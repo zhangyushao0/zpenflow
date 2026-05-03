@@ -1,0 +1,79 @@
+package dev.penflow
+
+import android.util.Log
+import android.view.MotionEvent
+
+/**
+ * Translates Android multi-finger touch [MotionEvent]s into wire-format
+ * touch snapshots.
+ *
+ * Each consumed event emits a *snapshot* of all currently active fingers.
+ * The PC server diffs successive snapshots to compute DOWN / MOVE / UP
+ * transitions for the WinRT InputInjector touch API. This avoids encoding
+ * Android's per-event action semantics (ACTION_POINTER_DOWN, _UP, etc.) into
+ * the wire — server only cares about "what fingers are currently down".
+ *
+ * On `ACTION_POINTER_UP` / `ACTION_UP`, the lifted pointer is **excluded**
+ * from the snapshot (Android keeps it in the pointer list of that single
+ * event for the action-index lookup). On `ACTION_CANCEL` we emit an empty
+ * snapshot so the server lifts everything.
+ *
+ * Filters by index-0 toolType: only TOOL_TYPE_FINGER events are forwarded as
+ * touch. Stylus events are handled by [PenInputCapture].
+ */
+class TouchInputCapture(
+    private val viewWidth: () -> Int,
+    private val viewHeight: () -> Int,
+    private val onSnapshot: (TouchSnapshot) -> Unit,
+) {
+    data class TouchSnapshot(
+        val tsNs: Long,
+        val contacts: List<Protocol.TouchContact>,
+    )
+
+    fun consume(ev: MotionEvent): Boolean {
+        // Diagnostic: log every event reaching us so we can verify finger
+        // events are actually arriving and have the expected toolType.
+        Log.d(TAG, "ev action=${ev.actionMasked} pointers=${ev.pointerCount} " +
+            "tool0=${ev.getToolType(0)} (FINGER=${MotionEvent.TOOL_TYPE_FINGER} " +
+            "STYLUS=${MotionEvent.TOOL_TYPE_STYLUS})")
+        if (ev.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER) return false
+
+        val w = viewWidth().coerceAtLeast(1).toFloat()
+        val h = viewHeight().coerceAtLeast(1).toFloat()
+
+        val contacts: List<Protocol.TouchContact> = when (ev.actionMasked) {
+            MotionEvent.ACTION_CANCEL -> emptyList()
+            else -> {
+                // The pointer at actionIndex is lifted on POINTER_UP / UP and
+                // must not appear in the next "currently active" snapshot.
+                val liftedIndex = when (ev.actionMasked) {
+                    MotionEvent.ACTION_POINTER_UP, MotionEvent.ACTION_UP -> ev.actionIndex
+                    else -> -1
+                }
+                val n = ev.pointerCount
+                val list = ArrayList<Protocol.TouchContact>(n)
+                for (i in 0 until n) {
+                    if (i == liftedIndex) continue
+                    list.add(
+                        Protocol.TouchContact(
+                            pointerId = ev.getPointerId(i),
+                            xNorm = (ev.getX(i) / w).coerceIn(0f, 1f),
+                            yNorm = (ev.getY(i) / h).coerceIn(0f, 1f),
+                            pressure = ev.getPressure(i).coerceIn(0f, 1f),
+                        )
+                    )
+                }
+                list
+            }
+        }
+
+        Log.d(TAG, "snapshot: ${contacts.size} contacts -> sending")
+        onSnapshot(TouchSnapshot(ev.eventTime * 1_000_000L, contacts))
+        return true
+    }
+
+    companion object {
+        private const val TAG = "TouchInputCapture"
+    }
+}

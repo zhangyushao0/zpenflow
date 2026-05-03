@@ -1,0 +1,33 @@
+# Rust / Cargo
+/target/
+**/target/
+*.rs.bk
+Cargo.lock.bak
+
+# Tauri
+apps/penflow-gui/src-tauri/gen/
+
+# Android
+android/.gradle/
+android/build/
+android/app/build/
+android/app/.cxx/
+android/local.properties
+android/.idea/
+*.iml
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Reference clones (re-clone on demand)
+research/
+
+# VDD binary artifacts (download from upstream release; not for VCS)
+tools/vdd/MttVDD.*
+tools/vdd/*.dll
+tools/vdd/*.exe
+tools/vdd/VDD.Control*
+tools/vdd/VirtualDriverControl*

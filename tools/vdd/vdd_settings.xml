@@ -1,0 +1,40 @@
+<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Penflow VDD configuration — MINIMAL (compatible with VDD release 25.7.23).
+
+  Earlier versions of this file used the upstream master schema (HDR,
+  auto_resolutions, color_advanced sections). That binary version of mttvdd.dll
+  crashed parsing those sections (WUDFUnhandledException, c0000005). This
+  reduced version contains only the fields the 25.7.23 binary actually parses.
+
+  Result: a single virtual monitor at 2880×1800, advertising 60 Hz and 120 Hz.
+-->
+<vdd_settings>
+
+    <monitors>
+        <count>1</count>
+    </monitors>
+
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+
+    <global>
+        <g_refresh_rate>60</g_refresh_rate>
+        <g_refresh_rate>120</g_refresh_rate>
+    </global>
+
+    <resolutions>
+        <resolution>
+            <width>2880</width>
+            <height>1800</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+        <resolution>
+            <width>2880</width>
+            <height>1800</height>
+            <refresh_rate>120</refresh_rate>
+        </resolution>
+    </resolutions>
+
+</vdd_settings>

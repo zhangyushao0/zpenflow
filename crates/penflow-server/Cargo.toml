@@ -1,0 +1,15 @@
+[package]
+name = "penflow-server"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Penflow tokio session orchestrator."
+
+[dependencies]
+penflow-core = { path = "../penflow-core" }
+penflow-protocol = { path = "../penflow-protocol" }
+penflow-transport = { path = "../penflow-transport" }
+tokio.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true

@@ -1,0 +1,11 @@
+[package]
+name = "penflow-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Penflow capture + encode + WinRT inject engine."
+
+[dependencies]
+penflow-protocol = { path = "../penflow-protocol" }
+thiserror.workspace = true

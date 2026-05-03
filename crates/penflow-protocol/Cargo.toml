@@ -1,0 +1,9 @@
+[package]
+name = "penflow-protocol"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Penflow PC↔Android wire-format constants and types."
+
+[dependencies]

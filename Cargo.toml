@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/penflow-protocol",
+    "crates/penflow-transport",
+    "crates/penflow-core",
+    "crates/penflow-server",
+    "apps/penflow-gui/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
