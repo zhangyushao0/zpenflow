@@ -46,6 +46,20 @@ pub struct D3d11Context {
     pub feature_level: D3D_FEATURE_LEVEL,
 }
 
+impl Clone for D3d11Context {
+    fn clone(&self) -> Self {
+        Self {
+            adapter: self.adapter.clone(),
+            adapter_luid: self.adapter_luid,
+            adapter_vendor_id: self.adapter_vendor_id,
+            adapter_name: self.adapter_name.clone(),
+            device: self.device.clone(),
+            immediate_context: self.immediate_context.clone(),
+            feature_level: self.feature_level,
+        }
+    }
+}
+
 impl D3d11Context {
     /// Build a context bound to the given adapter. This is the engine's
     /// primary constructor — the adapter must be the one that owns the
@@ -55,8 +69,8 @@ impl D3d11Context {
         let adapter_name = String::from_utf16_lossy(&desc.Description)
             .trim_end_matches('\0')
             .to_string();
-        let adapter_luid = ((desc.AdapterLuid.HighPart as i64) << 32)
-            | (desc.AdapterLuid.LowPart as i64);
+        let adapter_luid =
+            ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64);
 
         let mut device: Option<ID3D11Device> = None;
         let mut feature_level = D3D_FEATURE_LEVEL::default();

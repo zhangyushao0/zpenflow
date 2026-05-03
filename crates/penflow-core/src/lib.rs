@@ -209,11 +209,12 @@ impl EngineBuilder {
             });
         }
 
-        // Capturer needs its own D3d11Context (takes ownership of one);
-        // the encoder + converter share the second one. Both must be on the
-        // same adapter — enforced by LUID check inside DxgiCapturer::new.
-        let capturer_ctx =
-            D3d11Context::create_on_adapter(monitor.open_adapter(&factory)?)?;
+        // Capturer/converter/encoder must share the same D3D11 device.
+        // DDA returns textures owned by the device passed to DuplicateOutput;
+        // CopyResource into the keepalive texture is only valid on that same
+        // device. Cloning the COM handles keeps ownership simple while
+        // preserving one underlying ID3D11Device.
+        let capturer_ctx = ctx.clone();
         let capturer = DxgiCapturer::new(capturer_ctx, monitor.clone())?;
         let converter = ColorConverter::new(&ctx, width, height, self.fps)?;
 

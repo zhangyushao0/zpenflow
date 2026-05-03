@@ -38,6 +38,92 @@ If the probe brings up the wrong resolution, fix
 `C:\VirtualDisplayDriver\vdd_settings.xml` and then use Disable→Enable. Do not
 use Reload Driver on this build.
 
+## Follow-up: `MF_E_UNSUPPORTED_D3D_TYPE` only on the VDD output
+
+After VDD enable + `SetDisplayConfig(EXTEND)` started landing a real DXGI
+output, the engine still failed on the first encoded frame from that output:
+
+```
+submit_frame failed: 0xC00D6D76 (MF_E_UNSUPPORTED_D3D_TYPE)
+wait_for_keyframe: timed out, 0 packets popped
+```
+
+The same engine, same encoder, same NVIDIA HEVC MFT worked when capturing the
+physical `\\.\DISPLAY1`. Switching the VDD resolution, settling longer after
+`SetDisplayConfig`, and zero-clearing the keepalive texture all changed
+nothing.
+
+### Root cause: two `ID3D11Device` objects, cross-device `CopyResource`
+
+The engine was building **two** D3D11 devices on the same adapter:
+
+- `ctx` — used by `ColorConverter` (BGRA→NV12 VideoProcessor) and `MfBackend`
+  (the MFT's `ID3D11Device` via `MFCreateDXGIDeviceManager`).
+- `capturer_ctx` — a fresh `D3d11Context::create_on_adapter(...)` for the DDA
+  capturer, on the same adapter LUID but a distinct `ID3D11Device`.
+
+The pipeline's per-frame hot path then did:
+
+```rust
+ctx.immediate_context.CopyResource(&keepalive, &dda_frame.texture);
+//                                  ^^^^^^^^^   ^^^^^^^^^^^^^^^^^^
+//                                  on `ctx`    on `capturer_ctx`
+```
+
+`ID3D11DeviceContext::CopyResource` is only defined when source and
+destination belong to the **same** `ID3D11Device`. Cross-device is undefined
+behavior. The encoder consuming `keepalive` on yet a third path (the MFT's
+own device manager, also `ctx`) made the staleness visible.
+
+Why physical capture survived: NVIDIA's user-mode driver appears to fast-path
+DDA copies between two devices that share an underlying KMT context, so the
+bytes actually showed up in `keepalive`. On the freshly-attached VDD output
+that fast path didn't fire — the keepalive contents were left in a state the
+NVIDIA HEVC MFT rejected on `ProcessInput`, surfaced as the generic
+`MF_E_UNSUPPORTED_D3D_TYPE` HRESULT.
+
+This was misread for a long time as "the MFT's bound D3D device drifted out
+from under it after `SetDisplayConfig`" (HRESULT `0xC00D6D76` is also listed
+in some headers as `MF_E_DXGI_NEW_VIDEO_DEVICE`), which led to a 500 ms
+post-`SetDisplayConfig` settle delay that did nothing useful.
+
+### Fix
+
+Make capturer / converter / encoder share **one** `ID3D11Device`:
+
+- `crates/penflow-core/src/d3d11.rs`: `impl Clone for D3d11Context` (COM
+  clone = `AddRef`, so the underlying device + immediate context are shared,
+  not duplicated).
+- `crates/penflow-core/src/lib.rs` (`EngineBuilder::start`): replace
+  `D3d11Context::create_on_adapter(monitor.open_adapter(&factory)?)` with
+  `ctx.clone()` for `capturer_ctx`. This keeps the existing ownership model
+  (each subsystem owns a `D3d11Context`) but collapses to a single
+  `ID3D11Device`.
+- `crates/penflow-server/src/session.rs`: drop the speculative comment about
+  the NVIDIA UMD reshuffling MFT bindings; the 500 ms sleep stays as a
+  modest DXGI re-enumeration buffer, not as the fix.
+- `crates/penflow-core/src/pipeline.rs`: added a `describe_texture` helper
+  under `PENFLOW_PIPELINE_TRACE` so the next time something like this shows
+  up we can dump width/height/format/bind/usage at each stage.
+- `crates/penflow-core/examples/encoder_texture_probe.rs`: minimal repro
+  that drives BGRA → NV12 → MF HEVC at an arbitrary size **without** any
+  capture/VDD involvement. Run
+  `cargo run -p penflow-core --example encoder_texture_probe -- 2880 1800`
+  to isolate "encoder is unhappy with this surface" from "capture/VDD is
+  unhappy".
+
+### Lesson
+
+DDA hands you back a texture owned by whichever `ID3D11Device` was passed to
+`IDXGIOutput1::DuplicateOutput`. Anything downstream that touches that
+texture — `CopyResource`, MFT `ProcessInput`, VideoProcessor, shader views —
+must be on **the same device**. LUID equality is necessary but not
+sufficient; two `D3D11CreateDevice` calls on the same adapter give two
+distinct devices, and any cross-device path is silent UB until something
+breaks. Default to one device per pipeline; if you really need two, you
+need a proper shared-resource handoff (`KEYED_MUTEX` / `D3D11_RESOURCE_MISC_SHARED_NTHANDLE`),
+not a raw `CopyResource`.
+
 Outside the driver there is no direct "has `IddCxMonitorArrival` been called
 for DEVINST X" API. The practical external signals remain DXGI outputs,
 `QueryDisplayConfig(QDC_ALL_PATHS)`, monitor-class PnP children, event logs,

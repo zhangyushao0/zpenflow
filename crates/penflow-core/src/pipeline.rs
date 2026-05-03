@@ -23,9 +23,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::capture::dxgi::DxgiCapturer;
-use crate::color::{
-    clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter,
-};
+use crate::color::{clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter};
 use crate::d3d11::D3d11Context;
 use crate::encoder::{EncodeSession, EncodedPacket};
 use crate::error::{EngineError, EngineResult};
@@ -196,7 +194,10 @@ impl LoopState {
         let force_idr = self.idr_request.swap(false, Ordering::AcqRel);
         let trace = std::env::var_os("PENFLOW_PIPELINE_TRACE").is_some();
         if trace {
-            eprintln!("[pipeline] tick: acquiring (timeout={:?})", self.cfg.acquire_timeout);
+            eprintln!(
+                "[pipeline] tick: acquiring (timeout={:?})",
+                self.cfg.acquire_timeout
+            );
         }
         let acquired = match self.capturer.acquire_frame(self.cfg.acquire_timeout) {
             Ok(v) => v,
@@ -211,6 +212,14 @@ impl LoopState {
             Some(frame) => {
                 if trace {
                     eprintln!("[pipeline] got DDA frame, copying to keepalive");
+                    eprintln!(
+                        "[pipeline] {}",
+                        describe_texture("dda_frame", &frame.texture)
+                    );
+                    eprintln!(
+                        "[pipeline] {}",
+                        describe_texture("keepalive_before_copy", &self.keepalive)
+                    );
                 }
                 // Copy DXGI texture → stable BGRA keepalive (GPU-only copy,
                 // ~150 us on RTX 5070 for 4K). The frame's RAII guard
@@ -233,12 +242,11 @@ impl LoopState {
                 //     initialised black BGRA texture from
                 //     create_bgra_keepalive_texture. We still encode it
                 //     so wait_for_keyframe sees an IDR; otherwise on a
-                //     freshly-extended VDD output (where the desktop is
-                //     blank with no content changes, so DDA never fires)
-                //     wait_for_keyframe times out forever. D3D11
-                //     USAGE_DEFAULT textures are zero-cleared by the
-                //     driver at allocation, so the first frame the
-                //     tablet sees is plain black until something paints
+                //     freshly-extended VDD output (where the desktop can be
+                //     blank with no content changes, so DDA may not fire)
+                //     wait_for_keyframe times out forever. Pipeline::start
+                //     explicitly cleared the keepalive texture to black, so
+                //     the first frame is valid even before anything paints
                 //     onto the new desktop.
                 self.keepalive_uses.fetch_add(1, Ordering::AcqRel);
             }
@@ -251,6 +259,10 @@ impl LoopState {
         }
         if trace {
             eprintln!("[pipeline] convert ok, submitting frame to encoder");
+            eprintln!(
+                "[pipeline] {}",
+                describe_texture("encoder_input", self.converter.output_texture())
+            );
         }
 
         // Encode.
@@ -290,15 +302,33 @@ impl LoopState {
     }
 }
 
+fn describe_texture(
+    label: &str,
+    tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+) -> String {
+    let mut desc = windows::Win32::Graphics::Direct3D11::D3D11_TEXTURE2D_DESC::default();
+    unsafe {
+        tex.GetDesc(&mut desc);
+    }
+    format!(
+        "{label}: {}x{} fmt={} bind=0x{:x} misc=0x{:x} usage={} cpu=0x{:x}",
+        desc.Width,
+        desc.Height,
+        desc.Format.0,
+        desc.BindFlags,
+        desc.MiscFlags,
+        desc.Usage.0,
+        desc.CPUAccessFlags
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capture::dxgi::DxgiCapturer;
     use crate::color::ColorConverter;
     use crate::d3d11::D3d11Context;
-    use crate::encoder::{
-        mf::MfBackend, Codec, EncoderBackend, PixelFormat, SessionConfig,
-    };
+    use crate::encoder::{mf::MfBackend, Codec, EncoderBackend, PixelFormat, SessionConfig};
     use crate::monitors;
 
     /// End-to-end: spin the pipeline against the desktop for a few hundred ms,
