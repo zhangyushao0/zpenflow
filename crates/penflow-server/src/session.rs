@@ -17,8 +17,9 @@
 //! 6. `select!` until any task ends or `Session::stop()` is called; tear
 //!    down cleanly.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -33,7 +34,7 @@ use penflow_core::monitors::MonitorInfo;
 use penflow_core::Engine;
 use penflow_protocol::{
     encode_frame, extract_hevc_nals, read_frame, write_frame, HelloAndroid, HelloPc, PenEvent,
-    Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_HEVC,
+    Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_HEVC, FRAME_FLAG_EXTENDED,
     FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE,
     MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP,
     MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
@@ -150,11 +151,43 @@ impl Default for SessionConfig {
 
 /// Runtime counters; the telemetry pump samples this each tick. `dropped`
 /// is read from `queue.stats()` directly (it's the authoritative source) so
-/// we only track frames-out and current queue depth here.
+/// we only track frames-out + queue depth + a rolling encode-cost ring here.
+///
+/// The encode-cost ring is bounded at `ENCODE_RING_CAPACITY` samples so
+/// per-second p99 is computed over a stable window regardless of frame rate.
+/// `StdMutex` (not `tokio::sync::Mutex`) because the writer is a sync call
+/// from the blocking-style `frame_pump` and contention is one-per-frame.
 #[derive(Default)]
 struct Stats {
     frames: AtomicU32,
     queue_depth: AtomicU32,
+    encode_us_ring: StdMutex<VecDeque<u32>>,
+}
+
+const ENCODE_RING_CAPACITY: usize = 256;
+
+impl Stats {
+    fn record_encode_us(&self, us: u32) {
+        let mut ring = self.encode_us_ring.lock().expect("encode ring poisoned");
+        if ring.len() == ENCODE_RING_CAPACITY {
+            ring.pop_front();
+        }
+        ring.push_back(us);
+    }
+
+    /// `(avg, p99)` over the current ring contents. `(0, 0)` if empty.
+    fn encode_us_summary(&self) -> (u32, u32) {
+        let ring = self.encode_us_ring.lock().expect("encode ring poisoned");
+        if ring.is_empty() {
+            return (0, 0);
+        }
+        let sum: u64 = ring.iter().map(|v| *v as u64).sum();
+        let avg = (sum / ring.len() as u64) as u32;
+        let mut sorted: Vec<u32> = ring.iter().copied().collect();
+        sorted.sort_unstable();
+        let idx = ((sorted.len() - 1) as f64 * 0.99) as usize;
+        (avg, sorted[idx])
+    }
 }
 
 /// One Penflow session. `run()` blocks for the lifetime of the connection.
@@ -526,11 +559,15 @@ async fn frame_pump(
                     Ok(None) => continue,
                     Err(_) => return,
                 };
+                let mut flags = if pkt.is_keyframe { FRAME_FLAG_KEYFRAME } else { 0 };
+                if pkt.encode_us.is_some() {
+                    flags |= FRAME_FLAG_EXTENDED;
+                }
                 let vf = VideoFrame {
                     pts_ns: pkt.pts_ns,
-                    flags: if pkt.is_keyframe { FRAME_FLAG_KEYFRAME } else { 0 },
+                    flags,
                     capture_us: None,
-                    encode_us: None,
+                    encode_us: pkt.encode_us,
                     coded: pkt.bytes,
                 };
                 let bytes = encode_frame(MSG_VIDEO_FRAME, &vf.encode());
@@ -544,6 +581,9 @@ async fn frame_pump(
                     return;
                 }
                 stats.frames.fetch_add(1, Ordering::Relaxed);
+                if let Some(us) = pkt.encode_us {
+                    stats.record_encode_us(us);
+                }
                 let depth = queue.stats().depth as u32;
                 stats.queue_depth.store(depth, Ordering::Relaxed);
             }
@@ -567,12 +607,13 @@ async fn telemetry_pump(
                 let queue_stats = queue.stats();
                 let dropped = queue_stats.dropped_overflow as u32;
                 let depth = queue_stats.depth.min(u8::MAX as usize) as u8;
+                let (encode_us_avg, encode_us_p99) = stats.encode_us_summary();
                 let t = Telemetry {
                     frames,
                     dropped,
                     capture_us_avg: 0,
-                    encode_us_avg: 0,
-                    encode_us_p99: 0,
+                    encode_us_avg,
+                    encode_us_p99,
                     queue_depth: depth,
                 };
                 let bytes = encode_frame(MSG_TELEMETRY, &t.encode());

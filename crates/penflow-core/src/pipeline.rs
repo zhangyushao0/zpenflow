@@ -11,7 +11,7 @@
 //!      If it timed out, the keepalive holds the last frame — reusing it
 //!      keeps the encoder warm and avoids the 80 ms cold-start spike.
 //!   4. `converter.convert(&keepalive)` writes the cached NV12 output.
-//!   5. `encoder.submit_frame(converter.output_texture(), pts_ns, captured_at, force_idr)`.
+//!   5. `encoder.submit_frame(converter.output_texture(), pts_ns, force_idr)`.
 //!   6. Drain `encoder.try_packet()` into the packet queue.
 //!
 //! A single force-IDR request is consumed atomically per loop iteration —
@@ -278,12 +278,10 @@ impl LoopState {
 
         // Encode.
         let pts_ns = now.duration_since(self.start_instant).as_nanos() as i64;
-        if let Err(e) = self.encoder.submit_frame(
-            self.converter.output_texture(),
-            pts_ns,
-            Some(now),
-            force_idr,
-        ) {
+        if let Err(e) =
+            self.encoder
+                .submit_frame(self.converter.output_texture(), pts_ns, force_idr)
+        {
             eprintln!("[pipeline] submit_frame ERR: {e:?}");
             return Err(e);
         }

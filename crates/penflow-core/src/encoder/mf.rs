@@ -94,10 +94,11 @@ pub struct MfSession {
     /// Internal output queue — packets we drained from `METransformHaveOutput`
     /// events but the caller hasn't claimed yet.
     output_queue: VecDeque<EncodedPacket>,
-    /// PTS+captured_at of the most recent `submit_frame`, used to stamp the
-    /// next packet emitted by the encoder. MF doesn't reorder so this is a
-    /// safe 1:1 mapping.
-    pending_input_meta: Option<(i64, Option<Instant>, bool)>,
+    /// (pts, submit_instant, force_idr) of the most recent `submit_frame`,
+    /// used to stamp the next packet emitted by the encoder. MF doesn't
+    /// reorder so this is a safe 1:1 mapping. `submit_instant` is the
+    /// wall-clock anchor for `EncodedPacket::encode_us`.
+    pending_input_meta: Option<(i64, Instant, bool)>,
 }
 
 const STREAM_ID: u32 = 0;
@@ -254,7 +255,7 @@ impl MfSession {
             bytes,
             pts_ns,
             is_keyframe,
-            captured_at: None, // populated in submit_frame's metadata path
+            encode_us: None, // filled in try_packet from pending_input_meta
         }))
     }
 }
@@ -275,7 +276,6 @@ impl EncodeSession for MfSession {
         &mut self,
         tex: &ID3D11Texture2D,
         pts_ns: i64,
-        captured_at: Option<Instant>,
         force_idr: bool,
     ) -> EngineResult<()> {
         // 1. Block until the MFT signals NeedInput (queueing any HaveOutput
@@ -314,7 +314,10 @@ impl EncodeSession for MfSession {
         }
 
         unsafe { self.transform.ProcessInput(STREAM_ID, &sample, 0)? };
-        self.pending_input_meta = Some((pts_ns, captured_at, force_idr));
+        // Anchor *after* ProcessInput returns so encode_us measures only
+        // the encoder's wall-clock work, not the caller's pre-submit
+        // texture wrap / SetSampleTime overhead.
+        self.pending_input_meta = Some((pts_ns, Instant::now(), force_idr));
         Ok(())
     }
 
@@ -325,9 +328,10 @@ impl EncodeSession for MfSession {
             // most recent submit's meta corresponds to whatever we're
             // returning now. Good enough for engine-level telemetry; the
             // sample's own PTS is authoritative for protocol forwarding.
-            if let Some((pts_ns, captured_at, _)) = self.pending_input_meta.take() {
+            if let Some((pts_ns, submit_instant, _)) = self.pending_input_meta.take() {
                 pkt.pts_ns = pts_ns;
-                pkt.captured_at = captured_at;
+                let us = submit_instant.elapsed().as_micros();
+                pkt.encode_us = Some(us.min(u32::MAX as u128) as u32);
             }
             return Ok(Some(pkt));
         }
@@ -548,7 +552,7 @@ mod tests {
             conv.convert(&bgra).expect("convert");
             let force_idr = i == 5;
             session
-                .submit_frame(conv.output_texture(), i as i64 * 16_666_667, None, force_idr)
+                .submit_frame(conv.output_texture(), i as i64 * 16_666_667, force_idr)
                 .expect("submit");
             // Drain whatever's ready so we don't backlog.
             while let Some(pkt) = session.try_packet().expect("try_packet") {

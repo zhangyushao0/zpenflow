@@ -9,8 +9,6 @@
 #[cfg(windows)]
 pub mod mf;
 
-use std::time::Instant;
-
 use crate::error::EngineResult;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -44,9 +42,12 @@ pub struct EncodedPacket {
     /// frame PTS.
     pub pts_ns: i64,
     pub is_keyframe: bool,
-    /// `Instant` when the corresponding capture happened. Forwarded from
-    /// `submit_frame`'s caller for end-to-end telemetry.
-    pub captured_at: Option<Instant>,
+    /// Wall-clock time the encoder MFT held onto this frame
+    /// (`ProcessInput` → packet popped via `try_packet`). Includes the small
+    /// async-event drain in between but is dominated by the actual encode
+    /// step (~3 ms NVENC HEVC P1 ULL on RTX 5070). `None` if the backend
+    /// doesn't measure.
+    pub encode_us: Option<u32>,
 }
 
 #[cfg(windows)]
@@ -84,7 +85,6 @@ pub trait EncodeSession: Send {
         &mut self,
         tex: &windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
         pts_ns: i64,
-        captured_at: Option<Instant>,
         force_idr: bool,
     ) -> EngineResult<()>;
 

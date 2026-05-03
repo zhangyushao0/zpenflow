@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut keyframes = 0usize;
     for i in 0..30 {
         conv.convert(&bgra)?;
-        session.submit_frame(conv.output_texture(), i as i64 * 16_666_667, None, i == 0)?;
+        session.submit_frame(conv.output_texture(), i as i64 * 16_666_667, i == 0)?;
         while let Some(pkt) = session.try_packet()? {
             packets += 1;
             if pkt.is_keyframe {
