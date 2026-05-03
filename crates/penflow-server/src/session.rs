@@ -291,6 +291,21 @@ impl Session {
                      [session]          v1.0 doesn't yet have a shared-texture path."
                 );
             }
+
+            // SetDisplayConfig(EXTEND) returns synchronously but the
+            // NVIDIA user-mode driver keeps reshuffling internal device
+            // handles for a few hundred ms after — bringing up new
+            // monitor scanout queues, re-binding hardware engines, etc.
+            // If we create the MF HEVC encoder MFT during that window,
+            // the MFT binds to a device handle that the driver
+            // invalidates moments later. The first `ProcessInput` then
+            // fails with HRESULT 0xC00D6D76 (MF_E_DXGI_NEW_VIDEO_DEVICE
+            // in mferror.h — "the underlying D3D device has changed
+            // since the MFT was bound; reinitialise it"). Give the
+            // driver time to fully settle before Engine.start() creates
+            // the MFT. 500 ms is generous; if this turns out to be
+            // flaky we can poll + retry instead.
+            tokio::time::sleep(Duration::from_millis(500)).await;
             virt
         } else {
             self.cfg.monitor.clone()
