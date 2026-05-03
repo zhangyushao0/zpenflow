@@ -143,7 +143,13 @@ impl Default for SessionConfig {
             },
             codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
-            fps: 60,
+            // 120 fps to match the MovinkPad Pro 14's 120 Hz panel and the
+            // VDD config's 120 Hz mode (tools/vdd/vdd_settings.xml). Going
+            // 60 here means the panel renders the same frame twice and
+            // perceived smoothness drops by half. NVENC HEVC P1 ULL on
+            // RTX 5070 handles 120 fps × 2880×1800 well within budget
+            // (~3 ms encode at 60, scales sub-linearly).
+            fps: 120,
             vdd: None,
         }
     }

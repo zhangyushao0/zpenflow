@@ -273,7 +273,7 @@ fn parse_args() -> Args {
     let mut a = Args {
         monitor_index: 0,
         bitrate_bps: 50_000_000,
-        fps: 60,
+        fps: 120,
         no_vdd: false,
         vdd_probe: false,
     };
