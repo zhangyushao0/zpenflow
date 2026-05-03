@@ -199,14 +199,23 @@ impl LoopState {
                 drop(frame);
             }
             None => {
-                if !self.has_real_frame {
-                    // No frame ever; encoder would emit garbage. Skip until
-                    // DDA produces something.
-                    return Ok(());
-                }
+                // DDA timed out. Re-encode the keepalive texture. Two
+                // sub-cases:
+                //   - has_real_frame=true → keepalive holds the last
+                //     captured DDA frame (HANDOFF §2.3 #2 cold-start
+                //     protection).
+                //   - has_real_frame=false → keepalive is the zero-
+                //     initialised black BGRA texture from
+                //     create_bgra_keepalive_texture. We still encode it
+                //     so wait_for_keyframe sees an IDR; otherwise on a
+                //     freshly-extended VDD output (where the desktop is
+                //     blank with no content changes, so DDA never fires)
+                //     wait_for_keyframe times out forever. D3D11
+                //     USAGE_DEFAULT textures are zero-cleared by the
+                //     driver at allocation, so the first frame the
+                //     tablet sees is plain black until something paints
+                //     onto the new desktop.
                 self.keepalive_uses.fetch_add(1, Ordering::AcqRel);
-                // Fall through and re-encode the existing keepalive — this is
-                // the cold-start protection from HANDOFF §2.3 #2.
             }
         }
 
