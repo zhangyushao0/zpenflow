@@ -182,11 +182,24 @@ impl LoopState {
 
     fn tick(&mut self) -> EngineResult<()> {
         let force_idr = self.idr_request.swap(false, Ordering::AcqRel);
-        let acquired = self.capturer.acquire_frame(self.cfg.acquire_timeout)?;
+        let trace = std::env::var_os("PENFLOW_PIPELINE_TRACE").is_some();
+        if trace {
+            eprintln!("[pipeline] tick: acquiring (timeout={:?})", self.cfg.acquire_timeout);
+        }
+        let acquired = match self.capturer.acquire_frame(self.cfg.acquire_timeout) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[pipeline] acquire_frame ERR: {e:?}");
+                return Err(e);
+            }
+        };
         let now = Instant::now();
 
         match acquired {
             Some(frame) => {
+                if trace {
+                    eprintln!("[pipeline] got DDA frame, copying to keepalive");
+                }
                 // Copy DXGI texture → stable BGRA keepalive (GPU-only copy,
                 // ~150 us on RTX 5070 for 4K). The frame's RAII guard
                 // releases the duplication when it goes out of scope.
@@ -220,18 +233,46 @@ impl LoopState {
         }
 
         // BGRA → NV12 (writes to the converter's stable output texture).
-        self.converter.convert(&self.keepalive)?;
+        if let Err(e) = self.converter.convert(&self.keepalive) {
+            eprintln!("[pipeline] convert ERR: {e:?}");
+            return Err(e);
+        }
+        if trace {
+            eprintln!("[pipeline] convert ok, submitting frame to encoder");
+        }
 
         // Encode.
         let pts_ns = now.duration_since(self.start_instant).as_nanos() as i64;
-        self.encoder.submit_frame(
+        if let Err(e) = self.encoder.submit_frame(
             self.converter.output_texture(),
             pts_ns,
             Some(now),
             force_idr,
-        )?;
-        while let Some(pkt) = self.encoder.try_packet()? {
-            self.queue.push(pkt);
+        ) {
+            eprintln!("[pipeline] submit_frame ERR: {e:?}");
+            return Err(e);
+        }
+        if trace {
+            eprintln!("[pipeline] submit_frame ok, polling for output packets");
+        }
+        loop {
+            match self.encoder.try_packet() {
+                Ok(Some(pkt)) => {
+                    if trace {
+                        eprintln!(
+                            "[pipeline] pushing pkt: {} bytes, keyframe={}",
+                            pkt.bytes.len(),
+                            pkt.is_keyframe
+                        );
+                    }
+                    self.queue.push(pkt);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    eprintln!("[pipeline] try_packet ERR: {e:?}");
+                    return Err(e);
+                }
+            }
         }
         Ok(())
     }

@@ -419,7 +419,10 @@ async fn wait_for_keyframe(
     queue: &Arc<penflow_core::packet_queue::PacketQueue<EncodedPacket>>,
     timeout: Duration,
 ) -> Result<EncodedPacket, SessionError> {
-    let deadline = Instant::now() + timeout;
+    let trace = std::env::var_os("PENFLOW_PIPELINE_TRACE").is_some();
+    let start = Instant::now();
+    let deadline = start + timeout;
+    let mut popped_total: u32 = 0;
     while Instant::now() < deadline {
         let q = queue.clone();
         let pkt = tokio::task::spawn_blocking(move || {
@@ -428,12 +431,24 @@ async fn wait_for_keyframe(
         .await
         .map_err(|e| std::io::Error::other(format!("blocking pop join: {e}")))?;
         if let Some(p) = pkt {
+            popped_total += 1;
             if p.is_keyframe {
+                if trace {
+                    eprintln!(
+                        "[wait_for_keyframe] got keyframe after {:.2}s, total={}",
+                        start.elapsed().as_secs_f64(),
+                        popped_total
+                    );
+                }
                 return Ok(p);
             }
             // Drop non-keyframes that arrived before the IDR.
         }
     }
+    eprintln!(
+        "[wait_for_keyframe] TIMEOUT after {:?}: popped {} non-keyframe packets, queue depth on exit: {}",
+        timeout, popped_total, queue.stats().depth
+    );
     Err(SessionError::NoKeyframe(timeout))
 }
 
