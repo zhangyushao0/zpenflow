@@ -9,9 +9,13 @@
 
 #[cfg(windows)]
 pub mod session;
+#[cfg(windows)]
+pub mod vdd;
 
 #[cfg(windows)]
 pub use session::{Session, SessionConfig, SessionError, SessionEvent};
+#[cfg(windows)]
+pub use vdd::{VddController, VddError};
 
 #[cfg(test)]
 mod tests {

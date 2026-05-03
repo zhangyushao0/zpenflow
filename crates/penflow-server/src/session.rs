@@ -40,6 +40,8 @@ use penflow_protocol::{
 };
 use penflow_transport::{Transport, TransportStream};
 
+use crate::vdd::{wait_for_virtual_monitor, VddController, VddError};
+
 /// Session-level errors. Most fan-in from the engine, transport, or protocol;
 /// the variants below capture the few cases where the orchestrator wants to
 /// surface a more specific message.
@@ -64,6 +66,10 @@ pub enum SessionError {
     /// Waited for the engine's first keyframe but never received one.
     #[error("engine produced no keyframe within {0:?}")]
     NoKeyframe(Duration),
+
+    /// VDD lifecycle (enable / disable / wait-for-DXGI) failed.
+    #[error("VDD lifecycle: {0}")]
+    Vdd(#[from] VddError),
 }
 
 /// What [`Session::run`] sends to its caller through the event channel.
@@ -91,9 +97,12 @@ pub enum SessionEvent {
 }
 
 /// Configuration for one session.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct SessionConfig {
-    /// Monitor to capture (selected by the GUI / CLI).
+    /// Monitor to capture when not using VDD. When `vdd` is `Some`, the
+    /// session enables the virtual driver after the Android handshake and
+    /// captures the resulting virtual monitor instead — this field is the
+    /// fallback for `vdd: None`.
     pub monitor: MonitorInfo,
     /// Encoder codec.
     pub codec: Codec,
@@ -101,6 +110,12 @@ pub struct SessionConfig {
     pub bitrate_bps: u32,
     /// Encoder frame rate.
     pub fps: u32,
+    /// Optional Virtual Display Driver controller. When set, the session
+    /// calls `enable()` after the handshake completes and captures the
+    /// virtual monitor that appears; on disconnect (or panic / Drop) the
+    /// `disable()` is called to remove the virtual monitor from idle
+    /// desktop. Discovered by `VddController::detect()` at process startup.
+    pub vdd: Option<VddController>,
 }
 
 impl Default for SessionConfig {
@@ -126,6 +141,7 @@ impl Default for SessionConfig {
             codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
             fps: 60,
+            vdd: None,
         }
     }
 }
@@ -157,7 +173,7 @@ impl Session {
     /// `events` (optional) receives lifecycle notifications. The function
     /// returns after the connection ends or `stop` flag is set.
     pub async fn run(
-        self,
+        mut self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     ) -> Result<(), SessionError> {
@@ -196,17 +212,46 @@ impl Session {
             android.codec_caps
         );
 
-        // 3. NOW start the engine. HEVC's first encoded frame is necessarily
+        // 3. Enable the Virtual Display Driver if we have one. Otherwise
+        //    fall through to capturing whatever monitor the operator
+        //    configured.
+        //
+        //    Order matters: enable VDD AFTER HELLO_ANDROID (so the
+        //    virtual monitor only exists while a client is actually
+        //    connected — design.md §16 / HANDOFF §4.6) and BEFORE engine
+        //    startup (the engine builder enumerates monitors and creates
+        //    its D3D11 context; the new VDD output must be visible to
+        //    DXGI by then).
+        let capture_monitor = if let Some(vdd) = self.cfg.vdd.as_mut() {
+            eprintln!(
+                "[session] enabling VDD device '{}' ({})",
+                vdd.friendly_name(),
+                vdd.instance_id()
+            );
+            vdd.enable()?;
+            // Windows takes ~100-500 ms to publish the new monitor through
+            // DXGI on this rig. 5 s is a generous upper bound.
+            let virt = wait_for_virtual_monitor(Duration::from_secs(5)).await?;
+            eprintln!(
+                "[session] virtual monitor up: {} {}x{} on {}",
+                virt.device_name, virt.width, virt.height, virt.adapter_name
+            );
+            virt
+        } else {
+            self.cfg.monitor.clone()
+        };
+
+        // 4. NOW start the engine. HEVC's first encoded frame is necessarily
         //    an IDR (no reference frames available), so we don't need an
         //    explicit `request_idr()` — just take whatever comes off the
         //    queue first.
-        let engine = Engine::builder(self.cfg.monitor.clone())
+        let engine = Engine::builder(capture_monitor)
             .codec(self.cfg.codec)
             .bitrate_bps(self.cfg.bitrate_bps)
             .fps(self.cfg.fps)
             .start()?;
 
-        // 4. Build the unified pen+touch injector and the input→output
+        // 5. Build the unified pen+touch injector and the input→output
         //    coordinate transform. InputInjector::new sets
         //    PER_MONITOR_AWARE_V2 process-wide so captured coords +
         //    injection coords are both physical pixels (gate-2 §4.4b).

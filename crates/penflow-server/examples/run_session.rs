@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use penflow_core::encoder::Codec;
 use penflow_core::Engine;
-use penflow_server::{Session, SessionConfig, SessionEvent};
+use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
 
@@ -25,37 +25,91 @@ use penflow_transport::Transport;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = parse_args();
 
+    // Probe for a Virtual Display Driver. If it's installed (regardless of
+    // current enabled/disabled state), we'll enable it on connect and
+    // disable it on disconnect — see design.md §16 / HANDOFF §4.6.
+    let vdd: Option<VddController> = if args.no_vdd {
+        println!("[run_session] --no-vdd: skipping VDD detection");
+        None
+    } else {
+        match VddController::detect() {
+            Ok(Some(v)) => {
+                println!(
+                    "[run_session] VDD detected: '{}' ({})",
+                    v.friendly_name(),
+                    v.instance_id()
+                );
+                println!(
+                    "[run_session]   will enable on Android connect, disable on disconnect"
+                );
+                Some(v)
+            }
+            Ok(None) => {
+                println!(
+                    "[run_session] no VDD installed (PowerShell ran fine, no match)"
+                );
+                println!(
+                    "[run_session]   capturing the physical monitor — see tools/vdd/README.md"
+                );
+                println!(
+                    "[run_session]   (Qualcomm decoders may reject 4K streams; install VDD if so)"
+                );
+                None
+            }
+            Err(e) => {
+                eprintln!("[run_session] VDD detection failed: {e}");
+                eprintln!("[run_session]   continuing without VDD");
+                None
+            }
+        }
+    };
+
     println!("[run_session] enumerating monitors...");
     let monitors = Engine::list_monitors()?;
     let attached: Vec<_> = monitors
         .iter()
         .filter(|m| m.attached_to_desktop && !m.adapter_is_software)
         .collect();
-    if attached.is_empty() {
-        eprintln!("no attached non-software outputs found");
+    if attached.is_empty() && vdd.is_none() {
+        eprintln!("no attached non-software outputs found and no VDD available");
         std::process::exit(2);
     }
     for (i, m) in attached.iter().enumerate() {
         println!(
-            "  [{i}] {} on {} ({}x{})",
-            m.device_name, m.adapter_name, m.width, m.height
+            "  [{i}] {} on {} ({}x{}){}",
+            m.device_name,
+            m.adapter_name,
+            m.width,
+            m.height,
+            if m.looks_virtual { "  [virtual]" } else { "" }
         );
     }
-    let monitor = attached
-        .get(args.monitor_index)
-        .copied()
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!(
-                "monitor index {} out of range; using 0",
-                args.monitor_index
-            );
-            attached[0].clone()
-        });
-    println!(
-        "[run_session] selected: {} {}x{}",
-        monitor.device_name, monitor.width, monitor.height
-    );
+    // Fallback monitor for when --no-vdd is in effect (or VDD detection
+    // failed). When `vdd` is Some, the session ignores this and uses the
+    // virtual monitor that pops up after enable.
+    let fallback_monitor = if attached.is_empty() {
+        // We have a VDD that'll bring up its own monitor; just use a stub
+        // here. (The session won't read this field when vdd is Some.)
+        monitors[0].clone()
+    } else {
+        attached
+            .get(args.monitor_index)
+            .copied()
+            .cloned()
+            .unwrap_or_else(|| {
+                eprintln!(
+                    "monitor index {} out of range; using 0",
+                    args.monitor_index
+                );
+                attached[0].clone()
+            })
+    };
+    if vdd.is_none() {
+        println!(
+            "[run_session] selected: {} {}x{}",
+            fallback_monitor.device_name, fallback_monitor.width, fallback_monitor.height
+        );
+    }
 
     println!("[run_session] starting ADB reverse tunnel...");
     let transport: Arc<dyn Transport> = Arc::new(
@@ -67,10 +121,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("[run_session] tunnel ready. Launch the Penflow app on the device now.");
 
     let cfg = SessionConfig {
-        monitor: monitor.clone(),
+        monitor: fallback_monitor.clone(),
         codec: Codec::Hevc,
         bitrate_bps: args.bitrate_bps,
         fps: args.fps,
+        vdd,
     };
 
     // Subscribe to lifecycle events so the operator sees them.
@@ -124,6 +179,11 @@ struct Args {
     monitor_index: usize,
     bitrate_bps: u32,
     fps: u32,
+    /// `--no-vdd`: skip VDD detection and capture the physical monitor.
+    /// Useful when running in a non-elevated PowerShell (Enable-PnpDevice
+    /// requires admin) or when the operator deliberately wants to mirror
+    /// the existing desktop.
+    no_vdd: bool,
 }
 
 fn parse_args() -> Args {
@@ -131,6 +191,7 @@ fn parse_args() -> Args {
         monitor_index: 0,
         bitrate_bps: 50_000_000,
         fps: 60,
+        no_vdd: false,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -153,6 +214,9 @@ fn parse_args() -> Args {
                 if let Some(v) = argv.get(i).and_then(|s| s.parse().ok()) {
                     a.fps = v;
                 }
+            }
+            "--no-vdd" => {
+                a.no_vdd = true;
             }
             other => {
                 eprintln!("[run_session] ignoring unknown arg: {other}");
