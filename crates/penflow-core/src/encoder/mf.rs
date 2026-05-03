@@ -252,12 +252,34 @@ impl MfSession {
             Some(s) => s,
             None => return Ok(None),
         };
+        // Stamp the encoder-finished moment HERE — `ProcessOutput` returned
+        // a sample so the MFT just emitted it. If we deferred until the
+        // pipeline's next `try_packet` tick, encode_us would also include
+        // however long the pipeline slept between ticks (e.g. 200 ms when
+        // DDA timed out on a static desktop), turning the metric into
+        // "submit → we noticed" instead of "submit → encoder done".
+        let finished_at = Instant::now();
 
         let bytes = read_sample_bytes(&sample)?;
-        let pts_ns = match unsafe { sample.GetSampleTime() } {
-            Ok(t) => t * 100, // 100-ns units → ns
-            Err(_) => 0,
+        // Match MF's preserved 1:1 input/output ordering: the head of the
+        // meta FIFO corresponds to this output. Use the meta's pts_ns
+        // (caller-supplied, exact ns) over `sample.GetSampleTime()`'s
+        // 100-ns rounded value.
+        let (pts_ns, encode_us) = match self.pending_input_meta.pop_front() {
+            Some((pts, submit_instant)) => {
+                let us = finished_at
+                    .saturating_duration_since(submit_instant)
+                    .as_micros();
+                (pts, Some(us.min(u32::MAX as u128) as u32))
+            }
+            None => {
+                // Fall back to the MFT's own PTS (e.g. after a hot reset
+                // that drained outputs without paired meta).
+                let pts = unsafe { sample.GetSampleTime() }.map(|t| t * 100).unwrap_or(0);
+                (pts, None)
+            }
         };
+
         let is_keyframe = first_nal_is_idr(&bytes);
         // First IDR carries VPS+SPS+PPS; cache them for the protocol layer.
         if is_keyframe && self.sequence_header.is_empty() {
@@ -267,7 +289,7 @@ impl MfSession {
             bytes,
             pts_ns,
             is_keyframe,
-            encode_us: None, // filled in try_packet from pending_input_meta
+            encode_us,
         }))
     }
 }
@@ -338,21 +360,11 @@ impl EncodeSession for MfSession {
     }
 
     fn try_packet(&mut self) -> EngineResult<Option<EncodedPacket>> {
+        // pts_ns and encode_us were stamped in `collect_output_packet` at
+        // the moment `ProcessOutput` returned a sample, so no metadata
+        // work to do here — just hand the next packet to the caller.
         self.drain_events_nowait()?;
-        if let Some(mut pkt) = self.output_queue.pop_front() {
-            // MF preserves output order (no B-frames; zero-reorder MFT) so
-            // the head of the meta FIFO matches the head of the output
-            // queue. If they ever fall out of sync (e.g., a hot reset
-            // that drained outputs without pairing meta), leave encode_us
-            // as None rather than mis-stamping.
-            if let Some((pts_ns, submit_instant)) = self.pending_input_meta.pop_front() {
-                pkt.pts_ns = pts_ns;
-                let us = submit_instant.elapsed().as_micros();
-                pkt.encode_us = Some(us.min(u32::MAX as u128) as u32);
-            }
-            return Ok(Some(pkt));
-        }
-        Ok(None)
+        Ok(self.output_queue.pop_front())
     }
 }
 
