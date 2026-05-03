@@ -88,17 +88,27 @@ impl Engine {
             codec: Codec::Hevc,
             bitrate_bps: 50_000_000,
             fps: 60,
-            // One-frame budget at 120 fps (default). Short enough that a
-            // static desktop still encodes the keepalive at the configured
-            // cadence — design.md §6.1 / HANDOFF §2.3 #2 explicitly want
-            // "re-encode the last captured frame at the configured fps"
-            // when DDA times out, otherwise the encoder's HaveOutput
-            // events sit in the MFT queue and `Instant::now()` inside
-            // `collect_output_packet` ends up bound by the next pipeline
-            // tick (the Android HUD then reports 200 ms encode_us / net
-            // when idle). Sunshine's 200 ms recommendation is for a
-            // different keepalive shape; ours needs to match fps.
-            acquire_timeout: Duration::from_millis(8),
+            // One-frame budget at 60 fps. The acquire_timeout doubles as
+            // the pipeline's idle-state tick rate (when DDA times out we
+            // encode the keepalive and loop back), which directly drives
+            // the **decoder feed rate** on the Android side.
+            //
+            // The MovinkPad Pro 14's Adreno 720 is spec'd for 4K @ 60 fps
+            // HEVC decode (~480 MP/s). At 2880×1800 (5 MP/frame) that's
+            // a sustained ceiling around 90 fps. Earlier we ran with an
+            // 8 ms timeout (125 fps tick → ~625 MP/s decode load) and the
+            // decoder visibly fell behind when idle: callbacks queued on
+            // its handler thread and `decodedNs` lagged 10-15 ms past
+            // actual decode-finish, inflating `dec_us` to 24 ms. 16 ms
+            // keeps the steady-state idle feed at 60 fps where the
+            // decoder is comfortable, with the encoder-event drain still
+            // bounded by `submit_frame`'s post-`ProcessInput`
+            // `wait_for_need_input` (one tick-independent ~3-5 ms hop).
+            //
+            // design.md §6.1 / HANDOFF §2.3 #2 specified "re-encode the
+            // last captured frame at the configured fps" — *configured*
+            // fps, not "as fast as the pipeline can spin".
+            acquire_timeout: Duration::from_millis(16),
             packet_queue_capacity: 8,
             pts_epoch: None,
         }
