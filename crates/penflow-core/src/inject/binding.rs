@@ -53,13 +53,18 @@ pub struct PenButtonProfile {
 
 impl Default for PenButtonProfile {
     /// Predecessor-compatible default: barrel-1 holds Ctrl, barrel-2 holds
-    /// Shift, tertiary toggles eraser. Predecessor used 'E' tap; we switch
-    /// to `EraserToggle` (the WinRT `Inverted` bit) per design §6.6.
+    /// Shift, tertiary taps 'E' (Krita's eraser-toggle shortcut). The
+    /// design originally proposed `EraserToggle` (flip the WinRT
+    /// `Inverted` bit) as cleaner state, but in practice users find the
+    /// behaviour confusing — the pen "becomes" an eraser silently with
+    /// no visible UI change in some apps. A 'E' tap goes through Krita's
+    /// own tool-switch UI which matches what users expect from the
+    /// tertiary button on physical Wacom tablets.
     fn default() -> Self {
         Self {
             barrel_1: Binding::KeyHold(VK_CONTROL),
             barrel_2: Binding::KeyHold(VK_SHIFT),
-            tertiary: Binding::EraserToggle,
+            tertiary: Binding::KeyTap(VK_E),
             tip_threshold: 0.0,
         }
     }
@@ -88,7 +93,7 @@ mod tests {
         let p = PenButtonProfile::default();
         assert!(matches!(p.barrel_1, Binding::KeyHold(VK_CONTROL)));
         assert!(matches!(p.barrel_2, Binding::KeyHold(VK_SHIFT)));
-        assert!(matches!(p.tertiary, Binding::EraserToggle));
+        assert!(matches!(p.tertiary, Binding::KeyTap(VK_E)));
         assert_eq!(p.tip_threshold, 0.0);
     }
 
