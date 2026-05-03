@@ -246,9 +246,51 @@ impl Session {
             )
             .await?;
             eprintln!(
-                "[session] virtual monitor up: {} {}x{} on {}",
-                virt.device_name, virt.width, virt.height, virt.adapter_name
+                "[session] virtual monitor up: {} {}x{} on {} (adapter LUID 0x{:016x})",
+                virt.device_name,
+                virt.width,
+                virt.height,
+                virt.adapter_name,
+                virt.adapter_luid
             );
+
+            // Cross-adapter check: NVIDIA exposes the RTX 5070 as multiple
+            // logical DXGI adapters (one with desktop outputs + NVENC,
+            // one or two more for compute/encode-only). When VDD enables
+            // its IDDCx output can land on any of those — and if it lands
+            // on a non-NVENC sibling, the NVIDIA HEVC Encoder MFT rejects
+            // textures from that device with HRESULT 0xC00D6D76 ("D3D
+            // device does not support this input type"). Surface this up
+            // front rather than letting submit_frame fail mysteriously.
+            let factory = penflow_core::d3d11::create_dxgi_factory()?;
+            let high_perf: windows::Win32::Graphics::Dxgi::IDXGIAdapter1 = unsafe {
+                factory
+                    .EnumAdapterByGpuPreference(
+                        0,
+                        windows::Win32::Graphics::Dxgi::DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                    )
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            };
+            let hp_desc = unsafe {
+                high_perf
+                    .GetDesc1()
+                    .map_err(|e| std::io::Error::other(format!("{e:?}")))?
+            };
+            let hp_luid = ((hp_desc.AdapterLuid.HighPart as i64) << 32)
+                | (hp_desc.AdapterLuid.LowPart as i64);
+            eprintln!(
+                "[session] high-perf adapter LUID 0x{:016x} (where NVENC lives)",
+                hp_luid
+            );
+            if hp_luid != virt.adapter_luid {
+                eprintln!(
+                    "[session] WARNING: VDD output is on a different DXGI adapter than the\n\
+                     [session]          high-performance NVENC adapter. The NVIDIA HEVC encoder\n\
+                     [session]          MFT will reject the input texture (HRESULT 0xC00D6D76).\n\
+                     [session]          This is design.md §6.1's known cross-adapter case —\n\
+                     [session]          v1.0 doesn't yet have a shared-texture path."
+                );
+            }
             virt
         } else {
             self.cfg.monitor.clone()
