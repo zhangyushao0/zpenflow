@@ -278,6 +278,7 @@ mod tests {
     /// desktop and time out, so a None result is also acceptable.
     #[test]
     fn capture_one_frame() {
+        let _g = crate::test_lock::DDA_LOCK.lock().unwrap();
         let factory = create_dxgi_factory().expect("factory");
         let mons = monitors::enumerate(&factory).expect("enumerate");
         let mon = mons
