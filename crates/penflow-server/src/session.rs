@@ -306,10 +306,19 @@ impl Session {
         //    an IDR (no reference frames available), so we don't need an
         //    explicit `request_idr()` — just take whatever comes off the
         //    queue first.
+        //
+        //    `pts_epoch(session_start)`: the pipeline stamps every packet
+        //    with `(now - pts_epoch).as_nanos()`. The TimeSync responder
+        //    below stamps t2/t3 with `session_start.elapsed()`. Both must
+        //    use the same anchor — otherwise the Android HUD reads a
+        //    multi-second e2e (the gap between session_start and pipeline
+        //    init is the VDD enable + settle + engine bring-up time, ~2 s
+        //    on a cold start).
         let engine = Engine::builder(capture_monitor)
             .codec(self.cfg.codec)
             .bitrate_bps(self.cfg.bitrate_bps)
             .fps(self.cfg.fps)
+            .pts_epoch(session_start)
             .start()?;
 
         // 5. Build the unified pen+touch injector and the input→output

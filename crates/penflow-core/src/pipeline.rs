@@ -43,6 +43,15 @@ pub struct PipelineConfig {
     /// Packet queue capacity. 8 ≈ 130 ms at 60 fps; deeper than the e2e
     /// budget so any backlog is unambiguously a consumer problem.
     pub packet_queue_capacity: usize,
+    /// Anchor `Instant` for the per-frame `pts_ns` stamp (`pts = (now -
+    /// pts_epoch).as_nanos()`). The server's TimeSync replies stamp t2/t3
+    /// against `session_start`; if the pipeline used its own
+    /// `Instant::now()` here, the Android HUD's translated PTS would be
+    /// off by however long VDD enable + engine init took (~2 s on a cold
+    /// start), making `displayedNs - ptsInAndroidNs` read several seconds
+    /// instead of the actual ~20 ms e2e. The session passes its own
+    /// `session_start` so both clocks share an epoch.
+    pub pts_epoch: Instant,
 }
 
 impl Default for PipelineConfig {
@@ -53,6 +62,7 @@ impl Default for PipelineConfig {
             fps: 60,
             acquire_timeout: Duration::from_millis(200),
             packet_queue_capacity: 8,
+            pts_epoch: Instant::now(),
         }
     }
 }
@@ -99,6 +109,7 @@ impl Pipeline {
         let handle = thread::Builder::new()
             .name("penflow-encode".into())
             .spawn(move || {
+                let pts_epoch = cfg.pts_epoch;
                 let mut state = LoopState {
                     ctx,
                     capturer,
@@ -111,7 +122,7 @@ impl Pipeline {
                     keepalive_uses: ka,
                     cfg,
                     has_real_frame: false,
-                    start_instant: Instant::now(),
+                    start_instant: pts_epoch,
                 };
                 state.run()
             })
@@ -351,6 +362,7 @@ mod tests {
             fps: 60,
             acquire_timeout: Duration::from_millis(50),
             packet_queue_capacity: 16,
+            pts_epoch: Instant::now(),
         };
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         // Build the encoder session BEFORE moving ctx into the capturer

@@ -41,7 +41,7 @@ pub mod test_lock {
 #[cfg(windows)]
 use std::sync::Arc;
 #[cfg(windows)]
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use crate::capture::dxgi::DxgiCapturer;
@@ -90,6 +90,7 @@ impl Engine {
             fps: 60,
             acquire_timeout: Duration::from_millis(200),
             packet_queue_capacity: 8,
+            pts_epoch: None,
         }
     }
 
@@ -143,6 +144,12 @@ pub struct EngineBuilder {
     fps: u32,
     acquire_timeout: Duration,
     packet_queue_capacity: usize,
+    /// Anchor for per-frame `pts_ns` stamping. If `None`, the pipeline
+    /// uses its own `Instant::now()` at startup — fine for tests, wrong
+    /// for the server (the session's TimeSync replies use a different
+    /// epoch and the Android HUD's translated PTS is then off by the
+    /// VDD/engine-init delay; see `PipelineConfig::pts_epoch`).
+    pts_epoch: Option<Instant>,
 }
 
 #[cfg(windows)]
@@ -169,6 +176,16 @@ impl EngineBuilder {
 
     pub fn packet_queue_capacity(mut self, n: usize) -> Self {
         self.packet_queue_capacity = n;
+        self
+    }
+
+    /// Set the epoch for the per-frame `pts_ns` stamp. The session passes
+    /// its own `session_start` here so PC-side PTS and the TimeSync t2/t3
+    /// replies share a clock; without this, the Android HUD's translated
+    /// PTS lands seconds in the past and `displayedNs - ptsInAndroidNs`
+    /// reads several seconds.
+    pub fn pts_epoch(mut self, e: Instant) -> Self {
+        self.pts_epoch = Some(e);
         self
     }
 
@@ -242,6 +259,7 @@ impl EngineBuilder {
                 fps: self.fps,
                 acquire_timeout: self.acquire_timeout,
                 packet_queue_capacity: self.packet_queue_capacity,
+                pts_epoch: self.pts_epoch.unwrap_or_else(Instant::now),
             },
         )?;
 
