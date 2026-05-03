@@ -23,7 +23,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use crate::capture::dxgi::DxgiCapturer;
-use crate::color::{create_bgra_keepalive_texture, ColorConverter};
+use crate::color::{
+    clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter,
+};
 use crate::d3d11::D3d11Context;
 use crate::encoder::{EncodeSession, EncodedPacket};
 use crate::error::{EngineError, EngineResult};
@@ -81,6 +83,16 @@ impl Pipeline {
         let keepalive_uses = Arc::new(AtomicU64::new(0));
 
         let keepalive = create_bgra_keepalive_texture(&ctx.device, cfg.width, cfg.height)?;
+        // D3D11 does NOT guarantee zero-init for USAGE_DEFAULT textures. If
+        // we encode the keepalive before any DDA frame has overwritten it
+        // (which happens on a freshly-attached VDD extend monitor — its
+        // desktop is blank, no content changes, DDA returns
+        // WAIT_TIMEOUT forever), the encoder receives an undefined-state
+        // texture and rejects with MF_E_UNSUPPORTED_D3D_TYPE
+        // (0xC00D6D76, "the content is not supported for the current
+        // Direct3D device"). Explicit black clear gives the encoder a
+        // valid input no matter what.
+        clear_bgra_texture_to_black(&ctx, &keepalive)?;
 
         let q = Arc::clone(&queue);
         let s = Arc::clone(&stop);

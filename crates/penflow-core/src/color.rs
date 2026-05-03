@@ -15,10 +15,12 @@ use std::mem::ManuallyDrop;
 
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
-    ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D, ID3D11VideoContext1, ID3D11VideoDevice,
-    ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
+    ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
+    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
     ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
+    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
+    D3D11_TEX2D_RTV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
     D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
     D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
     D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
@@ -233,6 +235,15 @@ fn create_nv12_texture(
 /// Helper: create a stable BGRA "keepalive" texture matching `width × height`.
 /// Used by the pipeline to copy DDA frames into a fixed pointer the encoder
 /// can re-use across frames (HANDOFF §2.3 #6).
+///
+/// **Important:** the texture is **not** zero-initialised by D3D11.
+/// Callers that may submit it to a hardware encoder (MF HEVC MFT etc.)
+/// before any DDA frame overwrites it MUST clear it explicitly via
+/// [`clear_bgra_texture_to_black`] right after creation. The MF HEVC
+/// MFT rejects samples wrapping textures whose contents are
+/// "undefined" with `MF_E_UNSUPPORTED_D3D_TYPE` (HRESULT 0xC00D6D76 —
+/// localised as "D3D 设备不支持此输入类型" but the real meaning is
+/// "the content is not supported for the current Direct3D device").
 pub fn create_bgra_keepalive_texture(
     device: &ID3D11Device,
     width: u32,
@@ -256,6 +267,38 @@ pub fn create_bgra_keepalive_texture(
     let mut tex: Option<ID3D11Texture2D> = None;
     unsafe { device.CreateTexture2D(&desc, None, Some(&mut tex))? };
     tex.ok_or(EngineError::NotInitialized)
+}
+
+/// Clear a BGRA texture to opaque black (`B=G=R=0, A=255`). Creates a
+/// transient `ID3D11RenderTargetView` against the texture, calls
+/// `ClearRenderTargetView`, drops the view. The clear is GPU-side and
+/// cheap (~tens of microseconds for 4K).
+///
+/// Used by the pipeline immediately after `create_bgra_keepalive_texture`
+/// so the encoder always sees a valid input even when DDA hasn't
+/// produced its first frame yet (e.g. capturing a freshly-attached VDD
+/// extend monitor that has no content drawn on it).
+pub fn clear_bgra_texture_to_black(
+    ctx: &D3d11Context,
+    texture: &ID3D11Texture2D,
+) -> EngineResult<()> {
+    let rtv_desc = D3D11_RENDER_TARGET_VIEW_DESC {
+        Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+        ViewDimension: D3D11_RTV_DIMENSION_TEXTURE2D,
+        Anonymous: D3D11_RENDER_TARGET_VIEW_DESC_0 {
+            Texture2D: D3D11_TEX2D_RTV { MipSlice: 0 },
+        },
+    };
+    let mut rtv: Option<ID3D11RenderTargetView> = None;
+    unsafe {
+        ctx.device.CreateRenderTargetView(texture, Some(&rtv_desc), Some(&mut rtv))?;
+    }
+    let rtv = rtv.ok_or(EngineError::NotInitialized)?;
+    let black: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
+    unsafe {
+        ctx.immediate_context.ClearRenderTargetView(&rtv, &black);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
