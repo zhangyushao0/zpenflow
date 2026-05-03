@@ -110,12 +110,25 @@ pub enum VddError {
 
     /// Re-launched ourselves with `runas` to do the privileged operation,
     /// but the helper exited non-zero. The user probably clicked No on
-    /// the UAC prompt, or the helper's CM call failed.
-    #[error("elevated helper exited non-zero ({code:?}); user may have declined UAC")]
+    /// the UAC prompt, or the helper's CM call failed. The full helper
+    /// log is in `%TEMP%\penflow-vdd-helper.log`.
+    #[error("elevated helper exited non-zero ({code:?}); see %TEMP%\\penflow-vdd-helper.log for the full helper trace")]
     HelperExitedNonZero {
         /// Exit code from the helper, if available.
         code: Option<i32>,
     },
+
+    /// Enable returned success but the device is still in the
+    /// `CM_PROB_DISABLED` state. Typically means `CM_Enable_DevNode`
+    /// silently no-op'd because the calling process wasn't elevated, or
+    /// the helper sub-process didn't actually run elevated.
+    #[error(
+        "Enable reported success but the device is still disabled. \
+         Likely cause: the elevated helper didn't actually run with \
+         Administrator privileges. Check %TEMP%\\penflow-vdd-helper.log \
+         for the helper trace."
+    )]
+    EnableHadNoEffect,
 
     /// `ShellExecuteExW` itself failed (code path that runs in the
     /// non-elevated parent). Usually means the user clicked No on the
@@ -308,31 +321,110 @@ pub async fn wait_for_virtual_monitor(timeout: Duration) -> Result<MonitorInfo, 
 /// returns an `ExitCode` for the helper process to surface.
 ///
 /// Argv shape: `<exe> --vdd-helper <enable|disable> <instance_id>`.
+///
+/// **Logging:** the helper runs with `SW_HIDE` (no console window
+/// attached by ShellExecute), so stderr/stdout are dropped. We instead
+/// append a trace to `%TEMP%\penflow-vdd-helper.log` for every step.
+/// When the parent reports a helper failure or `EnableHadNoEffect`, the
+/// operator reads that file to see what actually happened.
 pub fn helper_main(args: &[String]) -> ExitCode {
+    let log = HelperLog::open();
+    log.append("--- helper invoked ---");
+    log.append(&format!("argv: {:?}", args));
+    log.append(&format!("elevated: {}", is_process_elevated()));
+
     if args.len() < 3 {
-        eprintln!("usage: {} --vdd-helper <enable|disable> <instance_id>", args.first().map(|s| s.as_str()).unwrap_or("penflow"));
+        log.append("usage error: expected `--vdd-helper <enable|disable> <instance_id>`");
         return ExitCode::from(2);
     }
     let action = args[1].as_str();
     let instance_id = args[2].as_str();
-    match action {
-        "enable" => match cm_enable(instance_id).and_then(|_| verify_devnode_started(instance_id)) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("[vdd-helper] enable failed: {e}");
-                ExitCode::from(1)
-            }
-        },
-        "disable" => match cm_disable(instance_id) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("[vdd-helper] disable failed: {e}");
-                ExitCode::from(1)
-            }
-        },
+
+    // Snapshot device status BEFORE the action so we can compare.
+    match snapshot_devnode_status(instance_id) {
+        Ok((s, p)) => log.append(&format!(
+            "before {action}: status=0x{:08x} problem=0x{:08x}",
+            s.0, p.0
+        )),
+        Err(e) => log.append(&format!("before {action}: status query failed: {e}")),
+    }
+
+    let result = match action {
+        "enable" => cm_enable(instance_id).and_then(|_| {
+            log.append("CM_Enable_DevNode returned CR_SUCCESS");
+            verify_devnode_started(instance_id).inspect(|_| {
+                log.append("verify_devnode_started: device is healthy after enable");
+            })
+        }),
+        "disable" => cm_disable(instance_id).inspect(|_| {
+            log.append("CM_Disable_DevNode returned CR_SUCCESS");
+        }),
         other => {
-            eprintln!("[vdd-helper] unknown action: {other}");
-            ExitCode::from(2)
+            log.append(&format!("unknown action: {other}"));
+            return ExitCode::from(2);
+        }
+    };
+
+    // Snapshot AFTER as well — comparing before/after is the cleanest
+    // signal for "did anything actually change?".
+    match snapshot_devnode_status(instance_id) {
+        Ok((s, p)) => log.append(&format!(
+            "after  {action}: status=0x{:08x} problem=0x{:08x}",
+            s.0, p.0
+        )),
+        Err(e) => log.append(&format!("after  {action}: status query failed: {e}")),
+    }
+
+    match result {
+        Ok(()) => {
+            log.append(&format!("{action} OK; exiting 0"));
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            log.append(&format!("{action} failed: {e}"));
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn snapshot_devnode_status(
+    instance_id: &str,
+) -> Result<(CM_DEVNODE_STATUS_FLAGS, CM_PROB), VddError> {
+    let devinst = locate_devnode(instance_id)?;
+    let mut status = CM_DEVNODE_STATUS_FLAGS(0);
+    let mut problem = CM_PROB(0);
+    let r = unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) };
+    if r != CR_SUCCESS {
+        return Err(VddError::ConfigManager(r.0));
+    }
+    Ok((status, problem))
+}
+
+/// Tiny `%TEMP%\penflow-vdd-helper.log` appender. The helper has no
+/// console; this file is the only diagnostic the operator can read.
+struct HelperLog {
+    path: std::path::PathBuf,
+}
+
+impl HelperLog {
+    fn open() -> Self {
+        let mut path = std::env::temp_dir();
+        path.push("penflow-vdd-helper.log");
+        Self { path }
+    }
+
+    fn append(&self, line: &str) {
+        use std::io::Write;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
+            let _ = writeln!(f, "[{now}] {line}");
         }
     }
 }
@@ -533,7 +625,13 @@ fn verify_devnode_started(instance_id: &str) -> Result<(), VddError> {
         return Err(VddError::ConfigManager(r.0));
     }
     let has_problem = (status.0 & DN_HAS_PROBLEM.0) != 0;
-    if has_problem && problem.0 != CM_PROB_DISABLED.0 {
+    if has_problem {
+        if problem.0 == CM_PROB_DISABLED.0 {
+            // Enable returned success but device is still disabled.
+            // Means CM_Enable was a no-op (almost always: helper sub-
+            // process didn't actually run elevated).
+            return Err(VddError::EnableHadNoEffect);
+        }
         return Err(VddError::DriverProblem {
             status: status.0,
             problem: problem.0,

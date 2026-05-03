@@ -74,6 +74,11 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
                 println!(
                     "[run_session]   will enable on Android connect, disable on disconnect"
                 );
+                let log_path = std::env::temp_dir().join("penflow-vdd-helper.log");
+                println!(
+                    "[run_session]   if enable fails, the elevated helper trace is at: {}",
+                    log_path.display()
+                );
                 Some(v)
             }
             Ok(None) => {
