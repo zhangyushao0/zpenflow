@@ -40,11 +40,22 @@ pub struct PenSample {
     pub tilt_y_deg: i32,
     pub in_range: bool,
     pub in_contact: bool,
-    /// True iff the third stylus button has toggled the eraser end on. The
-    /// pen injector flips the WinRT `Inverted` bit only when this changes,
-    /// emitting a one-frame `out-of-range` first (HANDOFF §1.5
-    /// "flip-then-flush").
+    /// True iff the **physical eraser end** of the stylus is in use (Android
+    /// reports `MotionEvent.TOOL_TYPE_ERASER`). The barrel-button-driven
+    /// "eraser toggle" is handled separately inside the injector via the
+    /// active `PenButtonProfile`; both contribute to the WinRT `Inverted`
+    /// bit. HANDOFF §1.5 "flip-then-flush" still applies — a one-frame
+    /// out-of-range sample is emitted whenever the *combined* eraser state
+    /// changes.
     pub eraser: bool,
+    /// Live barrel-button bitmask straight off the wire. Bit 0 = barrel-1
+    /// (`BUTTON_STYLUS_PRIMARY`), bit 1 = barrel-2
+    /// (`BUTTON_STYLUS_SECONDARY`), bit 2 = tertiary
+    /// (`BUTTON_TERTIARY`). The Android side already decodes chord-style
+    /// firmware into bit 2 so this is a clean per-button view; the
+    /// injector reads transitions and applies the active
+    /// `binding::PenButtonProfile`.
+    pub buttons: u8,
     /// Captured-at instant for telemetry (latency measurement).
     pub captured_at: Option<Instant>,
 }

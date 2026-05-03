@@ -664,6 +664,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     in_range: pe.phase != 4,                     // 4 = leave
                     in_contact: matches!(pe.phase, 1 | 2),       // down or move
                     eraser: pe.tool == 1,
+                    buttons: pe.buttons,
                     captured_at: None,
                 };
                 let mut inj = injector.lock().await;
