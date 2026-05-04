@@ -65,7 +65,11 @@ class VideoDecoder(
     private val codecId: Byte,
     private val surface: Surface,
     private val csd0: ByteArray,
-    private val onDecoded: (decodedNs: Long) -> Unit = {},
+    /** Called from the codec callback thread for every emitted output frame.
+     *  `framePtsNs` is the server-stamped PC pts_ns we round-tripped through
+     *  `queueInputBuffer`'s presentationTimeUs, so the caller can match it
+     *  against its own pending-sample map without any FIFO assumption. */
+    private val onDecoded: (framePtsNs: Long, decodedNs: Long) -> Unit = { _, _ -> },
 ) {
 
     private val mime: String = mimeFor(codecId)
@@ -77,8 +81,11 @@ class VideoDecoder(
 
     // Single mutex protecting both INPUT queues. Producer (network thread)
     // calls feed(); consumer (codec callback thread) calls onInputBufferAvailable.
+    // Each pending data carries its caller-supplied PTS (PC pts_ns) so
+    // MediaCodec sees a stable, unique presentationTimeUs per frame and the
+    // network thread can match outputs back without FIFO assumptions.
     private val lock = Any()
-    private val pendingData = ArrayDeque<ByteArray>()
+    private val pendingData = ArrayDeque<Pair<Long, ByteArray>>()
     private val parkedIndices = ArrayDeque<Int>()
 
     fun start() {
@@ -119,7 +126,7 @@ class VideoDecoder(
 
         codec.setCallback(object : MediaCodec.Callback() {
             override fun onInputBufferAvailable(c: MediaCodec, index: Int) {
-                val data: ByteArray? = synchronized(lock) {
+                val pair: Pair<Long, ByteArray>? = synchronized(lock) {
                     if (pendingData.isNotEmpty()) {
                         pendingData.removeFirst()
                     } else {
@@ -127,8 +134,8 @@ class VideoDecoder(
                         null
                     }
                 }
-                if (data != null) {
-                    feedBuffer(c, index, data)
+                if (pair != null) {
+                    feedBuffer(c, index, pair.first, pair.second)
                 }
             }
 
@@ -138,29 +145,13 @@ class VideoDecoder(
                 info: MediaCodec.BufferInfo
             ) {
                 val decodedNs = System.nanoTime()
-                // Render every output buffer immediately at the next vsync.
-                //
-                // Earlier we used a §10.6 MIN_LATENCY drain (newest-buffer-
-                // wins, drop the rest, render task posted on the codec
-                // handler with `System.nanoTime()` as the PTS). In practice
-                // it produced a "ratchet" decoder degradation when idle:
-                // most outputs were released with render=false, the panel's
-                // VRR controller saw few presented frames and dropped to a
-                // low refresh rate, the BufferQueue then back-pressured the
-                // remaining renders, and `releaseOutputBuffer(idx, ts)` ate
-                // codec-handler time waiting for a slot. Since callbacks
-                // share the same handler, `decodedNs` (captured at callback
-                // entry) lagged by the queueing delay — pushing dec_us to
-                // 30-40 ms with no path back down until the user touched
-                // the screen and the panel jumped to 120 Hz again.
-                //
-                // The predecessor's simple `releaseOutputBuffer(idx, true)`
-                // measured 7-8 ms steady, with the bonus that SurfaceFlinger
-                // sees a continuous frame stream and keeps the panel awake
-                // at the requested rate (paired with the
-                // `Surface.setFrameRate` hint below).
+                // MediaCodec round-trips the input PTS as info.presentationTimeUs
+                // (microseconds). We fed it pts_ns/1000 so * 1000 recovers
+                // the original PC pts_ns; the caller uses it to look up the
+                // matching recv sample without any FIFO ordering assumption.
+                val framePtsNs = info.presentationTimeUs * 1000L
                 c.releaseOutputBuffer(index, true)
-                onDecoded(decodedNs)
+                onDecoded(framePtsNs, decodedNs)
             }
 
             override fun onError(c: MediaCodec, e: MediaCodec.CodecException) {
@@ -204,26 +195,29 @@ class VideoDecoder(
         )
     }
 
-    /** Submit a coded video access unit (Annex-B framed). */
-    fun feed(coded: ByteArray) {
+    /** Submit a coded video access unit (Annex-B framed). `framePtsNs` is the
+     *  server-stamped PC pts_ns; we pass it through MediaCodec as the input
+     *  buffer's `presentationTimeUs` (truncated to microseconds) so the
+     *  network thread can match outputs back by PTS instead of FIFO order. */
+    fun feed(framePtsNs: Long, coded: ByteArray) {
         val parkedIndex: Int? = synchronized(lock) {
             if (parkedIndices.isNotEmpty()) {
                 parkedIndices.removeFirst()
             } else {
-                pendingData.addLast(coded)
+                pendingData.addLast(framePtsNs to coded)
                 null
             }
         }
         if (parkedIndex != null) {
-            feedBuffer(codec, parkedIndex, coded)
+            feedBuffer(codec, parkedIndex, framePtsNs, coded)
         }
     }
 
-    private fun feedBuffer(c: MediaCodec, index: Int, data: ByteArray) {
+    private fun feedBuffer(c: MediaCodec, index: Int, framePtsNs: Long, data: ByteArray) {
         val buf = c.getInputBuffer(index) ?: return
         buf.clear()
         buf.put(data)
-        c.queueInputBuffer(index, 0, data.size, System.nanoTime() / 1000, 0)
+        c.queueInputBuffer(index, 0, data.size, framePtsNs / 1000, 0)
     }
 
     fun stop() {

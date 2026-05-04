@@ -71,10 +71,31 @@ class PenflowClient(
     private data class PendingSample(
         val ptsNs: Long, val captureUs: Int?, val encodeUs: Int?, val recvNs: Long,
     )
-    private val pendingFrameSamples = java.util.concurrent.ConcurrentLinkedQueue<PendingSample>()
 
-    private fun onDecoderFrameDone(decodedNs: Long) {
-        val s = pendingFrameSamples.poll() ?: return
+    // Keyed by PC `pts_ns`. Earlier this was a FIFO `ConcurrentLinkedQueue`,
+    // but MediaCodec on the MovinkPad is not strictly 1-input/1-output for
+    // ultra-static content: when the encoder hands it a long stream of
+    // identical keepalive frames the decoder occasionally elides an output
+    // (1 input → 0 callbacks). With FIFO matching, every dropped output left
+    // one extra sample on the queue, head-of-queue grew progressively older,
+    // and `dec_us = decodedNs - recvNs_FIFO_head` ratcheted up monotonically
+    // — exactly the "stays high once it goes high" symptom.
+    //
+    // Match by PC `pts_ns` instead: each MSG_VIDEO_FRAME puts the sample
+    // keyed by its server-stamped PTS, and the codec callback looks up by
+    // the same PTS via `info.presentationTimeUs * 1000` (we feed PC-PTS
+    // into `queueInputBuffer`, MediaCodec round-trips it on the output
+    // sample). Robust against any input/output count mismatch.
+    private val pendingFrameSamples =
+        java.util.concurrent.ConcurrentHashMap<Long, PendingSample>()
+
+    /** Drop pending samples older than this; keeps the map bounded if the
+     * decoder genuinely drops outputs forever. 1 second ≈ 60 frames at our
+     * default fps which is plenty of slack for any transient hiccup. */
+    private val pendingSampleMaxAgeNs = 1_000_000_000L
+
+    private fun onDecoderFrameDone(framePtsNs: Long, decodedNs: Long) {
+        val s = pendingFrameSamples.remove(framePtsNs) ?: return
         // Approximate displayedNs as decodedNs + 1 vsync (8.33 ms @ 120 Hz).
         val displayedNs = decodedNs + 8_333_333L
         hud?.recordFrameSample(
@@ -134,7 +155,7 @@ class PenflowClient(
                 val surface = waitForSurface()
                 val dec = VideoDecoder(
                     hello.width, hello.height, hello.fps, hello.codec, surface, csd0!!,
-                    onDecoded = { decodedNs -> onDecoderFrameDone(decodedNs) },
+                    onDecoded = { framePtsNs, decodedNs -> onDecoderFrameDone(framePtsNs, decodedNs) },
                 )
                 dec.start()
                 decoder = dec
@@ -177,22 +198,21 @@ class PenflowClient(
                 Protocol.MSG_VIDEO_FRAME -> {
                     val recvNs = System.nanoTime()
                     val header = Protocol.decodeVideoFrame(payload)
-                    // Offer the HUD sample BEFORE feeding the decoder.
-                    // MediaCodec is async — when frames are tiny (idle
-                    // desktop = static keepalive ~50 B) the codec
-                    // sometimes fires `onOutputBufferAvailable` between
-                    // `feed()` returning and the offer landing. The
-                    // poll then sees an empty queue, drops this frame's
-                    // recv timestamp, and the next decode callback ends
-                    // up paired with the previous frame's recv — turning
-                    // `decode_us` into "inter-frame interval + decode"
-                    // (~200 ms when idle at 5 fps from DDA timeout).
+                    // Record sample BEFORE feeding the decoder — the codec
+                    // callback can fire as soon as feed() returns, and we
+                    // want the matching entry already in the map.
                     if (hud != null) {
-                        pendingFrameSamples.offer(
+                        pendingFrameSamples[header.ptsNs] =
                             PendingSample(header.ptsNs, header.captureUs, header.encodeUs, recvNs)
-                        )
+                        // Evict samples older than `pendingSampleMaxAgeNs`
+                        // so the map stays bounded if MediaCodec ever
+                        // permanently elides outputs (e.g. for some
+                        // long static run). O(n) on the map but n is
+                        // tiny in steady state (≤ 2 frames in flight).
+                        val cutoff = header.ptsNs - pendingSampleMaxAgeNs
+                        pendingFrameSamples.keys.removeAll { it < cutoff }
                     }
-                    dec.feed(header.coded)
+                    dec.feed(header.ptsNs, header.coded)
                 }
                 Protocol.MSG_TELEMETRY -> {
                     hud?.recordServerTelemetry(Protocol.decodeTelemetry(payload))
