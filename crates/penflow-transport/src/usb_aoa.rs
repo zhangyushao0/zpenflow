@@ -173,6 +173,28 @@ impl Transport for UsbAoaTransport {
         };
 
         let (interface, ep_in, ep_out) = claim_bulk_interface(&accessory_device)?;
+
+        // **Clear any stale endpoint state from a previous session.** When
+        // the previous run died mid-stream (e.g. PFD finalized on Android
+        // → bulk_in interrupted, or session crash) the kernel-side bulk
+        // buffer might still hold un-read bytes — reading them on the new
+        // connection produces "expected MSG_HELLO_ANDROID, got 0xff" (a
+        // stale MSG_ANDROID_GOODBYE byte). `clear_halt` resets the data
+        // toggle + stall state and Linux+Windows backends usually drop
+        // pending buffered data along with it.
+        if let Err(e) = interface.clear_halt(ep_in) {
+            eprintln!("[usb_aoa] clear_halt(IN endpoint 0x{ep_in:02x}) failed: {e:?} (continuing)");
+        }
+        if let Err(e) = interface.clear_halt(ep_out) {
+            eprintln!("[usb_aoa] clear_halt(OUT endpoint 0x{ep_out:02x}) failed: {e:?} (continuing)");
+        }
+
+        // Belt-and-braces drain: do a few short non-blocking-style reads
+        // and discard whatever shows up before the protocol expects its
+        // first byte. Bounded so we never sit here forever if the device
+        // is genuinely stuck.
+        drain_stale_bytes(&interface, ep_in).await;
+
         let interface = Arc::new(interface);
 
         let reader = UsbReader::new(Arc::clone(&interface), ep_in);
@@ -390,6 +412,48 @@ async fn wait_for_accessory_reenum(timeout: Duration) -> io::Result<(Device, u16
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Drain any bytes the previous (probably-crashed) session left in the
+/// kernel-side bulk-IN buffer for this endpoint. Wraps an in-flight
+/// `bulk_in` future in a `tokio::time::timeout` so we don't block
+/// forever — anything that arrives within the budget is discarded;
+/// nothing arriving means the buffer is genuinely empty and we can
+/// safely start the protocol handshake.
+async fn drain_stale_bytes(interface: &Interface, ep_in: u8) {
+    use nusb::transfer::RequestBuffer;
+    // Drain budget: small enough that a healthy device with no stale
+    // bytes barely notices, large enough that a couple of un-acked
+    // bulk packets will surface within the window.
+    let budget = Duration::from_millis(150);
+    let deadline = Instant::now() + budget;
+    let mut total = 0usize;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let req = RequestBuffer::new(4096);
+        let fut = interface.bulk_in(ep_in, req);
+        match tokio::time::timeout(remaining, fut).await {
+            Ok(completion) => match completion.into_result() {
+                Ok(data) if data.is_empty() => break,
+                Ok(data) => {
+                    total += data.len();
+                    eprintln!(
+                        "[usb_aoa] drained {} stale byte(s) from IN endpoint",
+                        data.len()
+                    );
+                }
+                Err(_e) => break,
+            },
+            Err(_) => {
+                // Timeout — no stale data. The pending future is dropped,
+                // which nusb should cancel.
+                break;
+            }
+        }
+    }
+    if total > 0 {
+        eprintln!("[usb_aoa] total drained: {total} byte(s)");
     }
 }
 
