@@ -8,6 +8,7 @@
 
 #[cfg(windows)]
 pub mod mf;
+pub mod sps_patcher;
 
 use crate::error::EngineResult;
 

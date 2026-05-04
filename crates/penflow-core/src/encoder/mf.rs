@@ -289,7 +289,17 @@ impl MfSession {
         // "submit → we noticed" instead of "submit → encoder done".
         let finished_at = Instant::now();
 
-        let bytes = read_sample_bytes(&sample)?;
+        let raw_bytes = read_sample_bytes(&sample)?;
+        // Patch SPS NAL(s) inside this packet to declare a 1-deep DPB
+        // and 0 reorder frames. This is the workaround for Adreno
+        // c2.qti.{avc,hevc}.decoder paced output_delay against SPS
+        // declarations rather than actual usage — see sps_patcher
+        // module docs. NVENC's MFT writes max_num_ref_frames > 1 by
+        // default and `CODECAPI_AVEncVideoMaxNumRefFrame` doesn't
+        // override it. Patching the bitstream after-the-fact does.
+        // No-op for packets without SPS (P-frames etc.).
+        let bytes = super::sps_patcher::patch_packet_for_low_latency_dpb(self.cfg.codec, &raw_bytes)
+            .unwrap_or(raw_bytes);
         // Match MF's preserved 1:1 input/output ordering: the head of the
         // meta FIFO corresponds to this output. Use the meta's pts_ns
         // (caller-supplied, exact ns) over `sample.GetSampleTime()`'s
