@@ -31,6 +31,18 @@ class MainActivity : Activity() {
     @Volatile
     private var currentSurface: android.view.Surface? = null
 
+    /**
+     * USB accessory streams. Held as a member so the underlying
+     * ParcelFileDescriptor isn't GC'd while the read coroutines on
+     * `client` are still using its file descriptor — `FileInputStream`
+     * and `FileOutputStream` keep weak refs to the PFD via the FD only,
+     * so when the only strong ref (this field) drops, the PFD's
+     * finalizer fires and closes the FD out from under the readers
+     * (manifests as `InterruptedIOException: read interrupted by close()
+     * on another thread` after ~5-10 s of GC delay).
+     */
+    private var usbStreams: UsbAccessoryConnection.Streams? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -130,6 +142,9 @@ class MainActivity : Activity() {
             try {
                 UsbAccessoryConnection.requestPermissionIfNeeded(ctx, accessory)
                 val streams = UsbAccessoryConnection.open(ctx, accessory)
+                // Keep a strong ref so PFD doesn't get finalized — see
+                // `usbStreams` doc.
+                usbStreams = streams
                 Log.i(TAG, "USB accessory transport ready: ${streams.accessoryLabel}")
                 client.connectViaStreams(streams.input, streams.output, caps)
             } catch (t: Throwable) {
@@ -146,6 +161,8 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         client.close()
+        usbStreams?.close()
+        usbStreams = null
         activityScope.cancel()
         super.onDestroy()
     }
