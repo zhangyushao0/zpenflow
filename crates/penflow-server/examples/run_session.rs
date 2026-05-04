@@ -22,7 +22,6 @@ use penflow_core::Engine;
 use penflow_server::vdd;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
-use penflow_transport::usb_aoa::{AccessoryStrings, UsbAoaTransport};
 use penflow_transport::Transport;
 
 fn main() -> ExitCode {
@@ -155,34 +154,12 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    let transport: Arc<dyn Transport> = if args.usb {
-        println!("[run_session] starting USB AOA accessory transport...");
-        // ADB's WinUSB driver instance claims the Android device's
-        // interface 0 — which blocks our control transfer for AOA
-        // GET_PROTOCOL. Kill the daemon up front so nusb can talk to
-        // the raw device. Once AOA negotiation succeeds the device
-        // re-enumerates as 0x18D1:0x2D01 (accessory + ADB) and adbd
-        // is welcome to re-attach to the new interface.
-        println!("[run_session]   stopping adb-server so the USB device is unclaimed...");
-        let _ = std::process::Command::new("adb")
-            .arg("kill-server")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        println!(
-            "[run_session]   PC will negotiate AOA mode with the first attached \
-             Android device, the device will re-enumerate as a Google accessory, \
-             and the Penflow app should launch via the USB_ACCESSORY_ATTACHED intent."
-        );
-        Arc::new(UsbAoaTransport::new(AccessoryStrings::default_penflow()))
-    } else {
-        println!("[run_session] starting ADB reverse tunnel...");
-        Arc::new(
-            AdbLocalAbstractTransport::bind("penflow")
-                .await
-                .map_err(|e| format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?"))?,
-        )
-    };
+    println!("[run_session] starting ADB reverse tunnel...");
+    let transport: Arc<dyn Transport> = Arc::new(
+        AdbLocalAbstractTransport::bind("penflow")
+            .await
+            .map_err(|e| format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?"))?,
+    );
 
     println!("[run_session] transport ready. Launch the Penflow app on the device now.");
 
@@ -193,9 +170,12 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         // The H.264 path costs more on the decoder side because NVENC's
         // H.264 SPS inflates max_num_ref_frames — see SessionConfig
         // default in session.rs for the full story.
-        codec: Codec::Hevc,
+        codec: if args.h264 { Codec::H264 } else { Codec::Hevc },
         bitrate_bps: args.bitrate_bps,
         fps: args.fps,
+        idr_interval: None,
+        motion_idr_threshold_bytes: None,
+        motion_idr_min_interval: Duration::from_millis(250),
         vdd,
     };
 
@@ -295,12 +275,10 @@ struct Args {
     /// `--vdd-probe`: enable VDD, attach display topology, wait for DXGI,
     /// then disable it again. Does not start ADB or wait for Android.
     vdd_probe: bool,
-    /// `--usb`: use the AOA USB bulk transport instead of ADB
-    /// localabstract. The Android client must have the
-    /// `USB_ACCESSORY_ATTACHED` intent filter active (see
-    /// `android/app/src/main/AndroidManifest.xml` and
-    /// `res/xml/accessory_filter.xml`).
-    usb: bool,
+    /// `--h264`: use H.264 instead of HEVC. Default HEVC is faster on
+    /// Adreno's `.low_latency` decoder; H.264 fallback for older devices
+    /// without HEVC decode hardware.
+    h264: bool,
 }
 
 fn parse_args() -> Args {
@@ -310,7 +288,7 @@ fn parse_args() -> Args {
         fps: 120,
         no_vdd: false,
         vdd_probe: false,
-        usb: false,
+        h264: false,
     };
     let argv: Vec<String> = env::args().skip(1).collect();
     let mut i = 0;
@@ -340,8 +318,8 @@ fn parse_args() -> Args {
             "--vdd-probe" => {
                 a.vdd_probe = true;
             }
-            "--usb" => {
-                a.usb = true;
+            "--h264" => {
+                a.h264 = true;
             }
             other => {
                 eprintln!("[run_session] ignoring unknown arg: {other}");

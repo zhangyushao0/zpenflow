@@ -1,13 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- USB Accessory mode (AOA v2). Optional so the app still installs on
-         devices/emulators without USB host support — the LocalSocket+ADB
-         transport remains a working fallback in that case. -->
-    <uses-feature
-        android:name="android.hardware.usb.accessory"
-        android:required="false" />
-
     <application
         android:label="Penflow"
         android:allowBackup="false"
@@ -25,18 +18,6 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
-
-            <!-- Triggered when the PC sends AOA START_ACCESSORY and the
-                 device re-enumerates. The accessory_filter.xml must match
-                 the PC's AccessoryStrings exactly (manufacturer / model /
-                 version), otherwise the system shows a chooser dialog
-                 instead of routing straight to us. -->
-            <intent-filter>
-                <action android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED" />
-            </intent-filter>
-            <meta-data
-                android:name="android.hardware.usb.action.USB_ACCESSORY_ATTACHED"
-                android:resource="@xml/accessory_filter" />
         </activity>
 
     </application>

@@ -65,13 +65,6 @@ pub const CODEC_CAPS_HEVC: u8 = 1 << 1;
 /// `HELLO_ANDROID.codec_caps` bitmask: client decodes AV1.
 pub const CODEC_CAPS_AV1: u8 = 1 << 2;
 
-/// Connection-readiness probe byte (scrcpy-inspired) — both sides exchange
-/// this single byte before any framed message, to distinguish a real
-/// connection from an ADB tunnel that accepted the TCP handshake while the
-/// peer is still initialising. **Not currently used by the Android client;
-/// reserved for a future Android update** (design.md §7.3).
-pub const READY_BYTE: u8 = 0xA5;
-
 /// Largest payload we'll accept on a single framed message. Sized for
 /// generous-but-bounded; any realistic VIDEO_FRAME at 50 Mbps × 1 frame is
 /// well under 1 MB.

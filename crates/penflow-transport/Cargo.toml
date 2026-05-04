@@ -9,7 +9,6 @@ description = "Pluggable transport layer for the Penflow PC↔Android session."
 [dependencies]
 async-trait.workspace = true
 tokio = { workspace = true, features = ["net", "rt", "sync", "time", "io-util"] }
-nusb.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

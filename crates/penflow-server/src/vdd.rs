@@ -61,7 +61,16 @@ use windows::Win32::Devices::Display::{
 };
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentProcess, GetCurrentProcessId, OpenEventW, OpenProcessToken, SetEvent,
+    SYNCHRONIZATION_ACCESS_RIGHTS,
+};
+/// Standard SYNCHRONIZE access right (winnt.h `STANDARD_RIGHTS_REQUIRED`
+/// adjacent), required for OpenEventW so the helper can WaitForSingleObject.
+const SYNCHRONIZE: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000);
+/// `EVENT_MODIFY_STATE = 0x0002`. Required for `SetEvent` / `ResetEvent`
+/// on a handle obtained via `OpenEventW`.
+const EVENT_MODIFY_STATE: SYNCHRONIZATION_ACCESS_RIGHTS = SYNCHRONIZATION_ACCESS_RIGHTS(0x0002);
 use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
 use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -186,6 +195,61 @@ pub struct VddController {
     instance_id: String,
     friendly_name: String,
     enabled: bool,
+    /// In unelevated mode: a long-lived elevated helper that did the
+    /// initial `CM_Enable_DevNode` and now sleeps on a named event. We
+    /// signal the event on `disable()` / `Drop` so the helper does the
+    /// matching `CM_Disable_DevNode` and exits — costing only ONE UAC
+    /// prompt (at first enable) instead of one each for enable+disable.
+    resident: Option<ResidentHelper>,
+}
+
+/// Live resident-mode helper. The fields aren't `Debug`-able cleanly
+/// (raw HANDLEs), so we hand-implement a stub.
+struct ResidentHelper {
+    /// Elevated child process handle. Used to wait-for-exit on shutdown.
+    process: HANDLE,
+    /// Helper signals this after `CM_Enable_DevNode` completes. We hold
+    /// it so we can re-wait on it if needed (and to keep its name reserved).
+    done_event: HANDLE,
+    /// We signal this to ask the helper to disable + exit.
+    stop_event: HANDLE,
+}
+
+impl std::fmt::Debug for ResidentHelper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResidentHelper")
+            .field("process", &(self.process.0 as usize))
+            .field("done_event", &(self.done_event.0 as usize))
+            .field("stop_event", &(self.stop_event.0 as usize))
+            .finish()
+    }
+}
+
+unsafe impl Send for ResidentHelper {}
+unsafe impl Sync for ResidentHelper {}
+
+impl ResidentHelper {
+    /// Signal the stop event, wait briefly for the helper to exit
+    /// (so `CM_Disable_DevNode` actually completes before we tear down),
+    /// then close handles.
+    fn shutdown(&mut self) {
+        unsafe {
+            let _ = SetEvent(self.stop_event);
+            use windows::Win32::System::Threading::WaitForSingleObject;
+            let _ = WaitForSingleObject(self.process, 5000);
+        }
+    }
+}
+
+impl Drop for ResidentHelper {
+    fn drop(&mut self) {
+        self.shutdown();
+        unsafe {
+            let _ = CloseHandle(self.process);
+            let _ = CloseHandle(self.done_event);
+            let _ = CloseHandle(self.stop_event);
+        }
+    }
 }
 
 impl VddController {
@@ -209,6 +273,7 @@ impl VddController {
             instance_id: id.clone(),
             friendly_name: id,
             enabled: false,
+            resident: None,
         }
     }
 
@@ -256,28 +321,44 @@ impl VddController {
             instance_id: c.instance_id,
             friendly_name: c.friendly_name,
             enabled: false,
+            resident: None,
         }))
     }
 
-    /// Enable the device. If the current process isn't elevated, spawns
-    /// an elevated helper (`<exe> --vdd-helper enable <instance>`) via
-    /// `ShellExecuteW("runas", ...)` — Windows shows the UAC prompt and
-    /// the user clicks Yes once. The helper does the actual CM call and
-    /// exits.
+    /// Enable the device. If the current process is elevated, just calls
+    /// `CM_Enable_DevNode` directly. Otherwise, spawns a long-lived
+    /// elevated helper (`--vdd-helper-resident <event-name> <instance>`)
+    /// that does the enable AND will do the matching disable when we
+    /// later signal it on `Drop`/`disable()` — keeping us at one UAC
+    /// prompt total instead of one for enable + one for disable.
     pub fn enable(&mut self) -> Result<(), VddError> {
         if is_process_elevated() {
             cm_enable(&self.instance_id)?;
             verify_devnode_started(&self.instance_id)?;
+        } else if self.resident.is_none() {
+            self.resident = Some(spawn_resident_helper(&self.instance_id)?);
+            // The helper does CM_Enable_DevNode in its own elevated
+            // context. Caller (session.rs) follows up with
+            // wait_for_virtual_monitor() which DXGI-polls until the
+            // virtual monitor actually appears, so we don't need a
+            // separate "enable done" signal.
         } else {
+            // Already running. Re-enable in resident mode is not yet
+            // supported (would need a second signal); fall back to the
+            // old per-call helper which costs another UAC prompt.
             run_helper_elevated("enable", &self.instance_id)?;
         }
         self.enabled = true;
         Ok(())
     }
 
-    /// Disable the device. Same elevation handling as `enable`.
+    /// Disable the device. If a resident helper is alive, signal it (no
+    /// UAC). Otherwise fall back to spawning a one-shot elevated helper.
     pub fn disable(&mut self) -> Result<(), VddError> {
-        if is_process_elevated() {
+        if let Some(mut helper) = self.resident.take() {
+            helper.shutdown();
+            // helper drops here, closing handles.
+        } else if is_process_elevated() {
             cm_disable(&self.instance_id)?;
         } else {
             run_helper_elevated("disable", &self.instance_id)?;
@@ -459,11 +540,23 @@ pub fn helper_main(args: &[String]) -> ExitCode {
     log.append(&format!("elevated: {}", is_process_elevated()));
 
     if args.len() < 3 {
-        log.append("usage error: expected `--vdd-helper <enable|disable> <instance_id>`");
+        log.append("usage error: expected `--vdd-helper <enable|disable|resident> <instance_id> [event-name]`");
         return ExitCode::from(2);
     }
     let action = args[1].as_str();
     let instance_id = args[2].as_str();
+
+    // Resident sub-mode: helper does enable now, then waits on the named
+    // event for the parent to ask us to disable+exit. The event name is
+    // passed as the 4th arg.
+    if action == "resident" {
+        if args.len() < 4 {
+            log.append("usage error: resident mode needs `<instance_id> <event_name>`");
+            return ExitCode::from(2);
+        }
+        let event_name = args[3].as_str();
+        return resident_helper_main(&log, instance_id, event_name);
+    }
 
     // Snapshot device status BEFORE the action so we can compare.
     match snapshot_devnode_status(instance_id) {
@@ -509,6 +602,202 @@ pub fn helper_main(args: &[String]) -> ExitCode {
             log.append(&format!("{action} failed: {e}"));
             ExitCode::from(1)
         }
+    }
+}
+
+/// Resident-mode helper. Two named events bracket the lifetime:
+///
+/// - `<base>-done`: the helper signals this AFTER it finishes the
+///   initial `CM_Enable_DevNode` + verify. The parent waits on it so
+///   `enable()` is effectively synchronous (matches old `WaitForSingleObject`
+///   semantics) and only returns once the device is actually started.
+/// - `<base>-stop`: the parent signals this when it wants the helper to
+///   tear down. The helper then runs `CM_Disable_DevNode` and exits.
+///
+/// Two events instead of one (or one with manual reset + race-prone
+/// handshake) keeps the protocol stupid-obvious.
+fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) -> ExitCode {
+    let done_name = format!("{event_base}-done");
+    let stop_name = format!("{event_base}-stop");
+    log.append(&format!(
+        "resident: enabling {instance_id}; events done={done_name} stop={stop_name}"
+    ));
+
+    let done_w = wide_z(&done_name);
+    let done_evt = match unsafe {
+        OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(done_w.as_ptr()))
+    } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            log.append("OpenEventW(done) failed; cannot proceed");
+            return ExitCode::from(2);
+        }
+    };
+    let stop_w = wide_z(&stop_name);
+    let stop_evt = match unsafe {
+        OpenEventW(SYNCHRONIZE, false, PCWSTR::from_raw(stop_w.as_ptr()))
+    } {
+        Ok(h) if !h.is_invalid() => h,
+        _ => {
+            log.append("OpenEventW(stop) failed; cannot proceed");
+            unsafe { let _ = CloseHandle(done_evt); };
+            return ExitCode::from(2);
+        }
+    };
+
+    // Initial enable.
+    if let Err(e) = cm_enable(instance_id) {
+        log.append(&format!("CM_Enable_DevNode failed: {e}"));
+        unsafe {
+            let _ = SetEvent(done_evt); // unblock parent so it can fail fast
+            let _ = CloseHandle(done_evt);
+            let _ = CloseHandle(stop_evt);
+        };
+        return ExitCode::from(1);
+    }
+    log.append("CM_Enable_DevNode returned CR_SUCCESS");
+    match verify_devnode_started(instance_id) {
+        Ok(()) => log.append("verify_devnode_started: device is healthy after enable"),
+        Err(e) => log.append(&format!("verify_devnode_started failed: {e}")),
+    }
+
+    // Tell the parent enable is done. The parent's `enable()` returns
+    // here; subsequent `wait_for_virtual_monitor` polls DXGI until the
+    // IddCx target attaches to the desktop.
+    unsafe { let _ = SetEvent(done_evt); }
+
+    // Sleep until the parent signals stop.
+    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
+    let _ = unsafe { WaitForSingleObject(stop_evt, INFINITE) };
+    log.append("stop event signaled; tearing down");
+
+    // Final disable.
+    let exit_code = match cm_disable(instance_id) {
+        Ok(()) => {
+            log.append("CM_Disable_DevNode returned CR_SUCCESS; exiting 0");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            log.append(&format!("CM_Disable_DevNode failed: {e}"));
+            ExitCode::from(1)
+        }
+    };
+
+    unsafe {
+        let _ = CloseHandle(done_evt);
+        let _ = CloseHandle(stop_evt);
+    };
+    exit_code
+}
+
+/// Spawn the elevated resident helper that owns this VDD device's
+/// enable/disable cycle for the lifetime of our process. Blocks until
+/// the helper signals completion of the initial `CM_Enable_DevNode`,
+/// matching the synchronous semantics of the legacy non-resident path.
+fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> {
+    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows::Win32::System::Threading::WaitForSingleObject;
+
+    let exe = env::current_exe()
+        .map_err(|e| VddError::ShellExecute(format!("can't resolve current exe path: {e}")))?;
+
+    // Unique-per-process event base name in the Local\\ namespace.
+    // `<base>-done` and `<base>-stop` are the two actual events.
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let pid = unsafe { GetCurrentProcessId() };
+    let ctr = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let event_base = format!("Local\\penflow-vdd-{pid}-{ctr}");
+
+    let create = |suffix: &str| -> Result<HANDLE, VddError> {
+        let name = format!("{event_base}-{suffix}");
+        let name_w = wide_z(&name);
+        unsafe {
+            CreateEventW(
+                Some(std::ptr::null::<SECURITY_ATTRIBUTES>()),
+                true,  // manual reset
+                false, // initial state: non-signaled
+                PCWSTR::from_raw(name_w.as_ptr()),
+            )
+        }
+        .map_err(|e| VddError::ShellExecute(format!("CreateEventW({suffix}): {e}")))
+    };
+    let done_evt = create("done")?;
+    let stop_evt = match create("stop") {
+        Ok(h) => h,
+        Err(e) => {
+            unsafe { let _ = CloseHandle(done_evt); };
+            return Err(e);
+        }
+    };
+
+    // Spawn helper elevated (UAC prompt).
+    let exe_w = wide_z(exe.as_os_str());
+    let params = format!(
+        "--vdd-helper resident \"{instance_id}\" \"{event_base}\""
+    );
+    let params_w = wide_z(&params);
+    let verb_w = wide_z("runas");
+    let mut sei = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: PCWSTR::from_raw(verb_w.as_ptr()),
+        lpFile: PCWSTR::from_raw(exe_w.as_ptr()),
+        lpParameters: PCWSTR::from_raw(params_w.as_ptr()),
+        lpDirectory: PCWSTR::null(),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+    if let Err(e) = unsafe { ShellExecuteExW(&mut sei) } {
+        unsafe {
+            let _ = CloseHandle(done_evt);
+            let _ = CloseHandle(stop_evt);
+        };
+        return Err(VddError::ShellExecute(format!("ShellExecuteExW: {e}")));
+    }
+    let process = sei.hProcess;
+    if process.is_invalid() {
+        unsafe {
+            let _ = CloseHandle(done_evt);
+            let _ = CloseHandle(stop_evt);
+        };
+        return Err(VddError::ShellExecute(
+            "ShellExecuteExW returned no process handle (likely user clicked No on UAC)".into(),
+        ));
+    }
+
+    // Block until helper finishes initial CM_Enable_DevNode (or process
+    // dies, whichever comes first). We use 30 s — generous; cm_enable +
+    // verify_devnode_started typically completes in < 2 s.
+    let waitables = [done_evt, process];
+    use windows::Win32::System::Threading::WaitForMultipleObjects;
+    let r = unsafe { WaitForMultipleObjects(&waitables, false, 30_000) };
+    if r == WAIT_OBJECT_0 {
+        // done_evt fired: helper finished cm_enable.
+        Ok(ResidentHelper {
+            process,
+            done_event: done_evt,
+            stop_event: stop_evt,
+        })
+    } else {
+        // Either helper died or we timed out. Either way bail out and
+        // close handles. Caller falls back to per-call helper or errors.
+        let _ = r; // suppress unused-value warning
+        // Did the helper exit? If yes, surface its exit code if non-zero.
+        let mut code: u32 = 0;
+        let _ = unsafe { WaitForSingleObject(process, 0) };
+        let _ = unsafe {
+            windows::Win32::System::Threading::GetExitCodeProcess(process, &mut code)
+        };
+        unsafe {
+            let _ = CloseHandle(done_evt);
+            let _ = CloseHandle(stop_evt);
+            let _ = CloseHandle(process);
+        };
+        Err(VddError::ShellExecute(format!(
+            "resident helper did not signal enable-done within 30s (exit code: {code})"
+        )))
     }
 }
 

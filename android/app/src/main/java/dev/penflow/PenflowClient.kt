@@ -14,7 +14,6 @@ import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.withContext
 import java.io.DataInputStream
 import java.io.DataOutputStream
 
@@ -44,11 +43,16 @@ class PenflowClient(
     private var decoder: VideoDecoder? = null
     private val sendMutex = Mutex()
 
+    private var connectJob: Job? = null
     private var readerJob: Job? = null
     private var timeSyncJob: Job? = null
     private var penSendJob: Job? = null
     private var touchSendJob: Job? = null
     private val timeSync = TimeSync()
+    /** Set to true by the public `disconnect()` so the reconnect loop
+     *  in `connect()` knows to bail out of its retry cycle. Reset by a
+     *  fresh `connect()` call. */
+    @Volatile private var stopRequested = false
 
     // FIFO queue from MotionEvent dispatch (UI thread) to a single consumer
     // coroutine that performs the actual socket send. Replaces the previous
@@ -104,50 +108,63 @@ class PenflowClient(
         )
     }
 
-    /** Connect via the ADB localabstract socket (default / development path). */
+    /**
+     * Connect via the ADB localabstract socket and keep retrying on
+     * disconnect / error until [disconnect] is called. The PC service
+     * may stop and resume freely (e.g. when the user toggles Pause/Resume
+     * in the GUI); the Android side just keeps probing the abstract
+     * socket with exponential backoff and re-handshakes whenever the PC
+     * comes back.
+     */
     fun connect(deviceCaps: DeviceCaps) {
-        scope.launch {
-            try {
-                onState(State.Connecting)
-                val sock = LocalSocket().apply {
-                    connect(LocalSocketAddress(abstractName, LocalSocketAddress.Namespace.ABSTRACT))
+        stopRequested = false
+        connectJob?.cancel()
+        connectJob = scope.launch {
+            var backoffMs = 500L
+            while (!stopRequested) {
+                try {
+                    onState(State.Connecting)
+                    val sock = LocalSocket().apply {
+                        connect(
+                            LocalSocketAddress(abstractName, LocalSocketAddress.Namespace.ABSTRACT)
+                        )
+                    }
+                    socket = sock
+                    val out = DataOutputStream(sock.outputStream)
+                    val input = DataInputStream(sock.inputStream)
+                    output = out
+                    // handshakeAndPump returns when the session ends
+                    // (clean disconnect or read-loop EOF/error).
+                    handshakeAndPump(input, out, deviceCaps)
+                    // Steady connect → reset backoff on next attempt.
+                    backoffMs = 500L
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (t: Throwable) {
+                    Log.w(TAG, "session ended (${t.javaClass.simpleName}: ${t.message}); will retry")
                 }
-                socket = sock
-                val out = DataOutputStream(sock.outputStream)
-                val input = DataInputStream(sock.inputStream)
-                output = out
-                handshakeAndPump(input, out, deviceCaps)
-            } catch (t: Throwable) {
-                Log.e(TAG, "ADB connect failed", t)
-                onState(State.Error(t.message ?: t.javaClass.simpleName))
-                disconnect()
+                cleanupSessionState()
+                if (stopRequested) break
+                onState(State.Disconnected)
+                kotlinx.coroutines.delay(backoffMs)
+                backoffMs = (backoffMs * 2).coerceAtMost(5000L)
             }
+            onState(State.Disconnected)
         }
     }
 
-    /**
-     * Connect via pre-opened streams (e.g. from a USB accessory's
-     * `ParcelFileDescriptor`). Used by the AOA path — see
-     * [UsbAccessoryConnection].
-     */
-    fun connectViaStreams(
-        rawInput: java.io.InputStream,
-        rawOutput: java.io.OutputStream,
-        deviceCaps: DeviceCaps,
-    ) {
-        scope.launch {
-            try {
-                onState(State.Connecting)
-                val out = DataOutputStream(rawOutput)
-                val input = DataInputStream(rawInput)
-                output = out
-                handshakeAndPump(input, out, deviceCaps)
-            } catch (t: Throwable) {
-                Log.e(TAG, "stream connect failed", t)
-                onState(State.Error(t.message ?: t.javaClass.simpleName))
-                disconnect()
-            }
-        }
+    /** Tear down per-session jobs / streams without exiting the
+     *  reconnect loop. Safe to call multiple times. */
+    private fun cleanupSessionState() {
+        touchSendJob?.cancel(); touchSendJob = null
+        penSendJob?.cancel(); penSendJob = null
+        timeSyncJob?.cancel(); timeSyncJob = null
+        readerJob?.cancel(); readerJob = null
+        try { socket?.close() } catch (_: Throwable) {}
+        socket = null
+        output = null
+        decoder?.stop()
+        decoder = null
     }
 
     private suspend fun handshakeAndPump(
@@ -200,8 +217,13 @@ class PenflowClient(
                 decoder = dec
                 onState(State.Connected(hello.width, hello.height, hello.fps))
 
-                // 5. read frames forever
-                readerJob = scope.launch { readLoop(input, dec) }
+                // 5. read frames forever (this is the session lifetime —
+                //    we await the read loop so handshakeAndPump only
+                //    returns when the session genuinely ends; see the
+                //    reconnect loop in `connect()` which expects exactly
+                //    that semantic).
+                val rJob = scope.launch { readLoop(input, dec) }
+                readerJob = rJob
 
                 // 6. start periodic time-sync ping (1 Hz)
                 timeSyncJob = scope.launch { timeSyncLoop(out) }
@@ -211,6 +233,12 @@ class PenflowClient(
 
                 // 8. single-consumer touch sender
                 touchSendJob = scope.launch { touchSendLoop(out) }
+
+                // Block until the read loop ends (PC closed connection,
+                // EOF, decode error, or it was canceled). The auxiliary
+                // jobs get torn down by `cleanupSessionState()` in the
+                // outer reconnect loop.
+                rJob.join()
     }
 
     private suspend fun waitForSurface(): Surface {
@@ -245,7 +273,8 @@ class PenflowClient(
                         val cutoff = header.ptsNs - pendingSampleMaxAgeNs
                         pendingFrameSamples.keys.removeAll { it < cutoff }
                     }
-                    dec.feed(header.ptsNs, header.coded)
+                    val isKeyframe = (header.flags and Protocol.FRAME_FLAG_KEYFRAME) != 0
+                    dec.feed(header.ptsNs, header.coded, isKeyframe)
                 }
                 Protocol.MSG_TELEMETRY -> {
                     hud?.recordServerTelemetry(Protocol.decodeTelemetry(payload))
@@ -347,21 +376,16 @@ class PenflowClient(
     }
 
     fun disconnect() {
-        touchSendJob?.cancel()
-        penSendJob?.cancel()
-        timeSyncJob?.cancel()
-        readerJob?.cancel()
+        stopRequested = true
+        connectJob?.cancel()
+        connectJob = null
         try {
             output?.let {
                 Protocol.sendMsg(it, Protocol.MSG_ANDROID_GOODBYE, ByteArray(0))
             }
         } catch (_: Throwable) {
         }
-        try { socket?.close() } catch (_: Throwable) {}
-        socket = null
-        output = null
-        decoder?.stop()
-        decoder = null
+        cleanupSessionState()
         onState(State.Disconnected)
     }
 

@@ -20,9 +20,6 @@ async-trait = "0.1"
 thiserror = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Pure-Rust USB. Used by penflow-transport's `usb_aoa` for the
-# Android Open Accessory bulk-endpoint transport.
-nusb = "0.1"
 
 [profile.release]
 lto = "thin"

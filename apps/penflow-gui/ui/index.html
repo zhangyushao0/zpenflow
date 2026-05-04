@@ -7,10 +7,108 @@
     <link rel="stylesheet" href="style.css" />
 </head>
 <body>
-    <main>
+<main>
+    <header>
         <h1>Penflow</h1>
-        <p class="muted">v0.1.0 — pre-engine scaffold</p>
-        <p class="muted small">No engine wired up yet. Window opens, that's all.</p>
-    </main>
+        <div id="status-pill" class="status-pill">starting…</div>
+    </header>
+
+    <section class="card" id="status-card">
+        <h2>Status</h2>
+        <div class="status-detail" id="status-detail">—</div>
+        <div class="row" id="status-actions">
+            <button id="btn-toggle">Pause</button>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Encoder</h2>
+        <div class="row">
+            <label for="bitrate">Bitrate (Mbps)</label>
+            <input id="bitrate" type="number" min="5" max="500" step="5" />
+        </div>
+        <div class="row">
+            <label for="fps">Frame rate</label>
+            <select id="fps">
+                <option value="60">60</option>
+                <option value="90">90</option>
+                <option value="120">120</option>
+            </select>
+        </div>
+        <div class="row">
+            <label for="codec">Codec</label>
+            <select id="codec">
+                <option value="hevc">HEVC (smaller, faster decode)</option>
+                <option value="h264">H.264 (broader compatibility)</option>
+            </select>
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>Pen buttons</h2>
+        <p class="hint small">
+            Each button can hold a key (e.g. Shift while pressed), tap a key
+            once on press, send a chord, click a mouse button, or toggle the
+            eraser.
+        </p>
+        <div class="row binding-row" data-slot="0">
+            <label>Barrel button 1</label>
+            <select class="binding-kind">
+                <option value="none">None</option>
+                <option value="key_tap">Key tap</option>
+                <option value="key_hold" selected>Key hold</option>
+                <option value="key_chord">Key chord</option>
+                <option value="mouse_button">Mouse button</option>
+                <option value="eraser_toggle">Eraser toggle</option>
+            </select>
+            <input class="binding-arg" placeholder="key" value="Ctrl" />
+        </div>
+        <div class="row binding-row" data-slot="1">
+            <label>Barrel button 2</label>
+            <select class="binding-kind">
+                <option value="none">None</option>
+                <option value="key_tap">Key tap</option>
+                <option value="key_hold" selected>Key hold</option>
+                <option value="key_chord">Key chord</option>
+                <option value="mouse_button">Mouse button</option>
+                <option value="eraser_toggle">Eraser toggle</option>
+            </select>
+            <input class="binding-arg" placeholder="key" value="Shift" />
+        </div>
+        <div class="row binding-row" data-slot="2">
+            <label>Tertiary button</label>
+            <select class="binding-kind">
+                <option value="none">None</option>
+                <option value="key_tap" selected>Key tap</option>
+                <option value="key_hold">Key hold</option>
+                <option value="key_chord">Key chord</option>
+                <option value="mouse_button">Mouse button</option>
+                <option value="eraser_toggle">Eraser toggle</option>
+            </select>
+            <input class="binding-arg" placeholder="key" value="E" />
+        </div>
+    </section>
+
+    <section class="card">
+        <h2>System</h2>
+        <div class="row">
+            <label for="autostart">Start with Windows</label>
+            <input id="autostart" type="checkbox" />
+        </div>
+        <div class="row">
+            <label for="run-as-admin">
+                Always run as administrator
+                <span class="hint small" id="elev-hint">(restart required)</span>
+            </label>
+            <input id="run-as-admin" type="checkbox" />
+        </div>
+    </section>
+
+    <footer>
+        <button id="btn-save" class="primary">Save settings</button>
+        <span id="save-status" class="muted small"></span>
+    </footer>
+</main>
+<script type="module" src="app.js"></script>
 </body>
 </html>

@@ -113,6 +113,7 @@ class VideoDecoder(
     private val lock = Any()
     private val pendingData = ArrayDeque<Pair<Long, ByteArray>>()
     private val parkedIndices = ArrayDeque<Int>()
+    private val pendingKeyframeFlags = HashMap<Long, Boolean>()
 
     fun start() {
         // codec.name reflects the actual decoder we got from
@@ -246,9 +247,16 @@ class VideoDecoder(
     /** Submit a coded video access unit (Annex-B framed). `framePtsNs` is the
      *  server-stamped PC pts_ns; we pass it through MediaCodec as the input
      *  buffer's `presentationTimeUs` (truncated to microseconds) so the
-     *  network thread can match outputs back by PTS instead of FIFO order. */
-    fun feed(framePtsNs: Long, coded: ByteArray) {
+     *  network thread can match outputs back by PTS instead of FIFO order.
+     *  `isKeyframe` propagates the server-side FRAME_FLAG_KEYFRAME so that
+     *  IDR access units carry MediaCodec's BUFFER_FLAG_KEY_FRAME, hinting
+     *  to the codec that it can drop any cached reference state and re-anchor. */
+    fun feed(framePtsNs: Long, coded: ByteArray, isKeyframe: Boolean = false) {
         val parkedIndex: Int? = synchronized(lock) {
+            // Stash the keyframe flag with the queued data so the codec
+            // callback applies it correctly when the buffer becomes
+            // available later.
+            pendingKeyframeFlags[framePtsNs] = isKeyframe
             if (parkedIndices.isNotEmpty()) {
                 parkedIndices.removeFirst()
             } else {
@@ -265,7 +273,11 @@ class VideoDecoder(
         val buf = c.getInputBuffer(index) ?: return
         buf.clear()
         buf.put(data)
-        c.queueInputBuffer(index, 0, data.size, framePtsNs / 1000, 0)
+        val isKey = synchronized(lock) {
+            pendingKeyframeFlags.remove(framePtsNs) ?: false
+        }
+        val flags = if (isKey) MediaCodec.BUFFER_FLAG_KEY_FRAME else 0
+        c.queueInputBuffer(index, 0, data.size, framePtsNs / 1000, flags)
     }
 
     fun stop() {
@@ -302,6 +314,5 @@ class VideoDecoder(
             // "lito" = Snapdragon 765G platform = Adreno 620.
             return hw == "lito"
         }
-
     }
 }

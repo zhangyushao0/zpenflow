@@ -113,6 +113,16 @@ pub struct SessionConfig {
     pub bitrate_bps: u32,
     /// Encoder frame rate.
     pub fps: u32,
+    /// Optional periodic IDR cadence. This is a transport/decoder recovery
+    /// guard: if the Android hardware decoder corrupts one reference frame,
+    /// the next IDR bounds how long the corruption can propagate.
+    pub idr_interval: Option<Duration>,
+    /// Optional motion-recovery trigger. When a non-IDR packet exceeds this
+    /// many coded bytes, request an IDR for the next frame. Useful for USB AOA
+    /// on Qualcomm where corruption is triggered by large motion P-frames.
+    pub motion_idr_threshold_bytes: Option<usize>,
+    /// Minimum interval between motion-triggered IDR requests.
+    pub motion_idr_min_interval: Duration,
     /// Optional Virtual Display Driver controller. When set, the session
     /// calls `enable()` after the handshake completes and captures the
     /// virtual monitor that appears; on disconnect (or panic / Drop) the
@@ -164,6 +174,9 @@ impl Default for SessionConfig {
             // RTX 5070 handles 120 fps × 2880×1800 well within budget
             // (~3 ms encode at 60, scales sub-linearly).
             fps: 120,
+            idr_interval: None,
+            motion_idr_threshold_bytes: None,
+            motion_idr_min_interval: Duration::from_millis(250),
             vdd: None,
         }
     }
@@ -251,6 +264,7 @@ impl Session {
                 .send(SessionEvent::Connecting { peer: peer_label.clone() })
                 .await;
         }
+
 
         // 2. Handshake: read HELLO_ANDROID.
         let (msg_id, payload) = read_frame(&mut reader).await?;
@@ -455,11 +469,19 @@ impl Session {
         let writer = Arc::new(Mutex::new(writer));
         let stop = Arc::new(tokio::sync::Notify::new());
 
+        // IDR-request relay: read_loop signals here, run() owns the engine
+        // and calls request_idr() in response. Avoids needing to share &Engine
+        // across tasks.
+        let (idr_tx, mut idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
         let frame_pump = tokio::spawn(frame_pump(
             queue.clone(),
             writer.clone(),
             stats.clone(),
             stop.clone(),
+            idr_tx.clone(),
+            self.cfg.motion_idr_threshold_bytes,
+            self.cfg.motion_idr_min_interval,
         ));
 
         let telemetry_pump = tokio::spawn(telemetry_pump(
@@ -469,10 +491,22 @@ impl Session {
             stop.clone(),
         ));
 
-        // IDR-request relay: read_loop signals here, run() owns the engine
-        // and calls request_idr() in response. Avoids needing to share &Engine
-        // across tasks.
-        let (idr_tx, mut idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let periodic_idr = self
+            .cfg
+            .idr_interval
+            .filter(|period| !period.is_zero())
+            .map(|period| {
+                eprintln!("[session] periodic IDR enabled: every {period:?}");
+                let tx = idr_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(period).await;
+                        if tx.send(()).is_err() {
+                            break;
+                        }
+                    }
+                })
+            });
 
         let dispatch = tokio::spawn(read_loop(
             reader,
@@ -503,6 +537,9 @@ impl Session {
             }
         };
 
+        if let Some(task) = periodic_idr {
+            task.abort();
+        }
         stop.notify_waiters();
         let _ = tokio::time::timeout(Duration::from_millis(500), frame_pump).await;
         let _ = tokio::time::timeout(Duration::from_millis(500), telemetry_pump).await;
@@ -576,7 +613,11 @@ async fn frame_pump(
     writer: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     stats: Arc<Stats>,
     stop: Arc<tokio::sync::Notify>,
+    idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
+    motion_idr_threshold_bytes: Option<usize>,
+    motion_idr_min_interval: Duration,
 ) {
+    let mut last_motion_idr = Instant::now() - motion_idr_min_interval;
     loop {
         let q = queue.clone();
         let pop = tokio::task::spawn_blocking(move || q.pop_timeout(Duration::from_millis(200)));
@@ -588,15 +629,18 @@ async fn frame_pump(
                     Ok(None) => continue,
                     Err(_) => return,
                 };
-                let mut flags = if pkt.is_keyframe { FRAME_FLAG_KEYFRAME } else { 0 };
-                if pkt.encode_us.is_some() {
+                let is_keyframe = pkt.is_keyframe;
+                let coded_len = pkt.bytes.len();
+                let encode_us = pkt.encode_us;
+                let mut flags = if is_keyframe { FRAME_FLAG_KEYFRAME } else { 0 };
+                if encode_us.is_some() {
                     flags |= FRAME_FLAG_EXTENDED;
                 }
                 let vf = VideoFrame {
                     pts_ns: pkt.pts_ns,
                     flags,
                     capture_us: None,
-                    encode_us: pkt.encode_us,
+                    encode_us,
                     coded: pkt.bytes,
                 };
                 let bytes = encode_frame(MSG_VIDEO_FRAME, &vf.encode());
@@ -609,8 +653,21 @@ async fn frame_pump(
                     eprintln!("[frame_pump] flush failed: {e}");
                     return;
                 }
+                if let Some(threshold) = motion_idr_threshold_bytes {
+                    if !is_keyframe
+                        && coded_len >= threshold
+                        && last_motion_idr.elapsed() >= motion_idr_min_interval
+                    {
+                        eprintln!(
+                            "[frame_pump] large P-frame ({} B >= {} B); requesting recovery IDR",
+                            coded_len, threshold
+                        );
+                        let _ = idr_tx.send(());
+                        last_motion_idr = Instant::now();
+                    }
+                }
                 stats.frames.fetch_add(1, Ordering::Relaxed);
-                if let Some(us) = pkt.encode_us {
+                if let Some(us) = encode_us {
                     stats.record_encode_us(us);
                 }
                 let depth = queue.stats().depth as u32;

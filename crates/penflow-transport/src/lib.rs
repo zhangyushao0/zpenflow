@@ -15,8 +15,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(any(unix, windows))]
 pub mod adb;
-#[cfg(any(unix, windows))]
-pub mod usb_aoa;
+// `pub mod usb_aoa` was removed — the AOA path produced persistent block
+// artifacts on Snapdragon 8s Gen 3 / Adreno 720 that we couldn't fix at
+// the software layer (see `docs/usb-aoa-tearing.md` for the full diagnostic
+// log). Recover via `git log --diff-filter=D -- crates/penflow-transport/src/usb_aoa.rs`
+// if you want to re-attempt.
 
 /// One bidirectional byte stream to the connected Android client.
 ///

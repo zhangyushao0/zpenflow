@@ -23,7 +23,9 @@ mod tests {
     #[test]
     fn session_config_default_round_trips() {
         let cfg = super::SessionConfig::default();
-        assert_eq!(cfg.fps, 60);
+        // 120 fps matches the MovinkPad's panel; if you bump the default
+        // again, update this assertion too.
+        assert_eq!(cfg.fps, 120);
         assert_eq!(cfg.codec, penflow_core::encoder::Codec::Hevc);
         assert!(cfg.bitrate_bps >= 1_000_000);
     }
