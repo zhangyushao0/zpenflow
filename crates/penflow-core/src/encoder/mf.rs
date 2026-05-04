@@ -162,6 +162,14 @@ impl MfSession {
         )?;
         set_codec_ui4(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, cfg.bitrate_bps)?;
         let _ = set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true);
+        // `AVEncCommonRealTime` is independent of `AVLowLatencyMode` — it
+        // tells the MFT "this is a real-time stream, prefer latency over
+        // quality on every internal trade-off". On NVIDIA's HEVC MFT (and
+        // confirmed by multiple NVIDIA dev-forum reports) it shaves 1-3 ms
+        // off the encode tail by disabling rate-control look-ahead and any
+        // remaining buffer-headroom scheduling. Best-effort: failure on
+        // backends that don't expose the property is fine.
+        let _ = set_codec_bool(&codec_api, &CODECAPI_AVEncCommonRealTime, true);
         let _ = set_codec_ui4(&codec_api, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
         // Long GOP — we drive IDR on demand (gate-1 PASS). If a backend
         // ignores ForceKeyFrame, the design §6.4.1 fallback is to set this to
