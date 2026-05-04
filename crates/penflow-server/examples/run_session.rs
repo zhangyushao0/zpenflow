@@ -165,7 +165,10 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = SessionConfig {
         monitor: fallback_monitor.clone(),
-        codec: Codec::Hevc,
+        // H.264 default — see `Codec::H264` in encoder/mod.rs for rationale
+        // (Adreno c2.qti.avc.decoder.low_latency exists, c2.qti.hevc has
+        // known ratchet bugs on Snapdragon 8s Gen 3, moonlight #1471).
+        codec: Codec::H264,
         bitrate_bps: args.bitrate_bps,
         fps: args.fps,
         vdd,
