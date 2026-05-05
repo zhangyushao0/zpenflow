@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Penflow icon — canonical source.
+
+  Concept: a vertical pen tip ("pen") above two flowing wave-humps
+  ("flow"). Together they read as pen-driven digital ink streaming
+  over a connection — which is exactly what Penflow does.
+
+  Palette: cyan-blue gradient background (brand "stream" color) +
+  amber pen accents (gold nib + cap + flow waves) for high-contrast
+  readability at 16x16. Body is off-white so the silhouette stays
+  legible against either light or dark themes.
+
+  Layout: composed inside a 512x512 viewbox. The active artwork sits
+  inside a 384x384 safe zone (75% center) so when the Android system
+  masks this into an adaptive icon (circle / squircle / round-square),
+  no critical detail gets clipped. Same artwork at the same coords is
+  reused for the Android adaptive icon foreground via a vector
+  drawable — see android/app/src/main/res/drawable/ic_launcher_*.xml.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0ea5e9"/>
+      <stop offset="1" stop-color="#0c4a6e"/>
+    </linearGradient>
+    <linearGradient id="penBody" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="1" stop-color="#cbd5e1"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Rounded square background. rx=96 matches Tauri's default
+       window-icon corner radius on Win11 task-bar previews. -->
+  <rect width="512" height="512" rx="96" fill="url(#bg)"/>
+
+  <!-- Pen, vertical, tip pointing down.
+       Total height ~280, centered vertically with slight upward
+       bias so the flow waves below have room. -->
+  <g transform="translate(256 220)">
+    <!-- pen barrel -->
+    <rect x="-30" y="-150" width="60" height="200" rx="14" fill="url(#penBody)"/>
+    <!-- gripper ring -->
+    <rect x="-30" y="20" width="60" height="20" fill="#94a3b8"/>
+    <!-- tip cone (dark) -->
+    <polygon points="-30,40 30,40 0,118" fill="#1e293b"/>
+    <!-- tip nib (gold) — the "writing" point -->
+    <polygon points="-8,98 8,98 0,128" fill="#fbbf24"/>
+    <!-- top cap (gold) -->
+    <rect x="-30" y="-150" width="60" height="22" rx="10" fill="#fbbf24"/>
+  </g>
+
+  <!-- Flow waves emerging from below the pen tip.
+       Two humps at different opacities to suggest depth / motion. -->
+  <g stroke="#fbbf24" fill="none" stroke-linecap="round">
+    <path d="M 88 400 Q 172 356 256 400 T 424 400"
+          stroke-width="22"/>
+    <path d="M 128 452 Q 200 420 256 452 T 384 452"
+          stroke-width="16" opacity="0.7"/>
+  </g>
+</svg>

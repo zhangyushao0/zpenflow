@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Cyan matching the icon SVG's background gradient mid-stop.
+         Adaptive-icon backgrounds in Android 8+ must be a single color
+         or vector; the system applies its own mask shape (circle /
+         squircle / round-square) on top. -->
+    <color name="ic_launcher_background">#0a7ea4</color>
+</resources>
