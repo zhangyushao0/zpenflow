@@ -2,7 +2,7 @@
 
 # Penflow
 
-**Turn your Android tablet into a real Windows pen display — with full pressure, tilt, and Windows Ink — over a USB cable.**
+**Turn your Wacom Movink Pad Pro 14 into a real Windows pen display — full pressure, tilt, and Windows Ink — over a USB cable.**
 
 [![CI](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/ci.yml)
 [![Release](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml/badge.svg)](https://github.com/zhangyushaow/zpenflow/actions/workflows/release.yml)
@@ -17,9 +17,14 @@
 
 ## What is Penflow?
 
-Penflow streams your Windows desktop to an Android tablet over USB and feeds the tablet's pen events back to the PC as **first-class Windows Ink** input — pressure, tilt, hover, three barrel buttons, and palm rejection all preserved. The result: a USD-499 Wacom Movink Pad becomes a fully-fledged 14″ pen display for Krita / Photoshop / Clip Studio / Blender, **with end-to-end latency around 26 ms.**
+Penflow streams your Windows desktop to a **Wacom Movink Pad Pro 14** over USB and feeds the tablet's pen events back to the PC as **first-class Windows Ink** input — pressure (8192 levels), tilt, hover, and all three Pro Pen 3 side switches preserved. End-to-end latency is **~26 ms**.
 
-Think of it as the OSS, vendor-neutral answer to Wacom's *EasyCanvas*, Astropad, or Duet Display — but for Android, with the source code on your side and configurable down to the pen-button level.
+Penflow is a free, open-source replacement for **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg/how-to-use-instant-pen-display-mode-movinkpad-tablet/)** — Wacom's own (currently beta, MovinkPad-exclusive) PC connection app. Compared with Wacom's first-party path, Penflow:
+
+- Drives a **120 Hz virtual extended display** (via a bundled VDD) instead of a 60 Hz mirror of your primary monitor — your physical screen isn't pinned to the tablet's resolution, and the pipeline runs at 2× Wacom's frame rate end-to-end.
+- Cuts pen-to-pixel latency from a measured **~60–70 ms** on Wacom's app to **~26 ms** on Penflow on the same rig.
+- Exposes **all three Pro Pen 3 side switches** with fully customizable per-button bindings (Tap key / Hold key / Mouse button / Eraser toggle), instead of Wacom's fixed presets.
+- Is **open source** and configurable down to the wire format.
 
 > **Status**: pre-v1.0, actively developed. Currently Windows-only; macOS host support is on the [roadmap](#roadmap).
 
@@ -27,7 +32,7 @@ Think of it as the OSS, vendor-neutral answer to Wacom's *EasyCanvas*, Astropad,
 
 | Metric | Value | Conditions |
 |---|---|---|
-| **End-to-end latency** (pen-tip to pixel) | **~26 ms** | RTX 3060+ • USB 2.0 OTG • HEVC 50 Mbps • 120 Hz |
+| **End-to-end latency** (pen-tip to pixel) | **~26 ms** | RTX 5070 • USB 2.0 OTG • HEVC 50 Mbps • 120 Hz capture |
 | Capture → encode | ~6 ms | DXGI Desktop Duplication, NVENC HEVC |
 | Wire (USB ADB tunnel) | ~3 ms | Reverse-tunnel local-abstract socket |
 | Decode → display | ~10 ms | MediaCodec (Android) async, surface-bound |
@@ -35,31 +40,43 @@ Think of it as the OSS, vendor-neutral answer to Wacom's *EasyCanvas*, Astropad,
 
 Latency was measured with a high-speed camera comparing tip-touch to pixel-update on the host, then independently validated with the in-app HUD.
 
+### GPU support
+
+The encoder uses Windows Media Foundation's hardware-MFT path and selects the matching encoder by adapter Vendor ID, so all three desktop GPU vendors are covered in code:
+
+| Vendor | Encoder MFT | Status |
+|---|---|---|
+| **NVIDIA** | NVENC | ✅ Daily-driver-tested (RTX 5070) |
+| Intel | Quick Sync (QSV) | 🟡 Code path exists; **not yet validated** on real hardware |
+| AMD | AMF | 🟡 Code path exists; **not yet validated** on real hardware |
+
+If you run Penflow on Intel Arc / iGPU or Radeon and it works (or doesn't), please file an issue with `dxdiag` output — that's how we close out the matrix.
+
 ## Features
 
-- 🎯 **Real Windows Ink** — pressure, tilt, hover, eraser, three barrel buttons. Apps see a Wintab/HID-compatible digitizer, not a synthesised mouse.
-- 🚀 **HEVC over GPU** — DXGI Desktop Duplication captures the desktop directly to a D3D11 texture, NVENC / AMF / QSV encodes without ever touching system RAM.
+- 🎯 **Real Windows Ink** — pressure (8192 levels), tilt, hover, eraser. Apps see a Wintab/HID-compatible digitizer, not a synthesised mouse.
+- 🖊️ **All three Pro Pen 3 buttons, configurable** — Switch 1 / Switch 2 / Switch 3 each map to *Tap key* / *Hold key* / *Mouse button* / *Eraser toggle*. Krita-friendly defaults out of the box.
+- 🚀 **HEVC over GPU** — DXGI Desktop Duplication captures the desktop directly to a D3D11 texture; the encoder MFT runs on the same texture without a system-RAM round trip.
 - 🔌 **USB-only path** — runs on top of `adb reverse`, so no Wi-Fi setup, no NAT, no per-network config. Plug in, launch, draw.
-- 🖥️ **Optional Virtual Display Driver** — extend rather than mirror your desktop, so your physical monitor isn't stuck at the tablet's resolution. Bundled `MttVDD` is auto-installed by the MSI.
-- 🎨 **Per-button bindings** — barrel-1 / barrel-2 / tertiary each map to *Tap key* / *Hold key* / *Mouse button* / *Eraser toggle*. Krita-friendly defaults out of the box.
-- 🔐 **One-time UAC** — when you flip "Run as administrator" in settings, Penflow registers a Highest-run-level scheduled task; every subsequent launch (and the boot autostart) is silent — no UAC popups.
-- 🪟 **Native Win11 look** — Mica backdrop, Fluent UI v9 controls, system-tray background service. Closing the window keeps the streaming session alive.
+- 🖥️ **120 Hz virtual display** — bundled `MttVDD` exposes the tablet as a separate 120 Hz extended desktop, not a 60 Hz mirror of your primary monitor. The whole pipeline (capture → encode → decode → present) runs at 120 Hz; pen strokes feel 2× smoother than Wacom's 60 Hz path.
 
 ## Why Penflow?
 
-| | Penflow | scrcpy | Spacedesk | EasyCanvas (Wacom) | Astropad / Duet |
-|---|:---:|:---:|:---:|:---:|:---:|
-| **Direction** | PC → tablet (PC drives, tablet draws) | Tablet → PC | PC → tablet | PC → tablet | PC/Mac → iPad |
-| **Pen pressure / tilt** | ✅ Windows Ink | ❌ touch only | ❌ no pen | ✅ | ✅ |
-| **Three barrel buttons** | ✅ all three, configurable | n/a | n/a | partial | ✅ |
-| **Latency** | ~26 ms | ~50–80 ms | ~80–120 ms | ~30 ms | ~25 ms |
-| **Transport** | USB (ADB) | USB / Wi-Fi | Wi-Fi | USB-C DP-Alt + USB | USB / Wi-Fi |
-| **Android target** | ✅ | ✅ | ✅ | ✅ (Wacom Movink Pad only) | ❌ iPad-only |
-| **Open source** | ✅ MIT/Apache | ✅ | ❌ | ❌ | ❌ |
-| **Per-app key bindings** | ✅ | n/a | n/a | partial | partial |
-| **Cost** | Free | Free | Free / paid | Bundled with hardware | $80+ subscription |
+The two PC-driving-the-Movink-Pad options today, side by side:
 
-The closest analogue is Wacom's first-party *EasyCanvas* — but it's closed-source, hardware-locked to the Movink Pad family, and offers no scripting / binding customisation. Penflow runs the same workload on the same hardware (and on any Android tablet with a digitiser) with the source on your side.
+| | Penflow | Wacom Instant Pen Display |
+|---|:---:|:---:|
+| **Direction** | PC → tablet | PC → tablet |
+| **Pen pressure / tilt** | ✅ Windows Ink | ✅ Windows Ink |
+| **All 3 Pro Pen 3 buttons, configurable** | ✅ | preset only |
+| **Extended display (not mirror)** | ✅ via VDD | ❌ mirror only |
+| **Refresh rate** | **120 Hz** | 60 Hz |
+| **Latency (wired)** | **~26 ms** | ~60–70 ms |
+| **Transport** | USB (ADB) | USB or Wi-Fi |
+| **Open source** | ✅ MIT/Apache | ❌ |
+| **Cost** | Free | Free (beta) |
+
+> **About the latency and refresh-rate numbers**: both are measured by the project author on the same rig (Movink Pad Pro 14 + RTX 5070, USB cable). Wacom does not publish an official pen-to-pixel latency for Instant Pen Display Mode, so the 60–70 ms figure is **our own measurement, not a vendor spec**. If your numbers come out different, please [open an issue](https://github.com/zhangyushaow/zpenflow/issues) — we'll update the table.
 
 ## Platform support
 
@@ -74,13 +91,14 @@ The closest analogue is Wacom's first-party *EasyCanvas* — but it's closed-sou
 | Tablet (client) | Status |
 |---|---|
 | **Wacom Movink Pad Pro 14** | ✅ Reference device, daily-driver-tested |
+| Wacom Movink Pad 11 | 🟡 Same Pro Pen 3 + Android base; should work, untested |
 | Other Android tablets (Android 11+) | 🟡 Should work if the digitiser exposes pressure via Android InputDevice; YMMV |
 | iPad | ❌ Use Astropad / Duet — Apple's sandbox blocks the USB transport Penflow needs |
 
 ### Roadmap
 
 - **v0.x** (now): Windows host stabilisation. VDD auto-install, pen-button binding UI, system tray + scheduled-task elevation.
-- **v1.0**: Full Wintab packet support (legacy app compatibility), per-app preset profiles, frame-pacing tuner.
+- **v1.0**: Full Wintab packet support (legacy app compatibility), per-app preset profiles, frame-pacing tuner, validated Intel QSV / AMD AMF paths.
 - **v1.x**: macOS (Apple Silicon) host port. The encoder abstraction has a stub `videotoolbox.rs` slot already; the capture side moves to `ScreenCaptureKit` and pen injection to `IOHIDManager`. Same Android client, same protocol.
 - **v2.x**: Raw USB transport (no ADB dependency) — see `crates/penflow-transport/` archived AOA path for prior art.
 
@@ -88,7 +106,7 @@ The closest analogue is Wacom's first-party *EasyCanvas* — but it's closed-sou
 
 1. Download the latest **Penflow_*.msi** from the [Releases page](https://github.com/zhangyushaow/zpenflow/releases).
 2. Run it. The installer registers Penflow under Programs and installs the Virtual Display Driver in one go (single UAC prompt).
-3. On your Android tablet:
+3. On your Movink Pad Pro 14:
    - Enable **Developer options** → **USB debugging**.
    - Install the [Penflow Android client](https://github.com/zhangyushaow/zpenflow/releases) APK (also attached to each release).
 4. Connect the tablet via USB. Approve the *Allow USB debugging from this computer* prompt on the tablet.
@@ -99,7 +117,7 @@ The closest analogue is Wacom's first-party *EasyCanvas* — but it's closed-sou
 ### Prerequisites
 
 - Windows 10 22H2+ or Windows 11 (x64)
-- [Rust stable](https://rustup.rs) ≥ 1.75
+- [Rust stable](https://rustup.rs) ≥ 1.76
 - [Node.js](https://nodejs.org) 20.x
 - Tauri CLI: `cargo install tauri-cli --version "^2.0" --locked`
 - WebView2 Runtime (preinstalled on Win11; auto-installed by the MSI on Win10)
@@ -162,7 +180,7 @@ See [`ARCHITECTURE.md`](ARCHITECTURE.md) for crate boundaries and the `Transport
 
 ## Prior art & influences
 
-Penflow is genuinely first-mover in the *PC → Android pen display with Windows Ink* niche, but the engineering stands on shoulders:
+Penflow is genuinely first-mover in the *PC → Wacom Movink Pad with Windows Ink* niche, but the engineering stands on shoulders:
 
 - [**Sunshine**](https://github.com/LizardByte/Sunshine) — DXGI low-latency capture tricks, encoder abstraction.
 - [**moonlight-android**](https://github.com/moonlight-stream/moonlight-android) — MediaCodec recovery and frame pacing.
@@ -180,4 +198,4 @@ PRs welcome. Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — short version: 
 
 Dual-licensed under [**MIT**](LICENSE-MIT) or [**Apache-2.0**](LICENSE-APACHE) at your option.
 
-The bundled `MttVDD` driver is © its respective authors under MPL-2.0; `devcon.exe` is © Microsoft, redistributed under the WDK redist terms.
+The bundled `MttVDD` driver is © its respective authors under MPL-2.0; `devcon.exe` is © Microsoft, redistributed under the WDK redist terms. *Wacom*, *Movink*, and *Pro Pen 3* are trademarks of Wacom Co., Ltd. Penflow is not affiliated with or endorsed by Wacom.

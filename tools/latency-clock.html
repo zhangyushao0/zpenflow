@@ -1,0 +1,174 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Penflow Latency Clock</title>
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    height: 100%;
+    width: 100%;
+    background: #000;
+    color: #0f0;
+    font-family: 'Consolas', 'Cascadia Mono', 'Courier New', monospace;
+    overflow: hidden;
+    cursor: none;
+    user-select: none;
+  }
+
+  /* Big monospace digit panel pinned top-right.
+     font-variant-numeric: tabular-nums keeps digits the same width
+     so the clock doesn't visually shift between e.g. "111" and "888". */
+  #clock {
+    position: fixed;
+    top: 0;
+    right: 0;
+    padding: 24px 36px;
+    font-size: clamp(72px, 12vw, 220px);
+    font-weight: 700;
+    line-height: 1;
+    letter-spacing: 0.04em;
+    font-variant-numeric: tabular-nums;
+    text-shadow: 0 0 12px rgba(0, 255, 80, 0.5);
+  }
+
+  /* Sub-line under the clock. Shows the browser's rAF tick rate,
+     which on Windows is controlled by DWM and follows the highest-
+     refresh monitor on the host — NOT the monitor this window happens
+     to be on. So this number reflects PC-side pipeline cadence, not
+     the actual displayed framerate on the tablet panel. */
+  #hz {
+    position: fixed;
+    top: 0;
+    right: 0;
+    margin-top: clamp(96px, 14vw, 250px);
+    padding: 0 36px;
+    color: #084;
+    font-size: clamp(16px, 1.5vw, 24px);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Help legend, dim grey, can be toggled with H. */
+  #help {
+    position: fixed;
+    bottom: 24px;
+    left: 24px;
+    right: 24px;
+    color: #666;
+    font-size: 14px;
+    line-height: 1.6;
+    max-width: 760px;
+  }
+  #help.hidden { display: none; }
+  #help h1 { margin: 0 0 8px; color: #aaa; font-size: 18px; }
+  #help p  { margin: 0 0 6px; }
+  kbd {
+    display: inline-block;
+    padding: 1px 7px;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 4px;
+    color: #999;
+    font-family: inherit;
+    font-size: 12px;
+  }
+  code { color: #6c6; }
+</style>
+</head>
+<body>
+<div id="clock">000000</div>
+<div id="hz">rAF — Hz</div>
+
+<div id="help">
+  <h1>Penflow latency clock</h1>
+  <p>
+    Open this page in <strong>two windows</strong> — one on the host primary
+    display, one on the VDD-extended desktop (which gets streamed to the tablet).
+    Both windows render <code>Date.now() % 1 000 000</code> in milliseconds, so the
+    digits represent the <em>same OS clock</em> regardless of which process the
+    window is in.
+  </p>
+  <p>
+    Photograph both screens with a high-speed camera (a phone's 240 fps slow-mo
+    works). The digit difference between the host window and the tablet window
+    is the end-to-end pixel-to-pixel latency in milliseconds.
+  </p>
+  <p>
+    <strong>About the two readings:</strong> this clock typically reads ~6–8 ms
+    <em>lower</em> than the in-app HUD's <code>e2e</code> number. Both are correct
+    — the HUD measures from server-side capture timestamp to tablet vsync (so
+    DXGI capture cost is in the budget), while this clock measures host-panel
+    pixel vs tablet-panel pixel and so subtracts the host monitor's own vsync
+    wait. Use the HUD for the conservative number; use this clock for an
+    independent ground truth.
+  </p>
+  <p>
+    <strong>About the Hz reading:</strong> this is the browser's
+    <code>requestAnimationFrame</code> tick rate on the host process — driven by
+    Windows DWM, which follows the highest-Hz monitor on your machine, not the
+    one this window is on. It is <em>not</em> a measurement of the tablet
+    panel's effective refresh rate (Movink Pad Pro 14 caps at 165 Hz hardware).
+  </p>
+  <p>
+    <kbd>H</kbd> toggle help · <kbd>F</kbd> fullscreen · <kbd>F11</kbd> browser
+    fullscreen · the page is fully offline / no JS framework.
+  </p>
+</div>
+
+<script>
+  'use strict';
+
+  const clockEl = document.getElementById('clock');
+  const hzEl    = document.getElementById('hz');
+  const helpEl  = document.getElementById('help');
+
+  // Last drawn ms value; skip DOM writes if it hasn't changed.
+  let lastDisplayed = -1;
+
+  // Rolling rAF rate (frames in the past second). Useful to confirm
+  // that the VDD window is actually getting 120 rAF callbacks/sec
+  // when its monitor is set to 120 Hz.
+  let frames = 0;
+  let lastSecond = (Date.now() / 1000) | 0;
+
+  function tick() {
+    const ms = Date.now() % 1_000_000;
+    if (ms !== lastDisplayed) {
+      // padStart so the columns line up regardless of value.
+      clockEl.textContent = String(ms).padStart(6, '0');
+      lastDisplayed = ms;
+    }
+
+    frames++;
+    const sec = (Date.now() / 1000) | 0;
+    if (sec !== lastSecond) {
+      hzEl.textContent = `rAF ${frames} Hz`;
+      frames = 0;
+      lastSecond = sec;
+    }
+
+    requestAnimationFrame(tick);
+  }
+  requestAnimationFrame(tick);
+
+  // Keyboard:
+  //   H — toggle help
+  //   F — request fullscreen on this window
+  document.addEventListener('keydown', (e) => {
+    const k = e.key.toLowerCase();
+    if (k === 'h') {
+      helpEl.classList.toggle('hidden');
+    } else if (k === 'f') {
+      const elem = document.documentElement;
+      if (!document.fullscreenElement) {
+        elem.requestFullscreen?.().catch(() => {});
+      } else {
+        document.exitFullscreen?.();
+      }
+    }
+  });
+</script>
+</body>
+</html>
