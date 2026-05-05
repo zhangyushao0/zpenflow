@@ -27,6 +27,14 @@ jobs:
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check
 
+      - name: Stage Virtual Display Driver + devcon
+        # penflow-gui's tauri.conf.json declares vdd/* as bundle resources;
+        # Tauri's build.rs validates each resource path exists, even for a
+        # plain `cargo build` (not just `cargo tauri build`). Without this
+        # step, build.rs errors with: resource path doesn't exist.
+        shell: pwsh
+        run: ./installer/fetch-vdd.ps1
+
       - name: cargo build --workspace
         run: cargo build --workspace
 

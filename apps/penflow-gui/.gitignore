@@ -1,5 +1,5 @@
 # The shim package.json at this level has no deps; if anyone runs
 # `npm install` here by accident, ignore the artefacts. The real
 # frontend lives in ./ui (with its own .gitignore).
-node_modules/
-package-lock.json
+/node_modules/
+/package-lock.json
