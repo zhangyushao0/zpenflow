@@ -44,6 +44,12 @@ jobs:
         shell: pwsh
         run: ./installer/fetch-vdd.ps1
 
+      - name: Stage bundled adb.exe
+        # Same validation rule applies to adb/* — tauri.conf.json declares
+        # installer/adb/{adb.exe,AdbWin*Api.dll} as resources.
+        shell: pwsh
+        run: ./installer/fetch-adb.ps1
+
       - name: Install + build frontend
         # tauri::generate_context!() expands at compile time and reads
         # tauri.conf.json, which declares `frontendDist: "../ui/dist"`.
