@@ -21,7 +21,7 @@ Penflow 通过 USB 把 Windows 桌面投流到 **Wacom Movink Pad Pro 14**，同
 
 Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg/how-to-use-instant-pen-display-mode-movinkpad-tablet/)** 的免费开源替代 — 那是 Wacom 自家（目前 beta、仅支持 Movink Pad 系列）的 PC 连接软件。相比 Wacom 的官方方案，Penflow 的差异在于：
 
-- 通过捆绑的虚拟显示器驱动（VDD）做一块 **正好 2880×1800 的 120 Hz 虚拟显示器**，平板上的像素是原生 1:1 的，**没有上下黑边**（Wacom IPD 不管 mirror 还是 extend 模式都会把源桌面信封式贴合到平板面板，所以总是有黑边）。整条管线全程 120 Hz，是 Wacom 60 Hz 路径的两倍。
+- 通过捆绑的虚拟显示器驱动（VDD）做一块 **正好 2880×1800 的 120 Hz 虚拟显示器**，平板上看到的是原生 1:1 像素、不经任何缩放。Wacom IPD 是 mirror + scale，把源屏拉伸/适配到平板面板，设置里**没有原生分辨率开关**（[Gigazine 2025/12 实测](https://gigazine.net/gsc_news/en/20251206-instant-pen-display-mode/) 提到曲线放大后会变模糊）。整条管线还跑在 120 Hz，是 Wacom 60 Hz 路径的两倍。
 - 同一台机器上实测，笔尖到像素的延迟从 Wacom 的 **~60–70 ms** 降到 **~26 ms**。
 - **Pro Pen 3 的三个侧键**全部可独立绑定（点击 / 按住 / 鼠标键 / 橡皮切换）。Wacom 的 PC 模式根本不会把侧键事件传给 Windows。
 - **完全开源**，可定制到协议层。
@@ -69,7 +69,7 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 | **方向** | PC → 平板 | PC → 平板 |
 | **笔压感 / 倾斜** | ✅ Windows Ink | ✅ Windows Ink |
 | **Pro Pen 3 三个侧键** | ✅ 三键全可配 | ❌ IPD 模式下不向 PC 暴露 |
-| **平板原生 1:1 像素（无信封黑边）** | ✅（VDD 直接做 2880×1800） | ❌ mirror 和 extend 模式下都信封式黑边 |
+| **平板原生 1:1 像素（无缩放）** | ✅（VDD 直接做 2880×1800） | ❌ 拉伸镜像；IPD 设置里无原生分辨率选项 |
 | **刷新率** | **120 Hz** | 60 Hz |
 | **延迟（有线）** | **~26 ms** | ~60–70 ms |
 | **传输** | USB (ADB) | USB 或 Wi-Fi |
