@@ -4,17 +4,22 @@
     "version": "0.1.0",
     "identifier": "dev.penflow.gui",
     "build": {
-        "frontendDist": "../ui"
+        "beforeBuildCommand": "npm run build",
+        "frontendDist": "../ui/dist"
     },
     "app": {
         "withGlobalTauri": true,
         "windows": [
             {
                 "title": "Penflow",
-                "width": 800,
-                "height": 600,
+                "width": 720,
+                "height": 720,
+                "minWidth": 640,
+                "minHeight": 640,
                 "resizable": true,
-                "fullscreen": false
+                "fullscreen": false,
+                "decorations": true,
+                "transparent": true
             }
         ],
         "security": {
@@ -22,8 +27,26 @@
         }
     },
     "bundle": {
-        "active": false,
-        "targets": "all",
-        "icon": []
+        "active": true,
+        "targets": ["msi"],
+        "icon": ["icons/icon.ico"],
+        "publisher": "Penflow",
+        "shortDescription": "PC→Android pen-display bridge",
+        "longDescription": "Streams the desktop to an Android pen-display tablet over a USB ADB tunnel, with full Windows Ink pressure/tilt input back to the PC.",
+        "category": "Productivity",
+        "resources": {
+            "../../../installer/vdd-driver/MttVDD.inf":  "vdd/MttVDD.inf",
+            "../../../installer/vdd-driver/MttVDD.dll":  "vdd/MttVDD.dll",
+            "../../../installer/vdd-driver/mttvdd.cat":  "vdd/mttvdd.cat",
+            "../../../installer/vdd-driver/devcon.exe":  "vdd/devcon.exe",
+            "../../../tools/vdd/vdd_settings.xml":       "vdd/vdd_settings.xml"
+        },
+        "windows": {
+            "wix": {
+                "language": "en-US",
+                "fragmentPaths": ["wix/vdd-install.wxs"],
+                "componentRefs": ["PenflowVddInstallActions"]
+            }
+        }
     }
 }

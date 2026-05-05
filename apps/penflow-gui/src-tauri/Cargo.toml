@@ -19,6 +19,9 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+# Native Win11 Mica window background. Tauri-team-maintained; one
+# DwmSetWindowAttribute call under the hood.
+window-vibrancy = "0.6"
 
 # Engine + session orchestration. The GUI runs the session in-process
 # (design.md §11): no IPC, just direct Rust calls from Tauri commands.

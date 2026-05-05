@@ -19,17 +19,23 @@ pub struct AffineTransform {
     //   [ a  c  e ]   [ x ]
     //   [ b  d  f ] * [ y ]
     //   [ 0  0  1 ]   [ 1 ]
-    a: f32, b: f32,
-    c: f32, d: f32,
-    e: f32, f: f32,
+    a: f32,
+    b: f32,
+    c: f32,
+    d: f32,
+    e: f32,
+    f: f32,
 }
 
 impl AffineTransform {
     pub fn identity() -> Self {
         Self {
-            a: 1.0, b: 0.0,
-            c: 0.0, d: 1.0,
-            e: 0.0, f: 0.0,
+            a: 1.0,
+            b: 0.0,
+            c: 0.0,
+            d: 1.0,
+            e: 0.0,
+            f: 0.0,
         }
     }
 
@@ -54,26 +60,38 @@ impl AffineTransform {
         let ot = output_top as f32;
         match rotation_deg % 360 {
             0 => Self {
-                a: ow, b: 0.0,
-                c: 0.0, d: oh,
-                e: ol, f: ot,
+                a: ow,
+                b: 0.0,
+                c: 0.0,
+                d: oh,
+                e: ol,
+                f: ot,
             },
             90 => Self {
                 // (x, y) → (oh - y * oh, x * ow) then translate. Equivalent
                 // affine: x' = -oh * y + ol + ow ;  y' = ow * x + ot
-                a: 0.0, b: ow,
-                c: -ow, d: 0.0,
-                e: ol + ow, f: ot,
+                a: 0.0,
+                b: ow,
+                c: -ow,
+                d: 0.0,
+                e: ol + ow,
+                f: ot,
             },
             180 => Self {
-                a: -ow, b: 0.0,
-                c: 0.0, d: -oh,
-                e: ol + ow, f: ot + oh,
+                a: -ow,
+                b: 0.0,
+                c: 0.0,
+                d: -oh,
+                e: ol + ow,
+                f: ot + oh,
             },
             270 => Self {
-                a: 0.0, b: -oh,
-                c: ow, d: 0.0,
-                e: ol, f: ot + oh,
+                a: 0.0,
+                b: -oh,
+                c: ow,
+                d: 0.0,
+                e: ol,
+                f: ot + oh,
             },
             _ => Self::from_normalized_to_rect(output_left, output_top, output_w, output_h, 0),
         }

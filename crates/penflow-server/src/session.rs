@@ -36,8 +36,8 @@ use penflow_protocol::{
     encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, HelloAndroid,
     HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame, CODEC_H264,
     CODEC_HEVC, FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_HELLO_ANDROID,
-    MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY,
-    MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
+    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -261,10 +261,11 @@ impl Session {
 
         if let Some(tx) = &events {
             let _ = tx
-                .send(SessionEvent::Connecting { peer: peer_label.clone() })
+                .send(SessionEvent::Connecting {
+                    peer: peer_label.clone(),
+                })
                 .await;
         }
-
 
         // 2. Handshake: read HELLO_ANDROID.
         let (msg_id, payload) = read_frame(&mut reader).await?;
@@ -314,11 +315,7 @@ impl Session {
             .await?;
             eprintln!(
                 "[session] virtual monitor up: {} {}x{} on {} (adapter LUID 0x{:016x})",
-                virt.device_name,
-                virt.width,
-                virt.height,
-                virt.adapter_name,
-                virt.adapter_luid
+                virt.device_name, virt.width, virt.height, virt.adapter_name, virt.adapter_luid
             );
 
             // Cross-adapter check: NVIDIA exposes the RTX 5070 as multiple
@@ -581,11 +578,9 @@ async fn wait_for_keyframe(
     let mut popped_total: u32 = 0;
     while Instant::now() < deadline {
         let q = queue.clone();
-        let pkt = tokio::task::spawn_blocking(move || {
-            q.pop_timeout(Duration::from_millis(100))
-        })
-        .await
-        .map_err(|e| std::io::Error::other(format!("blocking pop join: {e}")))?;
+        let pkt = tokio::task::spawn_blocking(move || q.pop_timeout(Duration::from_millis(100)))
+            .await
+            .map_err(|e| std::io::Error::other(format!("blocking pop join: {e}")))?;
         if let Some(p) = pkt {
             popped_total += 1;
             if p.is_keyframe {
@@ -747,8 +742,8 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     pressure: pe.pressure,
                     tilt_x_deg: pe.tilt_x as i32,
                     tilt_y_deg: pe.tilt_y as i32,
-                    in_range: pe.phase != 4,                     // 4 = leave
-                    in_contact: matches!(pe.phase, 1 | 2),       // down or move
+                    in_range: pe.phase != 4,               // 4 = leave
+                    in_contact: matches!(pe.phase, 1 | 2), // down or move
                     eraser: pe.tool == 1,
                     buttons: pe.buttons,
                     captured_at: None,
@@ -792,7 +787,10 @@ async fn read_loop<R: AsyncRead + Unpin>(
                     pc_t3_ns,
                 };
                 let mut w = writer.lock().await;
-                if write_frame(&mut *w, MSG_TIME_SYNC_RESP, &resp.encode()).await.is_err() {
+                if write_frame(&mut *w, MSG_TIME_SYNC_RESP, &resp.encode())
+                    .await
+                    .is_err()
+                {
                     return Ok(());
                 }
                 let _ = w.flush().await;

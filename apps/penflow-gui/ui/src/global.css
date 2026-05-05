@@ -1,0 +1,17 @@
+/* Page-level layer — keep totally transparent so the host window's Mica
+ * shows through. FluentProvider's outer div will paint its own Fluent
+ * surface on top via the `webDarkTheme` tokens. */
+
+html, body, #root {
+    margin: 0;
+    padding: 0;
+    background: transparent !important;
+    background-color: transparent !important;
+    color-scheme: dark;
+    height: 100%;
+    overflow: hidden;
+    user-select: none;
+    font-family:
+        "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI",
+        system-ui, sans-serif;
+}

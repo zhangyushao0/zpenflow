@@ -2141,6 +2141,7 @@ dependencies = [
  "tauri-build",
  "thiserror 1.0.69",
  "tokio",
+ "window-vibrancy",
  "windows 0.61.3",
 ]
 

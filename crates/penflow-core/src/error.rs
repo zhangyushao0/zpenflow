@@ -37,10 +37,7 @@ pub enum EngineError {
         "selected output (adapter LUID 0x{output_luid:016x}) is not on the engine's D3D11 device \
          (adapter LUID 0x{device_luid:016x}); cross-adapter capture is not supported"
     )]
-    AdapterMismatch {
-        output_luid: i64,
-        device_luid: i64,
-    },
+    AdapterMismatch { output_luid: i64, device_luid: i64 },
 
     /// `IDXGIOutputDuplication::AcquireNextFrame` returned `DXGI_ERROR_ACCESS_LOST`
     /// or `DXGI_ERROR_ACCESS_DENIED`. The capturer should reinit transparently;

@@ -30,9 +30,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::UI::Input::Preview::Injection::{
-    InjectedInputPenButtons, InjectedInputPenInfo, InjectedInputPenParameters,
-    InjectedInputPoint, InjectedInputPointerInfo, InjectedInputPointerOptions,
-    InjectedInputTouchInfo, InjectedInputTouchParameters, InjectedInputVisualizationMode,
+    InjectedInputPenButtons, InjectedInputPenInfo, InjectedInputPenParameters, InjectedInputPoint,
+    InjectedInputPointerInfo, InjectedInputPointerOptions, InjectedInputTouchInfo,
+    InjectedInputTouchParameters, InjectedInputVisualizationMode,
     InputInjector as WinRtInputInjector,
 };
 use windows_collections::IIterable;
@@ -88,9 +88,8 @@ impl InputInjector {
         // Process-wide; idempotent. Returns an error if already set, which
         // we ignore — that case means the host (Tauri) already configured
         // it.
-        let _ = unsafe {
-            SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
-        };
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
         let injector = WinRtInputInjector::TryCreate().map_err(EngineError::from)?;
 
@@ -225,15 +224,14 @@ impl InputInjector {
 
         let mut opts = InjectedInputPointerOptions::None;
         if sample.in_range {
-            opts = opts | InjectedInputPointerOptions::InRange;
+            opts |= InjectedInputPointerOptions::InRange;
         }
         if sample.in_contact {
-            opts = opts
-                | InjectedInputPointerOptions::InContact
-                | InjectedInputPointerOptions::Update;
+            opts =
+                opts | InjectedInputPointerOptions::InContact | InjectedInputPointerOptions::Update;
         }
         if !sample.in_range && !sample.in_contact {
-            opts = opts | InjectedInputPointerOptions::PointerUp;
+            opts |= InjectedInputPointerOptions::PointerUp;
         }
 
         let pointer = InjectedInputPointerInfo {
@@ -261,8 +259,10 @@ impl InputInjector {
         info.SetPenParameters(params).map_err(EngineError::from)?;
         info.SetPressure(sample.pressure as f64)
             .map_err(EngineError::from)?;
-        info.SetTiltX(sample.tilt_x_deg).map_err(EngineError::from)?;
-        info.SetTiltY(sample.tilt_y_deg).map_err(EngineError::from)?;
+        info.SetTiltX(sample.tilt_x_deg)
+            .map_err(EngineError::from)?;
+        info.SetTiltY(sample.tilt_y_deg)
+            .map_err(EngineError::from)?;
 
         self.injector
             .InjectPenInput(&info)
@@ -296,17 +296,17 @@ impl InputInjector {
         for (i, tp) in snapshot.iter().enumerate() {
             current_ids.insert(tp.id);
             let was_down = self.last_touch_pos.contains_key(&tp.id);
-            let mut opts = InjectedInputPointerOptions::InRange
-                | InjectedInputPointerOptions::InContact;
+            let mut opts =
+                InjectedInputPointerOptions::InRange | InjectedInputPointerOptions::InContact;
             if was_down {
-                opts = opts | InjectedInputPointerOptions::Update;
+                opts |= InjectedInputPointerOptions::Update;
             } else {
                 opts = opts
                     | InjectedInputPointerOptions::New
                     | InjectedInputPointerOptions::PointerDown;
             }
             if i == 0 {
-                opts = opts | InjectedInputPointerOptions::Primary;
+                opts |= InjectedInputPointerOptions::Primary;
             }
             infos.push(make_touch_info(tp.id, tp.x, tp.y, opts)?);
         }
@@ -336,8 +336,7 @@ impl InputInjector {
         //    `T::Default` for an interface/class type is `Option<T>`, so we
         //    map each value into `Some` for the `From<Vec<T::Default>>`
         //    impl.
-        let optional: Vec<Option<InjectedInputTouchInfo>> =
-            infos.into_iter().map(Some).collect();
+        let optional: Vec<Option<InjectedInputTouchInfo>> = infos.into_iter().map(Some).collect();
         let iterable: IIterable<InjectedInputTouchInfo> = optional.into();
         self.injector
             .InjectTouchInput(&iterable)
@@ -419,8 +418,8 @@ fn make_touch_info(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::TouchState;
+    use super::*;
 
     /// Smoke: build the unified injector. Initialises COM apartment if the
     /// harness hasn't.

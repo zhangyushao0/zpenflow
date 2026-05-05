@@ -1,0 +1,95 @@
+name: Release
+
+# Builds the Windows MSI and attaches it to a GitHub Release.
+#
+# Triggers:
+#   - Pushing a `v*` tag (e.g. `git tag v0.1.0 && git push --tags`)
+#     creates a draft release and uploads the MSI to it.
+#   - Manual dispatch from the Actions tab is supported for dry runs;
+#     the workflow then only uploads as a workflow artifact (no Release).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # required to create / update GitHub Releases
+
+jobs:
+  build-msi:
+    name: Build MSI (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Tauri 2 builds the bundle into the workspace target/ dir.
+          workspaces: ". -> target"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: apps/penflow-gui/ui/package-lock.json
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2.0" --locked
+
+      - name: Install frontend deps
+        working-directory: apps/penflow-gui/ui
+        run: npm ci
+
+      - name: Stage Virtual Display Driver + devcon
+        # The MSI bundles MttVDD + devcon.exe under [INSTALLDIR]\vdd\.
+        # These are not committed (binary blobs from the upstream VDD
+        # release) — fetch-vdd.ps1 downloads + extracts them.
+        shell: pwsh
+        run: ./installer/fetch-vdd.ps1
+
+      - name: Build MSI bundle
+        working-directory: apps/penflow-gui
+        run: cargo tauri build --bundles msi
+
+      - name: Locate MSI
+        id: msi
+        shell: pwsh
+        run: |
+          $msi = Get-ChildItem `
+            -Path target/release/bundle/msi `
+            -Filter "Penflow_*_x64_en-US.msi" `
+            -ErrorAction Stop |
+            Select-Object -First 1
+          if (-not $msi) { throw "MSI not produced — check the build log" }
+          "path=$($msi.FullName)"   | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "name=$($msi.Name)"       | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "size=$($msi.Length)"     | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Built $($msi.Name) ($([math]::Round($msi.Length/1MB,1)) MiB)"
+
+      - name: Upload MSI as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.msi.outputs.name }}
+          path: ${{ steps.msi.outputs.path }}
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach MSI to GitHub Release
+        # Only when triggered by a tag push. Manual dispatches stop at
+        # the workflow-artifact step above.
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.msi.outputs.path }}
+          draft: true
+          generate_release_notes: true
+          fail_on_unmatched_files: true

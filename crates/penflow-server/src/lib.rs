@@ -15,7 +15,7 @@ pub mod vdd;
 #[cfg(windows)]
 pub use session::{Session, SessionConfig, SessionError, SessionEvent};
 #[cfg(windows)]
-pub use vdd::{VddController, VddError};
+pub use vdd::{install_driver, uninstall_driver, VddController, VddError};
 
 #[cfg(test)]
 mod tests {

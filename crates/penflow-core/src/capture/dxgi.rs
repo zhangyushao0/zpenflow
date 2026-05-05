@@ -12,22 +12,18 @@
 use std::time::{Duration, Instant};
 
 use windows::core::Interface;
-use windows::Win32::Foundation::{
-    DXGI_STATUS_OCCLUDED, E_INVALIDARG, S_OK, WAIT_TIMEOUT,
-};
+use windows::Win32::Foundation::{DXGI_STATUS_OCCLUDED, E_INVALIDARG, S_OK, WAIT_TIMEOUT};
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Graphics::Dxgi::{
     Common::{
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
     },
     IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
     DXGI_OUTDUPL_FRAME_INFO,
 };
-use windows::Win32::System::Power::{
-    SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED,
-};
+use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 
 use crate::d3d11::D3d11Context;
 use crate::error::{EngineError, EngineResult};
@@ -140,10 +136,7 @@ impl DxgiCapturer {
     ///   - `Ok(None)` — DDA timeout (no new content within `timeout`). Caller
     ///     typically falls back to keepalive frame.
     ///   - `Err(EngineError::Win32)` — fatal HRESULT after recovery attempt.
-    pub fn acquire_frame(
-        &mut self,
-        timeout: Duration,
-    ) -> EngineResult<Option<AcquiredFrame<'_>>> {
+    pub fn acquire_frame(&mut self, timeout: Duration) -> EngineResult<Option<AcquiredFrame<'_>>> {
         if self.frame_held {
             // Defensive: previous AcquiredFrame must have been dropped. If we
             // ever see this, fix the caller — DDA refuses re-acquire otherwise.
@@ -174,8 +167,8 @@ impl DxgiCapturer {
                     capturer: self,
                 }))
             }
-            Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT
-                || e.code().0 == WAIT_TIMEOUT.0 as i32 =>
+            Err(e)
+                if e.code() == DXGI_ERROR_WAIT_TIMEOUT || e.code().0 == WAIT_TIMEOUT.0 as i32 =>
             {
                 Ok(None)
             }
@@ -305,6 +298,9 @@ mod tests {
                 Err(e) => panic!("non-Win32 error: {e:?}"),
             }
         }
-        assert!(got_frame_or_timeout, "DDA never returned a frame or timeout");
+        assert!(
+            got_frame_or_timeout,
+            "DDA never returned a frame or timeout"
+        );
     }
 }

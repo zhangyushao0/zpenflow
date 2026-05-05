@@ -16,16 +16,16 @@ use std::mem::ManuallyDrop;
 use windows::core::Interface;
 use windows::Win32::Graphics::Direct3D11::{
     ID3D11Device, ID3D11DeviceContext, ID3D11RenderTargetView, ID3D11Texture2D,
-    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor,
-    ID3D11VideoProcessorEnumerator, ID3D11VideoProcessorInputView,
-    ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET, D3D11_BIND_SHADER_RESOURCE,
-    D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0, D3D11_RTV_DIMENSION_TEXTURE2D,
-    D3D11_TEX2D_RTV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV, D3D11_TEXTURE2D_DESC,
-    D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE, D3D11_VIDEO_PROCESSOR_CONTENT_DESC,
-    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0,
-    D3D11_VIDEO_PROCESSOR_STREAM, D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
-    D3D11_VPIV_DIMENSION_TEXTURE2D, D3D11_VPOV_DIMENSION_TEXTURE2D, D3D11_USAGE_DEFAULT,
+    ID3D11VideoContext1, ID3D11VideoDevice, ID3D11VideoProcessor, ID3D11VideoProcessorEnumerator,
+    ID3D11VideoProcessorInputView, ID3D11VideoProcessorOutputView, D3D11_BIND_RENDER_TARGET,
+    D3D11_BIND_SHADER_RESOURCE, D3D11_RENDER_TARGET_VIEW_DESC, D3D11_RENDER_TARGET_VIEW_DESC_0,
+    D3D11_RTV_DIMENSION_TEXTURE2D, D3D11_TEX2D_RTV, D3D11_TEX2D_VPIV, D3D11_TEX2D_VPOV,
+    D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT, D3D11_VIDEO_FRAME_FORMAT_PROGRESSIVE,
+    D3D11_VIDEO_PROCESSOR_CONTENT_DESC, D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_INPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC,
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC_0, D3D11_VIDEO_PROCESSOR_STREAM,
+    D3D11_VIDEO_USAGE_PLAYBACK_NORMAL, D3D11_VPIV_DIMENSION_TEXTURE2D,
+    D3D11_VPOV_DIMENSION_TEXTURE2D,
 };
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709, DXGI_COLOR_SPACE_YCBCR_FULL_G22_LEFT_P709,
@@ -86,8 +86,7 @@ impl ColorConverter {
             OutputHeight: height,
             Usage: D3D11_VIDEO_USAGE_PLAYBACK_NORMAL,
         };
-        let enumerator =
-            unsafe { video_device.CreateVideoProcessorEnumerator(&content_desc)? };
+        let enumerator = unsafe { video_device.CreateVideoProcessorEnumerator(&content_desc)? };
         // Rate-conversion index 0 is always the simplest "no rate change"
         // path; we don't do framerate conversion.
         let processor = unsafe { video_device.CreateVideoProcessor(&enumerator, 0)? };
@@ -291,7 +290,8 @@ pub fn clear_bgra_texture_to_black(
     };
     let mut rtv: Option<ID3D11RenderTargetView> = None;
     unsafe {
-        ctx.device.CreateRenderTargetView(texture, Some(&rtv_desc), Some(&mut rtv))?;
+        ctx.device
+            .CreateRenderTargetView(texture, Some(&rtv_desc), Some(&mut rtv))?;
     }
     let rtv = rtv.ok_or(EngineError::NotInitialized)?;
     let black: [f32; 4] = [0.0, 0.0, 0.0, 1.0];

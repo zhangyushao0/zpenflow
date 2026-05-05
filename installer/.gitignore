@@ -1,0 +1,4 @@
+# Output of `installer/fetch-vdd.ps1`. The driver itself is downloaded
+# from upstream at build time; we don't check binaries into git.
+.cache/
+vdd-driver/

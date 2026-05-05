@@ -61,8 +61,7 @@ impl MonitorInfo {
         // Confirm we got the same physical adapter (LUIDs survive even if
         // adapter indices renumber).
         let desc = unsafe { adapter.GetDesc1()? };
-        let luid = ((desc.AdapterLuid.HighPart as i64) << 32)
-            | (desc.AdapterLuid.LowPart as i64);
+        let luid = ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64);
         if luid != self.adapter_luid {
             return Err(EngineError::AdapterMismatch {
                 output_luid: self.adapter_luid,
@@ -93,8 +92,8 @@ pub fn enumerate(factory: &IDXGIFactory6) -> EngineResult<Vec<MonitorInfo>> {
         let adapter_name = String::from_utf16_lossy(&desc.Description)
             .trim_end_matches('\0')
             .to_string();
-        let adapter_luid = ((desc.AdapterLuid.HighPart as i64) << 32)
-            | (desc.AdapterLuid.LowPart as i64);
+        let adapter_luid =
+            ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64);
         // DXGI_ADAPTER_FLAG_SOFTWARE = 2.
         let adapter_is_software = (desc.Flags & 2) != 0;
 

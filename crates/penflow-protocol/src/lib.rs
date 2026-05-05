@@ -137,9 +137,7 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 }
 
 /// Read one framed message from the given `AsyncRead`. Returns `(msg_id, payload)`.
-pub async fn read_frame<R: AsyncRead + Unpin>(
-    r: &mut R,
-) -> Result<(u8, Vec<u8>), ProtocolError> {
+pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> Result<(u8, Vec<u8>), ProtocolError> {
     let msg_id = r.read_u8().await?;
     let len = r.read_u32().await?;
     if len as usize > MAX_PAYLOAD_LEN {
@@ -619,7 +617,10 @@ pub fn split_h264_nals(bytes: &[u8]) -> Vec<(usize, usize, u8)> {
 
 /// Shared start-code walker. The `nal_type_from_header_byte` closure pulls
 /// the codec-specific NAL type bits out of the first header byte.
-fn split_nals<F: Fn(u8) -> u8>(bytes: &[u8], nal_type_from_header_byte: F) -> Vec<(usize, usize, u8)> {
+fn split_nals<F: Fn(u8) -> u8>(
+    bytes: &[u8],
+    nal_type_from_header_byte: F,
+) -> Vec<(usize, usize, u8)> {
     let mut starts: Vec<(usize, usize)> = Vec::new(); // (start_off, payload_off)
     let mut i = 0;
     while i + 3 <= bytes.len() {
@@ -644,7 +645,11 @@ fn split_nals<F: Fn(u8) -> u8>(bytes: &[u8], nal_type_from_header_byte: F) -> Ve
         if payload_off >= bytes.len() {
             continue;
         }
-        out.push((start_off, end_off, nal_type_from_header_byte(bytes[payload_off])));
+        out.push((
+            start_off,
+            end_off,
+            nal_type_from_header_byte(bytes[payload_off]),
+        ));
     }
     out
 }
@@ -670,7 +675,10 @@ mod tests {
             MSG_REQUEST_IDR,
             MSG_ANDROID_GOODBYE,
         ] {
-            assert!(id & 0x80 != 0, "client→server id 0x{id:02x} missing high bit");
+            assert!(
+                id & 0x80 != 0,
+                "client→server id 0x{id:02x} missing high bit"
+            );
         }
     }
 
@@ -693,7 +701,9 @@ mod tests {
     async fn write_then_read_frame_round_trip() {
         use tokio::io::duplex;
         let (mut a, mut b) = duplex(64 * 1024);
-        write_frame(&mut a, MSG_PEN_EVENT, &vec![7u8; 31]).await.unwrap();
+        write_frame(&mut a, MSG_PEN_EVENT, &[7u8; 31])
+            .await
+            .unwrap();
         let (id, payload) = read_frame(&mut b).await.unwrap();
         assert_eq!(id, MSG_PEN_EVENT);
         assert_eq!(payload.len(), 31);
@@ -756,8 +766,18 @@ mod tests {
         let t = TouchEvent {
             ts_ns: 555,
             contacts: vec![
-                TouchContact { pointer_id: 0, x_norm: 0.1, y_norm: 0.2, pressure: 0.5 },
-                TouchContact { pointer_id: 1, x_norm: 0.9, y_norm: 0.7, pressure: 0.3 },
+                TouchContact {
+                    pointer_id: 0,
+                    x_norm: 0.1,
+                    y_norm: 0.2,
+                    pressure: 0.5,
+                },
+                TouchContact {
+                    pointer_id: 1,
+                    x_norm: 0.9,
+                    y_norm: 0.7,
+                    pressure: 0.3,
+                },
             ],
         };
         let bytes = t.encode();
@@ -785,11 +805,11 @@ mod tests {
         // gate-1 probe captured exactly this sequence on NVIDIA).
         let mut bytes = Vec::new();
         for (sc4, header_byte) in [
-            (true, 0x46u8),  // AUD (35)
-            (true, 0x40),    // VPS (32)
-            (true, 0x42),    // SPS (33)
-            (true, 0x44),    // PPS (34)
-            (true, 0x26),    // IDR_W_RADL (19)
+            (true, 0x46u8), // AUD (35)
+            (true, 0x40),   // VPS (32)
+            (true, 0x42),   // SPS (33)
+            (true, 0x44),   // PPS (34)
+            (true, 0x26),   // IDR_W_RADL (19)
         ] {
             if sc4 {
                 bytes.extend_from_slice(&[0, 0, 0, 1]);
@@ -823,10 +843,10 @@ mod tests {
         //   type 1 (non-IDR slice) → header byte 0x41
         let mut bytes: Vec<u8> = Vec::new();
         for (sc4, hdr) in [
-            (true, 0x67u8),  // SPS
-            (false, 0x68),   // PPS
-            (true, 0x65),    // IDR
-            (false, 0x41),   // non-IDR slice
+            (true, 0x67u8), // SPS
+            (false, 0x68),  // PPS
+            (true, 0x65),   // IDR
+            (false, 0x41),  // non-IDR slice
         ] {
             if sc4 {
                 bytes.extend_from_slice(&[0, 0, 0, 1]);

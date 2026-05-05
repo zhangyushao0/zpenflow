@@ -141,20 +141,30 @@ impl Service {
             let transport: Arc<dyn Transport> =
                 match AdbLocalAbstractTransport::bind("penflow").await {
                     Ok(t) => {
-                        eprintln!(
-                            "[service] adb reverse OK; bound port={}",
-                            t.bound_port()
-                        );
+                        eprintln!("[service] adb reverse OK; bound port={}", t.bound_port());
                         Arc::new(t)
                     }
                     Err(e) => {
                         eprintln!("[service] adb reverse failed: {e}");
+                        // "adb not on PATH" can never be fixed by retrying —
+                        // back off hard so we're not respawning adb 30× a
+                        // minute and (pre-CREATE_NO_WINDOW fix) flashing
+                        // a console window each time. Other errors
+                        // (transient daemon hiccup, USB unplug) get a
+                        // shorter retry.
+                        let missing_binary = e.kind() == std::io::ErrorKind::NotFound
+                            || e.to_string().contains("Is adb on PATH?");
+                        let backoff = if missing_binary {
+                            Duration::from_secs(30)
+                        } else {
+                            Duration::from_secs(5)
+                        };
                         self.emit(ServiceState::Error {
                             message: format!("adb reverse failed: {e}"),
                         })
                         .await;
                         tokio::select! {
-                            _ = tokio::time::sleep(Duration::from_secs(2)) => continue,
+                            _ = tokio::time::sleep(backoff) => continue,
                             _ = &mut cancel => return,
                         }
                     }

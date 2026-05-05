@@ -23,6 +23,30 @@ use std::io;
 use std::process::{Command, Output, Stdio};
 use std::time::Duration;
 
+/// `CREATE_NO_WINDOW` from `wincon.h`. We attach this flag to every
+/// `adb.exe` spawn because the Tauri GUI ships with
+/// `#![windows_subsystem = "windows"]` (no parent console), so any
+/// console child without this flag pops a black `cmd`-like window for
+/// a few hundred milliseconds. With reverse-tunnel rebinding running
+/// 2× per accept-loop iteration, that produced a continuous flicker
+/// — especially on machines without adb installed where every retry
+/// failed and the error path looped fast.
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Wrap `Command::new(...)` callers so every adb spawn is silent on
+/// Windows; on other platforms this is a no-op pass-through.
+#[cfg(windows)]
+fn silent(cmd: &mut Command) -> &mut Command {
+    use std::os::windows::process::CommandExt;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+fn silent(cmd: &mut Command) -> &mut Command {
+    cmd
+}
+
 use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -106,10 +130,7 @@ impl Transport for AdbLocalAbstractTransport {
     async fn accept(&self) -> io::Result<TransportStream> {
         let mut g = self.listener.lock().await;
         let listener = g.as_mut().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotConnected,
-                "transport already shut down",
-            )
+            io::Error::new(io::ErrorKind::NotConnected, "transport already shut down")
         })?;
         let (sock, peer) = listener.accept().await?;
         // Disable Nagle so small input messages (PEN_EVENT, TIME_SYNC_REQ)
@@ -144,15 +165,15 @@ impl Transport for AdbLocalAbstractTransport {
                     let adb_path = self.adb_path.clone();
                     let abstract_name = self.abstract_name.clone();
                     move || {
-                        let _ = Command::new(&adb_path)
-                            .args([
-                                "reverse",
-                                "--remove",
-                                &format!("localabstract:{abstract_name}"),
-                            ])
-                            .stdout(Stdio::null())
-                            .stderr(Stdio::null())
-                            .status();
+                        let mut cmd = Command::new(&adb_path);
+                        cmd.args([
+                            "reverse",
+                            "--remove",
+                            &format!("localabstract:{abstract_name}"),
+                        ])
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null());
+                        let _ = silent(&mut cmd).status();
                     }
                 }),
             )
@@ -169,15 +190,15 @@ impl Drop for AdbLocalAbstractTransport {
         // context and shouldn't deadlock if shutdown() is also racing.
         if let Ok(mut active) = self.reverse_active.try_lock() {
             if *active {
-                let _ = Command::new(&self.adb_path)
-                    .args([
-                        "reverse",
-                        "--remove",
-                        &format!("localabstract:{}", self.abstract_name),
-                    ])
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
+                let mut cmd = Command::new(&self.adb_path);
+                cmd.args([
+                    "reverse",
+                    "--remove",
+                    &format!("localabstract:{}", self.abstract_name),
+                ])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+                let _ = silent(&mut cmd).status();
                 *active = false;
             }
         }
@@ -185,20 +206,17 @@ impl Drop for AdbLocalAbstractTransport {
 }
 
 fn run_adb(adb_path: &str, args: &[&str]) -> io::Result<Output> {
-    let out = Command::new(adb_path)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| {
-            io::Error::new(
-                e.kind(),
-                format!(
-                    "failed to invoke `{adb_path} {}`: {e}. Is adb on PATH?",
-                    args.join(" ")
-                ),
-            )
-        })?;
+    let mut cmd = Command::new(adb_path);
+    cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = silent(&mut cmd).output().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "failed to invoke `{adb_path} {}`: {e}. Is adb on PATH?",
+                args.join(" ")
+            ),
+        )
+    })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();

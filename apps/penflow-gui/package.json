@@ -1,0 +1,9 @@
+{
+  "name": "penflow-gui-shim",
+  "version": "0.0.0",
+  "private": true,
+  "_comment": "Tauri 2's beforeBuildCommand cwd is sometimes this directory and sometimes ./ui — see docs/issues/tauri-cwd. This shim package.json forwards `npm run build` into the real frontend at ./ui regardless of which cwd Tauri picks. No deps; do NOT install anything here.",
+  "scripts": {
+    "build": "npm --prefix ./ui run build"
+  }
+}

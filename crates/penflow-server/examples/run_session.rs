@@ -74,9 +74,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
                     v.friendly_name(),
                     v.instance_id()
                 );
-                println!(
-                    "[run_session]   will enable on Android connect, disable on disconnect"
-                );
+                println!("[run_session]   will enable on Android connect, disable on disconnect");
                 let log_path = std::env::temp_dir().join("penflow-vdd-helper.log");
                 println!(
                     "[run_session]   if enable fails, the elevated helper trace is at: {}",
@@ -140,10 +138,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
             .copied()
             .cloned()
             .unwrap_or_else(|| {
-                eprintln!(
-                    "monitor index {} out of range; using 0",
-                    args.monitor_index
-                );
+                eprintln!("monitor index {} out of range; using 0", args.monitor_index);
                 attached[0].clone()
             })
     };
@@ -158,7 +153,9 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     let transport: Arc<dyn Transport> = Arc::new(
         AdbLocalAbstractTransport::bind("penflow")
             .await
-            .map_err(|e| format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?"))?,
+            .map_err(|e| {
+                format!("ADB transport bind failed: {e}. Is `adb` on PATH and a device attached?")
+            })?,
     );
 
     println!("[run_session] transport ready. Launch the Penflow app on the device now.");
@@ -192,9 +189,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
                     device_width,
                     device_height,
                 } => {
-                    println!(
-                        "[run_session] connected: {peer} → {device_width}x{device_height}"
-                    );
+                    println!("[run_session] connected: {peer} → {device_width}x{device_height}");
                 }
                 SessionEvent::Disconnected => {
                     println!("[run_session] disconnected (clean)");
@@ -236,10 +231,7 @@ async fn vdd_probe_main() -> Result<(), Box<dyn std::error::Error>> {
         vdd.instance_id()
     );
     let baseline = vdd::snapshot_attached_monitor_keys()?;
-    println!(
-        "[vdd-probe] baseline attached outputs: {}",
-        baseline.len()
-    );
+    println!("[vdd-probe] baseline attached outputs: {}", baseline.len());
 
     let instance_id = vdd.instance_id().to_string();
     println!("[vdd-probe] enabling VDD; approve the UAC prompt");

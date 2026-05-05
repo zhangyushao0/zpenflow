@@ -10,20 +10,20 @@
 pub mod error;
 
 #[cfg(windows)]
-pub mod d3d11;
-#[cfg(windows)]
-pub mod monitors;
-#[cfg(windows)]
 pub mod capture;
 #[cfg(windows)]
 pub mod color;
 #[cfg(windows)]
+pub mod d3d11;
+#[cfg(windows)]
 pub mod encoder;
+#[cfg(windows)]
+pub mod monitors;
 
+pub mod inject;
 pub mod packet_queue;
 #[cfg(windows)]
 pub mod pipeline;
-pub mod inject;
 
 pub use error::{EngineError, EngineResult};
 

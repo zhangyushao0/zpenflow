@@ -114,6 +114,7 @@ pub struct MfSession {
     ///   3. submit(N) sets meta = (pts_N, instant_N)
     ///   4. try_packet pops N-1's packet, takes N's meta → encode_us
     ///      ≈ 0 µs (the meta was set ~1 µs ago) and the PTS is wrong.
+    ///
     /// A FIFO eliminates this skew: each submit appends, each pop
     /// consumes the head, so packet ↔ meta line up correctly.
     pending_input_meta: VecDeque<(i64, Instant)>,
@@ -159,7 +160,11 @@ impl MfSession {
             &CODECAPI_AVEncCommonRateControlMode,
             eAVEncCommonRateControlMode_CBR.0 as u32,
         )?;
-        set_codec_ui4(&codec_api, &CODECAPI_AVEncCommonMeanBitRate, cfg.bitrate_bps)?;
+        set_codec_ui4(
+            &codec_api,
+            &CODECAPI_AVEncCommonMeanBitRate,
+            cfg.bitrate_bps,
+        )?;
         let _ = set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true);
         // `AVEncCommonRealTime` is independent of `AVLowLatencyMode` — it
         // tells the MFT "this is a real-time stream, prefer latency over
@@ -355,7 +360,9 @@ impl MfSession {
             None => {
                 // Fall back to the MFT's own PTS (e.g. after a hot reset
                 // that drained outputs without paired meta).
-                let pts = unsafe { sample.GetSampleTime() }.map(|t| t * 100).unwrap_or(0);
+                let pts = unsafe { sample.GetSampleTime() }
+                    .map(|t| t * 100)
+                    .unwrap_or(0);
                 (pts, None)
             }
         };
@@ -413,12 +420,7 @@ impl EncodeSession for MfSession {
         // 3. Wrap the D3D11 texture as an IMFSample (zero-copy via
         //    MFCreateDXGISurfaceBuffer). The IID is ID3D11Texture2D.
         let buffer: IMFMediaBuffer = unsafe {
-            MFCreateDXGISurfaceBuffer(
-                &<ID3D11Texture2D as Interface>::IID,
-                tex,
-                0,
-                false,
-            )?
+            MFCreateDXGISurfaceBuffer(&<ID3D11Texture2D as Interface>::IID, tex, 0, false)?
         };
         let sample = unsafe { MFCreateSample()? };
         unsafe {
@@ -436,8 +438,7 @@ impl EncodeSession for MfSession {
         // Anchor *after* ProcessInput returns so encode_us measures only
         // the encoder's wall-clock work, not the caller's pre-submit
         // texture wrap / SetSampleTime overhead.
-        self.pending_input_meta
-            .push_back((pts_ns, Instant::now()));
+        self.pending_input_meta.push_back((pts_ns, Instant::now()));
 
         // 4. Pre-fetch the next NeedInput credit. NVENC P1 ULL with
         //    `MF_LOW_LATENCY=1` has a shallow pipeline that emits
@@ -467,7 +468,9 @@ impl EncodeSession for MfSession {
 impl Drop for MfSession {
     fn drop(&mut self) {
         unsafe {
-            let _ = self.transform.ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
+            let _ = self
+                .transform
+                .ProcessMessage(MFT_MESSAGE_NOTIFY_END_OF_STREAM, 0);
             let _ = self
                 .transform
                 .ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
@@ -519,7 +522,10 @@ fn pick_mft_for_adapter(adapter_vendor_id: u32, codec: Codec) -> EngineResult<IM
     }
     // Fallback: take the first MFT and let the live-probe at SetOutputType
     // surface the failure if it's wrong-vendor.
-    activates.into_iter().next().ok_or(EngineError::NoCompatibleEncoder)
+    activates
+        .into_iter()
+        .next()
+        .ok_or(EngineError::NoCompatibleEncoder)
 }
 
 fn read_mft_vendor_id(activate: &IMFActivate) -> Option<String> {
@@ -635,7 +641,7 @@ fn pack_2u32(hi: u32, lo: u32) -> u64 {
 /// One-shot diagnostic: locate the FIRST SPS NAL in an Annex-B stream
 /// and return the start-code + NAL header + RBSP slice. Used only by
 /// the FIRST_DUMP debug print in `collect_output_packet`.
-fn find_sps_nal<'a>(codec: Codec, bytes: &'a [u8]) -> Option<&'a [u8]> {
+fn find_sps_nal(codec: Codec, bytes: &[u8]) -> Option<&[u8]> {
     let target_type: u8 = match codec {
         Codec::H264 => 7,
         Codec::Hevc => 33,
@@ -740,7 +746,7 @@ fn first_nal_is_idr(bytes: &[u8], codec: Codec) -> bool {
             Codec::Hevc => {
                 let nal_type = (bytes[off] >> 1) & 0x3F;
                 if nal_type < 32 {
-                    return matches!(nal_type, 19 | 20 | 21);
+                    return matches!(nal_type, 19..=21);
                 }
                 // Non-VCL; keep scanning.
                 i = off + 2;

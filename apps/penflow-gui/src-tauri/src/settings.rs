@@ -95,9 +95,7 @@ impl Default for PenBindings {
         // hold Shift on barrel-2 (line straighten), tap E on tertiary
         // (eraser toggle).
         Self {
-            button_0: Binding::KeyHold {
-                key: "Ctrl".into(),
-            },
+            button_0: Binding::KeyHold { key: "Ctrl".into() },
             button_1: Binding::KeyHold {
                 key: "Shift".into(),
             },

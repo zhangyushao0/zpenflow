@@ -36,8 +36,8 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::{
     Common::{
-        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM,
-        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM,
+        DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R10G10B10A2_UNORM, DXGI_FORMAT_R16G16B16A16_FLOAT,
+        DXGI_FORMAT_R8G8B8A8_UNORM,
     },
     CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory1, IDXGIFactory6, IDXGIOutput, IDXGIOutput1,
     IDXGIOutput5, DXGI_CREATE_FACTORY_FLAGS, DXGI_ERROR_NOT_FOUND,
@@ -129,8 +129,8 @@ fn run_probe() -> Result<bool> {
     let hp_adapter: IDXGIAdapter1 =
         unsafe { factory.EnumAdapterByGpuPreference(0, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE)? };
     let hp_desc = unsafe { hp_adapter.GetDesc1()? };
-    let hp_luid = ((hp_desc.AdapterLuid.HighPart as i64) << 32)
-        | (hp_desc.AdapterLuid.LowPart as i64);
+    let hp_luid =
+        ((hp_desc.AdapterLuid.HighPart as i64) << 32) | (hp_desc.AdapterLuid.LowPart as i64);
 
     // 4. Print the topology.
     println!("=== DXGI topology ===");
@@ -205,13 +205,19 @@ fn run_probe() -> Result<bool> {
     for ai in &adapters {
         for oi in &ai.outputs {
             if looks_like_vdd(&ai.name) || looks_like_vdd(&oi.device_name) {
-                vdd_hits.push((ai.index, oi.index, format!("{} / {}", ai.name, oi.device_name)));
+                vdd_hits.push((
+                    ai.index,
+                    oi.index,
+                    format!("{} / {}", ai.name, oi.device_name),
+                ));
             }
         }
     }
     if vdd_hits.is_empty() {
         println!("    no virtual-display indicators in adapter or output names.");
-        println!("    (VDD lifecycle is Wave-5 work; no virtual monitor expected on idle desktop.)");
+        println!(
+            "    (VDD lifecycle is Wave-5 work; no virtual monitor expected on idle desktop.)"
+        );
     } else {
         for (ai, oi, label) in &vdd_hits {
             println!("    candidate VDD: adapter#{ai} output#{oi}: {label}");
@@ -285,8 +291,7 @@ fn enumerate_adapters_and_outputs(factory: &IDXGIFactory1) -> Result<Vec<Adapter
             name,
             vendor_id: desc.VendorId,
             device_id: desc.DeviceId,
-            luid: ((desc.AdapterLuid.HighPart as i64) << 32)
-                | (desc.AdapterLuid.LowPart as i64),
+            luid: ((desc.AdapterLuid.HighPart as i64) << 32) | (desc.AdapterLuid.LowPart as i64),
             dedicated_vram_mb: (desc.DedicatedVideoMemory as u64) / (1024 * 1024),
             is_software,
             outputs,

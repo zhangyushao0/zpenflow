@@ -9,10 +9,14 @@ mod settings;
 
 use std::sync::{Arc, RwLock};
 
-use tauri::Emitter;
+use tauri::{
+    menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem},
+    tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent},
+    Emitter, Manager, WindowEvent,
+};
 
 use crate::service::{Service, ServiceState};
-use crate::settings::{SharedSettings, Settings};
+use crate::settings::{Settings, SharedSettings};
 
 struct AppState {
     settings: SharedSettings,
@@ -25,17 +29,43 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 }
 
 #[tauri::command]
-fn save_settings(
-    state: tauri::State<'_, AppState>,
-    new: Settings,
-) -> Result<(), String> {
+fn save_settings(state: tauri::State<'_, AppState>, new: Settings) -> Result<(), String> {
     settings::save(&new).map_err(|e| e.to_string())?;
     *state.settings.write().expect("settings poisoned") = new.clone();
 
-    // Apply autostart side-effect immediately. Other settings take effect
-    // on the next session reconnect.
-    if let Err(e) = os::set_autostart(new.autostart) {
-        return Err(format!("autostart toggle failed: {e}"));
+    // Apply OS-level side-effects of the (run_as_admin × autostart)
+    // matrix immediately. The other settings (bitrate / fps / bindings)
+    // take effect on the next session reconnect.
+    //
+    //   run_as_admin | autostart || HKCU Run | Scheduled task (RL=HIGHEST)
+    //   -------------+-----------++---------+----------------------------
+    //   false        | false     || none    | absent
+    //   false        | true      || present | absent
+    //   true         | false     || none    | present (no logon trigger)
+    //   true         | true      || none    | present (ONLOGON trigger)
+    //
+    // The scheduled task variant is what makes "no UAC on subsequent
+    // launches" possible: HIGHEST run-level tasks bypass the consent
+    // dialog when triggered. Cost: one UAC at task-create time.
+    if new.run_as_admin {
+        // Drop any HKCU Run autostart — the task replaces it. Doing
+        // this first means a failure to set up the task leaves the
+        // user without a duplicate launcher.
+        if let Err(e) = os::set_autostart(false) {
+            return Err(format!("autostart cleanup failed: {e}"));
+        }
+        if let Err(e) = os::create_admin_task(new.autostart) {
+            return Err(format!("admin task create failed: {e}"));
+        }
+    } else {
+        // Tear down any leftover scheduled task (one UAC if currently
+        // unelevated and the task exists; no-op if absent).
+        if let Err(e) = os::delete_admin_task() {
+            return Err(format!("admin task delete failed: {e}"));
+        }
+        if let Err(e) = os::set_autostart(new.autostart) {
+            return Err(format!("autostart toggle failed: {e}"));
+        }
     }
     Ok(())
 }
@@ -62,9 +92,78 @@ fn is_elevated() -> bool {
     os::is_elevated()
 }
 
+/// Returns true if a Virtual Display Driver is currently installed and
+/// detectable by SetupAPI. The GUI uses this to decide whether to show
+/// the "Install VDD" banner.
+#[tauri::command]
+fn is_vdd_installed() -> bool {
+    matches!(penflow_server::VddController::detect(), Ok(Some(_)))
+}
+
+/// Install the bundled VDD driver via the elevated pnputil helper.
+/// Returns Ok(()) when pnputil completes successfully.
+#[tauri::command]
+async fn install_vdd(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {e}"))?;
+    let inf = resource_dir.join("vdd").join("MttVDD.inf");
+    if !inf.exists() {
+        return Err(format!(
+            "bundled VDD driver not found at {} — was the installer/vdd-driver folder populated before tauri build?",
+            inf.display()
+        ));
+    }
+    // Run the install on a blocking thread so the elevated helper can
+    // block on UAC + pnputil without freezing the tokio runtime.
+    let inf_clone = inf.clone();
+    tokio::task::spawn_blocking(move || penflow_server::install_driver(&inf_clone))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("install_driver: {e}"))?;
+
+    // After install, copy our pre-tuned settings.xml over the driver's
+    // default install location so the resolution / refresh-rate match
+    // what the engine expects (2880x1800 @ 60/120).
+    let settings_src = resource_dir.join("vdd").join("vdd_settings.xml");
+    let settings_dst = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\vdd_settings.xml");
+    if let Some(parent) = settings_dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::copy(&settings_src, &settings_dst);
+    Ok(())
+}
+
+/// Restore + focus the main window after a tray click or the "Show"
+/// menu item. Handles the un-minimized + hidden combo (clicking X
+/// hides; if the user had also minimized first the window is both
+/// minimized AND hidden).
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.unminimize();
+        let _ = w.show();
+        let _ = w.set_focus();
+    }
+}
+
 #[tauri::command]
 fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
-    os::relaunch_elevated().map_err(|e| e.to_string())?;
+    // Same hand-off ladder as startup: prefer the no-UAC scheduled
+    // task if it exists, fall back to ShellExecuteW(runas) only when
+    // the task isn't there. This way, after the first time the user
+    // enables run_as_admin (which creates the task and burns one UAC
+    // for that creation), every subsequent admin re-launch — settings
+    // edits, fresh launches — costs zero prompts.
+    if os::has_admin_task() {
+        if let Err(e) = os::run_admin_task() {
+            eprintln!("[gui] schtasks /Run failed: {e}; falling back to UAC");
+            os::relaunch_elevated().map_err(|e| e.to_string())?;
+        }
+    } else {
+        os::relaunch_elevated().map_err(|e| e.to_string())?;
+    }
     // Schedule the current process to exit so the elevated copy takes
     // over. Give Tauri a tick to flush the command response first.
     std::thread::spawn(move || {
@@ -95,15 +194,40 @@ fn main() -> std::process::ExitCode {
 
     // Hand off to elevated copy if the user asked for admin and we
     // aren't already there. Skip for the elevated copy itself.
+    //
+    // Prefer the scheduled-task path: if a Penflow task with RL=HIGHEST
+    // exists (created the first time the user toggled run_as_admin),
+    // `schtasks /Run` launches an elevated copy WITHOUT a UAC prompt.
+    // Fall back to ShellExecuteW(runas) — which DOES prompt — only
+    // when no task is registered yet (e.g. fresh install where the
+    // user enabled run_as_admin but the task creation hasn't happened
+    // yet, or task got deleted out-of-band).
     if initial_settings.run_as_admin && !os::is_elevated() {
-        match os::relaunch_elevated() {
-            Ok(()) => {
-                eprintln!("[gui] handed off to elevated copy; exiting unelevated process");
-                std::process::exit(0);
+        let mut handed_off = false;
+        if os::has_admin_task() {
+            match os::run_admin_task() {
+                Ok(()) => {
+                    eprintln!("[gui] handed off via scheduled task (no UAC)");
+                    handed_off = true;
+                }
+                Err(e) => {
+                    eprintln!("[gui] schtasks /Run failed: {e}; falling back to UAC path");
+                }
             }
-            Err(e) => {
-                eprintln!("[gui] elevated re-launch failed (continuing unelevated): {e}");
+        }
+        if !handed_off {
+            match os::relaunch_elevated() {
+                Ok(()) => {
+                    eprintln!("[gui] handed off to elevated copy via UAC");
+                    handed_off = true;
+                }
+                Err(e) => {
+                    eprintln!("[gui] elevated re-launch failed (continuing unelevated): {e}");
+                }
             }
+        }
+        if handed_off {
+            std::process::exit(0);
         }
     }
 
@@ -118,8 +242,73 @@ fn main() -> std::process::ExitCode {
         .setup({
             let service = Arc::clone(&service);
             move |app| {
-                // Auto-start the service on launch — the design is
-                // "always running, ready to accept the next plug-in".
+                // Apply Win11 Mica to the main window. Falls back silently
+                // on Win10 or older where Mica isn't supported (apply_mica
+                // returns Err but it's not fatal).
+                #[cfg(target_os = "windows")]
+                if let Some(window) = app.get_webview_window("main") {
+                    match window_vibrancy::apply_mica(&window, Some(true)) {
+                        Ok(()) => eprintln!("[gui] Win11 Mica applied"),
+                        Err(e) => eprintln!("[gui] Mica unavailable ({e}); window will be opaque"),
+                    }
+                }
+
+                // Close-to-tray: clicking the window's X must hide the
+                // window, not exit the process. Otherwise the background
+                // service dies the moment the user closes the settings
+                // panel — exactly the bug the user hit. Only the tray's
+                // explicit Quit menu (or app.exit) actually shuts down.
+                if let Some(window) = app.get_webview_window("main") {
+                    let w = window.clone();
+                    window.on_window_event(move |event| {
+                        if let WindowEvent::CloseRequested { api, .. } = event {
+                            api.prevent_close();
+                            let _ = w.hide();
+                        }
+                    });
+                }
+
+                // System tray. Left-click toggles window visibility;
+                // menu has explicit "Show" + "Quit". Quit exits the app
+                // which fires RunEvent::ExitRequested → svc.stop().
+                let tray_show = MenuItemBuilder::with_id("show", "Show Penflow").build(app)?;
+                let tray_separator = PredefinedMenuItem::separator(app)?;
+                let tray_quit = MenuItemBuilder::with_id("quit", "Quit Penflow").build(app)?;
+                let tray_menu = MenuBuilder::new(app)
+                    .items(&[&tray_show, &tray_separator, &tray_quit])
+                    .build()?;
+
+                let app_handle_menu = app.handle().clone();
+                let app_handle_click = app.handle().clone();
+                let _tray = TrayIconBuilder::with_id("penflow-tray")
+                    .icon(app.default_window_icon().cloned().unwrap())
+                    .tooltip("Penflow")
+                    .menu(&tray_menu)
+                    .show_menu_on_left_click(false)
+                    .on_menu_event(move |_tray, event| match event.id().as_ref() {
+                        "show" => show_main_window(&app_handle_menu),
+                        "quit" => app_handle_menu.exit(0),
+                        _ => {}
+                    })
+                    .on_tray_icon_event(move |_tray, event| {
+                        if let TrayIconEvent::Click {
+                            button: MouseButton::Left,
+                            button_state: MouseButtonState::Up,
+                            ..
+                        } = event
+                        {
+                            if let Some(w) = app_handle_click.get_webview_window("main") {
+                                if w.is_visible().unwrap_or(false) {
+                                    let _ = w.hide();
+                                } else {
+                                    show_main_window(&app_handle_click);
+                                }
+                            }
+                        }
+                    })
+                    .build(app)?;
+
+                // Auto-start the service on launch.
                 let svc = Arc::clone(&service);
                 tauri::async_runtime::spawn(async move {
                     svc.start().await;
@@ -145,6 +334,8 @@ fn main() -> std::process::ExitCode {
             stop_service,
             is_elevated,
             relaunch_as_admin,
+            is_vdd_installed,
+            install_vdd,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Penflow GUI");

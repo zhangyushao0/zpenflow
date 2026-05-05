@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!--
+  WiX 3 fragment that installs the bundled Virtual Display Driver
+  during MSI install (one UAC at install time, never again).
+  Loaded by Tauri 2's `bundle.windows.wix.fragmentPaths`.
+
+  Linker note: WiX fragments are dead-stripped unless the main module
+  references a symbol inside them. Tauri owns main.wxs and never names
+  our CustomAction Ids, so we wrap them in a no-op `Component` and ask
+  Tauri to add a `<ComponentRef>` for it via
+  `bundle.windows.wix.componentRefs`. ComponentRef pulls the component,
+  which drags in the entire fragment (CustomActions + sequence).
+
+  Why devcon, not pnputil:
+    The MttVDD INF advertises a Root-enumerated hardware ID
+    (`Root\MttVDD`). `pnputil /add-driver foo.inf /install` only
+    install/updates drivers on EXISTING matching devices — for root-
+    enumerated virtual devices there is no pre-existing PnP node, so
+    pnputil leaves the driver in the store but no device gets created.
+    `devcon install foo.inf Root\MttVDD` both adds the driver to the
+    store AND creates the root device node, after which the IDDCx
+    target is live. devcon is Microsoft-signed and bundled by the
+    upstream VDD release; we ship it next to the .inf at vdd/devcon.exe.
+
+  Uninstall:
+    Skipped on purpose. devcon /remove with a hardware ID needs cmd
+    quoting that WiX 3's XML attribute parser doesn't tolerate, and
+    leaving the device in place across a Penflow reinstall is harmless
+    (devcon install is idempotent — it updates the existing device).
+    Power users can run `devcon remove Root\MttVDD` manually if they
+    really want to scrub the device.
+
+  Return="ignore" means a devcon failure does NOT abort the MSI —
+  the GUI's first-run banner is still the fallback.
+-->
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <!-- Anchor component. No real install side-effect beyond a
+             marker registry value (KeyPath required); its only purpose
+             is to give Tauri's componentRefs something to point at so
+             the linker keeps this whole fragment. -->
+        <DirectoryRef Id="INSTALLDIR">
+            <Component Id="PenflowVddInstallActions"
+                       Guid="{8C1B7A2E-4F9D-4A3E-9F0B-2C7E0D5A6B14}"
+                       Win64="yes">
+                <RegistryValue Root="HKLM"
+                               Key="Software\Penflow\VddInstaller"
+                               Name="FragmentLinked"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <!-- Install: runs after files are laid out on disk. Tauri lays
+             our resources at `[INSTALLDIR]vdd\` (the resources object
+             in tauri.conf.json maps each file to "vdd/<name>"). devcon
+             needs admin (Impersonate="no" + deferred → runs as SYSTEM,
+             which is sufficient). -->
+        <CustomAction
+            Id="PenflowInstallVdd"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vdd\devcon.exe" install "[INSTALLDIR]vdd\MttVDD.inf" "Root\MttVDD"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
+        <!-- Copy our pre-tuned 2880x1800 settings.xml over the driver's
+             install dir so the IDDCx target advertises the right modes
+             on first arrival. The driver creates C:\VirtualDisplayDriver
+             during pnputil install; we overwrite the XML right after. -->
+        <CustomAction
+            Id="PenflowApplyVddSettings"
+            Directory="INSTALLDIR"
+            ExeCommand='cmd.exe /c if exist "C:\VirtualDisplayDriver" copy /Y "[INSTALLDIR]vdd\vdd_settings.xml" "C:\VirtualDisplayDriver\vdd_settings.xml"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
+        <InstallExecuteSequence>
+            <!-- Schedule both install actions after files are copied,
+                 only on a true install (not on uninstall/repair). -->
+            <Custom Action="PenflowInstallVdd"        After="InstallFiles">NOT REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowApplyVddSettings"  After="PenflowInstallVdd">NOT REMOVE~="ALL"</Custom>
+        </InstallExecuteSequence>
+    </Fragment>
+</Wix>

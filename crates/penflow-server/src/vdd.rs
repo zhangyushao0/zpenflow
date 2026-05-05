@@ -567,6 +567,70 @@ pub fn helper_main(args: &[String]) -> ExitCode {
         Err(e) => log.append(&format!("before {action}: status query failed: {e}")),
     }
 
+    // `install` / `uninstall` go through the bundled devcon.exe rather
+    // than pnputil. MttVDD's INF advertises `Root\MttVDD` (root-
+    // enumerated virtual device); pnputil /add-driver /install only
+    // updates drivers on EXISTING matching PnP nodes, but for a root
+    // device there is no pre-existing node, so pnputil silently leaves
+    // the driver in the store with nothing actually installed. devcon's
+    // `install <inf> <hwid>` form does both: store-add + root-node
+    // creation in one step. The 2nd arg is the full path to the .inf
+    // when action is install/uninstall; we sit devcon next to the .inf
+    // (Tauri MSI lays both at `[INSTALLDIR]vdd\`).
+    if action == "install" || action == "uninstall" {
+        let inf_path = std::path::Path::new(instance_id);
+        let devcon = inf_path
+            .parent()
+            .map(|p| p.join("devcon.exe"))
+            .unwrap_or_else(|| std::path::PathBuf::from("devcon.exe"));
+        log.append(&format!(
+            "{action} via devcon at {}: {}",
+            devcon.display(),
+            inf_path.display()
+        ));
+        // Hide devcon's console window. The elevated helper itself is
+        // GUI-subsystem with no console attached, so any console child
+        // it spawns gets a fresh popup unless we set CREATE_NO_WINDOW.
+        #[cfg(windows)]
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let mut cmd = std::process::Command::new(&devcon);
+        if action == "install" {
+            cmd.args(["install", &inf_path.to_string_lossy(), "Root\\MttVDD"]);
+        } else {
+            // devcon remove takes the hardware ID, not the .inf path.
+            cmd.args(["remove", "Root\\MttVDD"]);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        let r = cmd.status();
+        return match r {
+            Ok(s) if s.success() => {
+                log.append(&format!("devcon {action} OK"));
+                ExitCode::SUCCESS
+            }
+            // devcon's exit code 1 means "reboot required" but the
+            // device is registered + driver loaded — treat as success
+            // for our purposes (IDDCx targets attach without reboot).
+            Ok(s) if s.code() == Some(1) => {
+                log.append(&format!(
+                    "devcon {action} OK (reboot recommended; ignoring)"
+                ));
+                ExitCode::SUCCESS
+            }
+            Ok(s) => {
+                log.append(&format!("devcon {action} exit={s:?}"));
+                ExitCode::from(1)
+            }
+            Err(e) => {
+                log.append(&format!("devcon {action} spawn failed: {e}"));
+                ExitCode::from(1)
+            }
+        };
+    }
+
     let result = match action {
         "enable" => cm_enable(instance_id).and_then(|_| {
             log.append("CM_Enable_DevNode returned CR_SUCCESS");
@@ -624,26 +688,26 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
     ));
 
     let done_w = wide_z(&done_name);
-    let done_evt = match unsafe {
-        OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(done_w.as_ptr()))
-    } {
-        Ok(h) if !h.is_invalid() => h,
-        _ => {
-            log.append("OpenEventW(done) failed; cannot proceed");
-            return ExitCode::from(2);
-        }
-    };
+    let done_evt =
+        match unsafe { OpenEventW(EVENT_MODIFY_STATE, false, PCWSTR::from_raw(done_w.as_ptr())) } {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                log.append("OpenEventW(done) failed; cannot proceed");
+                return ExitCode::from(2);
+            }
+        };
     let stop_w = wide_z(&stop_name);
-    let stop_evt = match unsafe {
-        OpenEventW(SYNCHRONIZE, false, PCWSTR::from_raw(stop_w.as_ptr()))
-    } {
-        Ok(h) if !h.is_invalid() => h,
-        _ => {
-            log.append("OpenEventW(stop) failed; cannot proceed");
-            unsafe { let _ = CloseHandle(done_evt); };
-            return ExitCode::from(2);
-        }
-    };
+    let stop_evt =
+        match unsafe { OpenEventW(SYNCHRONIZE, false, PCWSTR::from_raw(stop_w.as_ptr())) } {
+            Ok(h) if !h.is_invalid() => h,
+            _ => {
+                log.append("OpenEventW(stop) failed; cannot proceed");
+                unsafe {
+                    let _ = CloseHandle(done_evt);
+                };
+                return ExitCode::from(2);
+            }
+        };
 
     // Initial enable.
     if let Err(e) = cm_enable(instance_id) {
@@ -664,7 +728,9 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
     // Tell the parent enable is done. The parent's `enable()` returns
     // here; subsequent `wait_for_virtual_monitor` polls DXGI until the
     // IddCx target attaches to the desktop.
-    unsafe { let _ = SetEvent(done_evt); }
+    unsafe {
+        let _ = SetEvent(done_evt);
+    }
 
     // Sleep until the parent signals stop.
     use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
@@ -726,16 +792,16 @@ fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> 
     let stop_evt = match create("stop") {
         Ok(h) => h,
         Err(e) => {
-            unsafe { let _ = CloseHandle(done_evt); };
+            unsafe {
+                let _ = CloseHandle(done_evt);
+            };
             return Err(e);
         }
     };
 
     // Spawn helper elevated (UAC prompt).
     let exe_w = wide_z(exe.as_os_str());
-    let params = format!(
-        "--vdd-helper resident \"{instance_id}\" \"{event_base}\""
-    );
+    let params = format!("--vdd-helper resident \"{instance_id}\" \"{event_base}\"");
     let params_w = wide_z(&params);
     let verb_w = wide_z("runas");
     let mut sei = SHELLEXECUTEINFOW {
@@ -784,12 +850,11 @@ fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> 
         // Either helper died or we timed out. Either way bail out and
         // close handles. Caller falls back to per-call helper or errors.
         let _ = r; // suppress unused-value warning
-        // Did the helper exit? If yes, surface its exit code if non-zero.
+                   // Did the helper exit? If yes, surface its exit code if non-zero.
         let mut code: u32 = 0;
         let _ = unsafe { WaitForSingleObject(process, 0) };
-        let _ = unsafe {
-            windows::Win32::System::Threading::GetExitCodeProcess(process, &mut code)
-        };
+        let _ =
+            unsafe { windows::Win32::System::Threading::GetExitCodeProcess(process, &mut code) };
         unsafe {
             let _ = CloseHandle(done_evt);
             let _ = CloseHandle(stop_evt);
@@ -960,15 +1025,16 @@ fn get_string_property(
 
 fn matches_vdd_heuristic(name: &str) -> bool {
     let n = name.to_lowercase();
+    // Specific product names of IDDCx-based virtual display drivers.
+    // We deliberately do NOT match a bare "virtual display" or "vdd"
+    // substring — too many emulators (MuMu, BlueStacks, NoxPlayer)
+    // expose adapters whose names contain "Virtual Display" but which
+    // are not driveable like a real IDDCx device.
     [
-        "virtual display driver",
-        "virtual display",
-        "iddcx",
-        "iddsample",
-        "iddsampledriver",
-        "vdd",
-        "mttvdd",
-        "amyuni",
+        "virtual display driver", // VirtualDrivers project (our bundle)
+        "mttvdd",                 // shipped INF / hardware id
+        "iddsample",              // Microsoft IDDCx sample (incl. iddsampledriver)
+        "amyuni usb mobile",      // commercial Amyuni VDD
     ]
     .iter()
     .any(|needle| n.contains(needle))
@@ -1092,6 +1158,22 @@ fn is_process_elevated() -> bool {
     got && elevation.TokenIsElevated != 0
 }
 
+/// Install the bundled Virtual Display Driver. Spawns the elevated
+/// helper with `--vdd-helper install <inf-path>` which calls
+/// `pnputil /add-driver <inf> /install`. One UAC prompt; returns when
+/// the install is complete (or errors out).
+pub fn install_driver(inf_path: &std::path::Path) -> Result<(), VddError> {
+    let s = inf_path.to_string_lossy();
+    run_helper_elevated("install", &s)
+}
+
+/// Uninstall the VDD via pnputil. `inf_path` is the same .inf used
+/// during install (or its OEM-renamed twin in `%WINDIR%\INF`).
+pub fn uninstall_driver(inf_path: &std::path::Path) -> Result<(), VddError> {
+    let s = inf_path.to_string_lossy();
+    run_helper_elevated("uninstall", &s)
+}
+
 /// Re-launch the current executable elevated, with `--vdd-helper <action>
 /// <instance_id>` arguments. Waits for the elevated child to exit and
 /// translates exit code into `Result`.
@@ -1153,19 +1235,20 @@ mod tests {
     #[test]
     fn heuristic_recognises_canonical_name() {
         assert!(matches_vdd_heuristic("Virtual Display Driver"));
-        assert!(matches_vdd_heuristic("MTT VDD"));
+        assert!(matches_vdd_heuristic("MttVDD"));
         assert!(matches_vdd_heuristic("IddSampleDriver"));
     }
 
     #[test]
-    fn heuristic_rejects_real_gpus() {
+    fn heuristic_rejects_real_gpus_and_emulators() {
         assert!(!matches_vdd_heuristic("NVIDIA GeForce RTX 5070"));
         assert!(!matches_vdd_heuristic("AMD Radeon Graphics"));
-        // MuMu — emulator's display adapter, contains "virtual"; we
-        // accept it here, but `detect()` deprioritises it via
-        // status (it's enabled, ours is disabled) and via canonical
-        // name (it doesn't contain "virtual display driver" exactly).
-        assert!(matches_vdd_heuristic("MuMu Virtual Display Adapter"));
+        // MuMu / BlueStacks / NoxPlayer expose adapters whose names
+        // contain "Virtual Display" but don't behave like real IDDCx
+        // devices. Excluding them prevents the GUI's first-run banner
+        // from being suppressed by an unrelated emulator.
+        assert!(!matches_vdd_heuristic("MuMu Virtual Display Adapter"));
+        assert!(!matches_vdd_heuristic("BlueStacks Virtual Display"));
     }
 
     #[test]

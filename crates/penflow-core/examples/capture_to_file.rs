@@ -20,14 +20,8 @@ use penflow_core::Engine;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
-    let mon_idx: usize = args
-        .get(1)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let duration_s: u64 = args
-        .get(2)
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5);
+    let mon_idx: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let duration_s: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
     let out_path: PathBuf = args
         .get(3)
         .map(PathBuf::from)
@@ -49,14 +43,10 @@ fn main() {
             i, m.device_name, m.adapter_name, m.width, m.height
         );
     }
-    let monitor = attached
-        .get(mon_idx)
-        .copied()
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!("monitor index {mon_idx} out of range; using 0");
-            attached[0].clone()
-        });
+    let monitor = attached.get(mon_idx).copied().cloned().unwrap_or_else(|| {
+        eprintln!("monitor index {mon_idx} out of range; using 0");
+        attached[0].clone()
+    });
     println!(
         "[selected] {} {}x{} on {}",
         monitor.device_name, monitor.width, monitor.height, monitor.adapter_name

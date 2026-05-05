@@ -57,7 +57,9 @@ fn main() -> ExitCode {
             println!("(Windows Ink mode) or OneNote that you saw a pressured stroke, not a click.");
             println!();
             println!("Remaining gate-3.5: re-run this probe inside the WiX/MSI release shape");
-            println!("during Wave 5. If it fails there, switch to MSIX-with-restricted-capability,");
+            println!(
+                "during Wave 5. If it fails there, switch to MSIX-with-restricted-capability,"
+            );
             println!("a small broker process, or virtual HID. (See design.md §6.6.)");
             ExitCode::SUCCESS
         }
@@ -121,19 +123,22 @@ fn inject_pen(
 
     let mut opts = InjectedInputPointerOptions::None;
     if in_range {
-        opts = opts | InjectedInputPointerOptions::InRange;
+        opts |= InjectedInputPointerOptions::InRange;
     }
     if in_contact {
         opts = opts | InjectedInputPointerOptions::InContact | InjectedInputPointerOptions::Update;
     }
     if !in_range && !in_contact {
-        opts = opts | InjectedInputPointerOptions::PointerUp;
+        opts |= InjectedInputPointerOptions::PointerUp;
     }
 
     let pointer = InjectedInputPointerInfo {
         PointerId: 1,
         PointerOptions: opts,
-        PixelLocation: InjectedInputPoint { PositionX: x, PositionY: y },
+        PixelLocation: InjectedInputPoint {
+            PositionX: x,
+            PositionY: y,
+        },
         TimeOffsetInMilliseconds: 0,
         PerformanceCount: 0,
     };

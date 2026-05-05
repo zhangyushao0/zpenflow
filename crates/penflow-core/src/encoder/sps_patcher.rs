@@ -149,11 +149,7 @@ fn rbsp_unescape(ebsp: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(ebsp.len());
     let mut i = 0;
     while i < ebsp.len() {
-        if i + 2 < ebsp.len()
-            && ebsp[i] == 0x00
-            && ebsp[i + 1] == 0x00
-            && ebsp[i + 2] == 0x03
-        {
+        if i + 2 < ebsp.len() && ebsp[i] == 0x00 && ebsp[i + 1] == 0x00 && ebsp[i + 2] == 0x03 {
             out.push(0x00);
             out.push(0x00);
             i += 3;
@@ -249,7 +245,6 @@ impl<'a> BitReader<'a> {
             Ok(-((code >> 1) as i32))
         }
     }
-
 }
 
 struct BitWriter {
@@ -282,7 +277,7 @@ impl BitWriter {
     fn write_ue(&mut self, value: u32) {
         // Number of leading zeros = floor(log2(value + 1)).
         let v_plus_1 = value as u64 + 1;
-        let leading_zeros = 63 - v_plus_1.leading_zeros() as u32;
+        let leading_zeros = 63 - v_plus_1.leading_zeros();
         // Write `leading_zeros` zero bits then a 1 bit then `leading_zeros`
         // bits of `(value + 1) - 2^leading_zeros`.
         for _ in 0..leading_zeros {
@@ -837,7 +832,7 @@ mod tests {
         w.write_bits(0xC0, 8); // constraint flags + reserved
         w.write_bits(40, 8); // level_idc
         w.write_ue(0); // seq_parameter_set_id
-        // No chroma block for profile_idc = 66.
+                       // No chroma block for profile_idc = 66.
         w.write_ue(0); // log2_max_frame_num_minus4
         w.write_ue(0); // pic_order_cnt_type = 0
         w.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
@@ -988,26 +983,26 @@ mod tests {
         w.write_bits(0, 4); // sps_video_parameter_set_id
         w.write_bits(0, 3); // sps_max_sub_layers_minus1
         w.write_bits(1, 1); // sps_temporal_id_nesting_flag
-        // profile_tier_level: 96 bits when profile_present_flag=1 and
-        // max_num_sub_layers_minus1=0.
+                            // profile_tier_level: 96 bits when profile_present_flag=1 and
+                            // max_num_sub_layers_minus1=0.
         for _ in 0..12 {
             w.write_bits(0, 8); // 96 bits = 12 bytes of zeros
         }
         w.write_ue(0); // sps_seq_parameter_set_id
         w.write_ue(1); // chroma_format_idc = 1 (4:2:0)
         w.write_ue(1919); // pic_width_in_luma_samples = 1920... wait this is u(v) not ue
-        // Hmm wait, per spec pic_width_in_luma_samples is ue(v). Let me check.
-        // Actually it IS ue(v) per H.265 §7.3.2.2.1. So 1920 directly.
-        // Already wrote 1919 — let me fix to write 1920 below for a more
-        // realistic test, but actually since this is just synthetic, anything
-        // works. Keep it small.
+                          // Hmm wait, per spec pic_width_in_luma_samples is ue(v). Let me check.
+                          // Actually it IS ue(v) per H.265 §7.3.2.2.1. So 1920 directly.
+                          // Already wrote 1919 — let me fix to write 1920 below for a more
+                          // realistic test, but actually since this is just synthetic, anything
+                          // works. Keep it small.
         w.write_ue(1080);
         w.write_bits(0, 1); // conformance_window_flag = 0
         w.write_ue(0); // bit_depth_luma_minus8
         w.write_ue(0); // bit_depth_chroma_minus8
         w.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
         w.write_bits(1, 1); // sps_sub_layer_ordering_info_present_flag
-        // Just one entry since max_sub_layers_minus1 = 0.
+                            // Just one entry since max_sub_layers_minus1 = 0.
         w.write_ue(sps_max_dec_pic_buffering_minus1);
         w.write_ue(sps_max_num_reorder_pics);
         w.write_ue(sps_max_latency_increase_plus1);

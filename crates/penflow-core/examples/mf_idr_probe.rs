@@ -17,17 +17,21 @@ use std::ptr;
 
 use windows::core::{Interface, Result, GUID, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, E_FAIL, HMODULE, VARIANT_TRUE};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Multithread,
-    D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Multithread, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
 };
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIAdapter1, IDXGIFactory6, DXGI_CREATE_FACTORY_FLAGS,
     DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
 };
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_MULTITHREADED,
+};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
 const WIDTH: u32 = 1280;
@@ -146,7 +150,9 @@ fn run_probe() -> Result<bool> {
             }
 
             let mut status: u32 = 0;
-            let r = unsafe { transform.ProcessOutput(0, std::slice::from_mut(&mut out_buf), &mut status) };
+            let r = unsafe {
+                transform.ProcessOutput(0, std::slice::from_mut(&mut out_buf), &mut status)
+            };
 
             // Always reclaim ownership so refcounts don't leak.
             let opt_sample = unsafe { ManuallyDrop::take(&mut out_buf.pSample) };
@@ -421,7 +427,11 @@ fn configure_transform(transform: &IMFTransform, dev_mgr: &IMFDXGIDeviceManager)
 }
 
 fn apply_codec_settings(codec: &ICodecAPI) -> Result<()> {
-    set_codec_ui4(codec, &CODECAPI_AVEncCommonRateControlMode, eAVEncCommonRateControlMode_CBR.0 as u32)?;
+    set_codec_ui4(
+        codec,
+        &CODECAPI_AVEncCommonRateControlMode,
+        eAVEncCommonRateControlMode_CBR.0 as u32,
+    )?;
     set_codec_ui4(codec, &CODECAPI_AVEncCommonMeanBitRate, BITRATE)?;
     let _ = set_codec_bool(codec, &CODECAPI_AVLowLatencyMode, true);
     let _ = set_codec_ui4(codec, &CODECAPI_AVEncMPVDefaultBPictureCount, 0);
@@ -445,7 +455,11 @@ fn set_codec_bool(codec: &ICodecAPI, key: &GUID, value: bool) -> Result<()> {
     unsafe {
         let inner = &mut var.Anonymous.Anonymous;
         inner.vt = VT_BOOL;
-        inner.Anonymous.boolVal = if value { VARIANT_TRUE } else { windows::Win32::Foundation::VARIANT_FALSE };
+        inner.Anonymous.boolVal = if value {
+            VARIANT_TRUE
+        } else {
+            windows::Win32::Foundation::VARIANT_FALSE
+        };
         codec.SetValue(key, &var)
     }
 }
