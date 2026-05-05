@@ -1,8 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 
 <!--
-  WiX 3 fragment that installs the bundled Virtual Display Driver
-  during MSI install (one UAC at install time, never again).
+  WiX 3 fragment that installs + uninstalls the bundled Virtual
+  Display Driver around the MSI lifecycle. One UAC prompt at MSI
+  install time, none thereafter.
   Loaded by Tauri 2's `bundle.windows.wix.fragmentPaths`.
 
   Linker note: WiX fragments are dead-stripped unless the main module
@@ -23,16 +24,26 @@
     target is live. devcon is Microsoft-signed and bundled by the
     upstream VDD release; we ship it next to the .inf at vdd/devcon.exe.
 
+  Why devcon disable right after install:
+    The IDDCx driver, on `devcon install`, comes up enabled by default
+    — meaning Windows immediately allocates a virtual monitor and
+    starts a spinner-backed display target. Penflow's design is to
+    keep the device disabled at rest and only enable it for the
+    duration of an active session (see crates/penflow-server/src/vdd.rs
+    `enable()` / `disable()`). Disabling right after install gets us
+    to that resting state in one shot.
+
   Uninstall:
-    Skipped on purpose. devcon /remove with a hardware ID needs cmd
-    quoting that WiX 3's XML attribute parser doesn't tolerate, and
-    leaving the device in place across a Penflow reinstall is harmless
-    (devcon install is idempotent — it updates the existing device).
-    Power users can run `devcon remove Root\MttVDD` manually if they
-    really want to scrub the device.
+    On REMOVE=ALL, run `devcon remove Root\MttVDD` BEFORE Tauri's
+    file-removal step yanks the driver binaries off disk. devcon
+    needs the .inf still resident in the package store to do a clean
+    remove (it touches the cached PnP records). Running before
+    InstallFinalize (file removal) keeps things in the right order.
 
   Return="ignore" means a devcon failure does NOT abort the MSI —
-  the GUI's first-run banner is still the fallback.
+  the GUI's first-run banner is still the fallback for install, and a
+  failed remove just leaves the device in place (harmless; user can
+  manually scrub with `devcon remove Root\MttVDD`).
 -->
 
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
@@ -67,6 +78,16 @@
             Impersonate="no"
             Return="ignore" />
 
+        <!-- Disable the just-installed device. Penflow flips it back on
+             per-session. -->
+        <CustomAction
+            Id="PenflowDisableVdd"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vdd\devcon.exe" disable "Root\MttVDD"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
         <!-- Copy our pre-tuned 2880x1800 settings.xml over the driver's
              install dir so the IDDCx target advertises the right modes
              on first arrival. The driver creates C:\VirtualDisplayDriver
@@ -79,11 +100,30 @@
             Impersonate="no"
             Return="ignore" />
 
+        <!-- Uninstall: yank the device + driver before the MSI removes
+             our [INSTALLDIR]\vdd\ files. devcon's idempotent: a no-op
+             when the device is already gone. -->
+        <CustomAction
+            Id="PenflowRemoveVdd"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vdd\devcon.exe" remove "Root\MttVDD"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
         <InstallExecuteSequence>
-            <!-- Schedule both install actions after files are copied,
-                 only on a true install (not on uninstall/repair). -->
+            <!-- Install side: only on a true install, not uninstall.
+                 InstallVdd → DisableVdd → ApplyVddSettings, in that
+                 order, all After="InstallFiles" so [INSTALLDIR]\vdd\
+                 is populated. -->
             <Custom Action="PenflowInstallVdd"        After="InstallFiles">NOT REMOVE~="ALL"</Custom>
-            <Custom Action="PenflowApplyVddSettings"  After="PenflowInstallVdd">NOT REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowDisableVdd"        After="PenflowInstallVdd">NOT REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowApplyVddSettings"  After="PenflowDisableVdd">NOT REMOVE~="ALL"</Custom>
+
+            <!-- Uninstall side: only on a true uninstall (not on
+                 upgrade/repair). Run BEFORE the standard RemoveFiles
+                 so devcon.exe + MttVDD.inf are still on disk. -->
+            <Custom Action="PenflowRemoveVdd"         Before="RemoveFiles">REMOVE~="ALL"</Custom>
         </InstallExecuteSequence>
     </Fragment>
 </Wix>
