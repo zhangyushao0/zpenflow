@@ -55,8 +55,7 @@ impl MmcssGuard {
         // SAFETY: `AvSetMmThreadCharacteristicsW` writes the task index out
         // through the pointer and returns INVALID_HANDLE_VALUE on failure
         // (we treat any error result as failure and skip).
-        let handle =
-            unsafe { AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index).ok()? };
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index).ok()? };
         Some(Self { handle })
     }
 }

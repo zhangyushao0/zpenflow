@@ -59,11 +59,11 @@ use windows::Win32::Devices::Display::{
     SetDisplayConfig, SDC_ALLOW_CHANGES, SDC_APPLY, SDC_TOPOLOGY_EXTEND, SDC_VIRTUAL_MODE_AWARE,
     SDC_VIRTUAL_REFRESH_RATE_AWARE,
 };
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Graphics::Gdi::{
     ChangeDisplaySettingsExW, CDS_UPDATEREGISTRY, DEVMODEW, DISP_CHANGE_SUCCESSFUL,
     DM_DISPLAYFREQUENCY, DM_PELSHEIGHT, DM_PELSWIDTH,
 };
-use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
 use windows::Win32::System::Threading::{
     CreateEventW, GetCurrentProcess, GetCurrentProcessId, OpenEventW, OpenProcessToken, SetEvent,
