@@ -30,6 +30,7 @@ fn get_settings(state: tauri::State<'_, AppState>) -> Settings {
 
 #[tauri::command]
 fn save_settings(state: tauri::State<'_, AppState>, new: Settings) -> Result<(), String> {
+    settings::validate(&new)?;
     settings::save(&new).map_err(|e| e.to_string())?;
     *state.settings.write().expect("settings poisoned") = new.clone();
 
@@ -67,6 +68,14 @@ fn save_settings(state: tauri::State<'_, AppState>, new: Settings) -> Result<(),
             return Err(format!("autostart toggle failed: {e}"));
         }
     }
+
+    // If the bundled VDD is installed, update its active settings file
+    // immediately. The driver reads this on its next enable cycle, so a
+    // saved resolution takes effect on the next tablet reconnect.
+    if matches!(penflow_server::VddController::detect(), Ok(Some(_))) {
+        settings::write_installed_vdd_settings(&new)
+            .map_err(|e| format!("VDD settings write failed: {e}"))?;
+    }
     Ok(())
 }
 
@@ -103,7 +112,10 @@ fn is_vdd_installed() -> bool {
 /// Install the bundled VDD driver via the elevated pnputil helper.
 /// Returns Ok(()) when pnputil completes successfully.
 #[tauri::command]
-async fn install_vdd(app: tauri::AppHandle) -> Result<(), String> {
+async fn install_vdd(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+) -> Result<(), String> {
     use tauri::Manager;
     let resource_dir = app
         .path()
@@ -124,15 +136,12 @@ async fn install_vdd(app: tauri::AppHandle) -> Result<(), String> {
         .map_err(|e| format!("join error: {e}"))?
         .map_err(|e| format!("install_driver: {e}"))?;
 
-    // After install, copy our pre-tuned settings.xml over the driver's
-    // default install location so the resolution / refresh-rate match
-    // what the engine expects (2880x1800 @ 60/120).
-    let settings_src = resource_dir.join("vdd").join("vdd_settings.xml");
-    let settings_dst = std::path::PathBuf::from(r"C:\VirtualDisplayDriver\vdd_settings.xml");
-    if let Some(parent) = settings_dst.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let _ = std::fs::copy(&settings_src, &settings_dst);
+    // After install, write the GUI-selected VDD settings over the driver's
+    // default install location so the next enable publishes the requested
+    // resolution.
+    let s = state.settings.read().expect("settings poisoned").clone();
+    settings::write_installed_vdd_settings(&s)
+        .map_err(|e| format!("VDD settings write failed: {e}"))?;
     Ok(())
 }
 

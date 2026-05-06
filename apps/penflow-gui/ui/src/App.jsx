@@ -33,6 +33,7 @@ const useStyles = makeStyles({
         margin: "0 auto",
         height: "100vh",
         boxSizing: "border-box",
+        overflowY: "auto",
     },
     header: {
         display: "flex",
@@ -68,8 +69,11 @@ const useStyles = makeStyles({
     },
     rowGroup: {
         display: "grid",
-        gridTemplateColumns: "1fr 1fr",
+        gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
         gap: "20px",
+    },
+    column: {
+        minWidth: 0,
     },
     row: {
         display: "flex",
@@ -78,9 +82,47 @@ const useStyles = makeStyles({
         gap: "12px",
         minHeight: "36px",
     },
+    resolutionField: {
+        display: "flex",
+        flexDirection: "column",
+        alignItems: "stretch",
+        gap: "6px",
+        minHeight: "auto",
+        marginTop: "2px",
+        marginBottom: "8px",
+    },
     rowLabel: {
         flex: 1,
         color: tokens.colorNeutralForeground1,
+    },
+    resolutionControl: {
+        display: "flex",
+        flexDirection: "column",
+        gap: "8px",
+        width: "100%",
+        minWidth: 0,
+    },
+    resolutionDropdown: {
+        width: "100%",
+        minWidth: 0,
+    },
+    resolutionInputs: {
+        display: "grid",
+        gridTemplateColumns: "minmax(96px, 1fr) 20px minmax(96px, 1fr)",
+        alignItems: "center",
+        columnGap: "8px",
+    },
+    resolutionSeparator: {
+        color: tokens.colorNeutralForeground3,
+        textAlign: "center",
+        lineHeight: "32px",
+        minWidth: "20px",
+        position: "relative",
+        zIndex: 1,
+    },
+    resolutionSpin: {
+        width: "100%",
+        minWidth: 0,
     },
     bindingRow: {
         display: "flex",
@@ -202,6 +244,31 @@ const useStyles = makeStyles({
 });
 
 const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Win"];
+const DEFAULT_RESOLUTION = { width: 2880, height: 1800 };
+const RESOLUTION_PRESETS = [
+    { key: "2880x1800", label: "2880×1800 native", width: 2880, height: 1800 },
+    { key: "2560x1600", label: "2560×1600", width: 2560, height: 1600 },
+    { key: "1920x1200", label: "1920×1200", width: 1920, height: 1200 },
+    { key: "1920x1080", label: "1920×1080", width: 1920, height: 1080 },
+    { key: "1600x1000", label: "1600×1000", width: 1600, height: 1000 },
+    { key: "1280x800", label: "1280×800", width: 1280, height: 800 },
+];
+
+function resolutionKey(resolution) {
+    const key = `${resolution.width}x${resolution.height}`;
+    return RESOLUTION_PRESETS.some((p) => p.key === key) ? key : "custom";
+}
+
+function resolutionLabel(resolution) {
+    return RESOLUTION_PRESETS.find((p) => p.key === resolutionKey(resolution))?.label
+        ?? `${resolution.width}×${resolution.height}`;
+}
+
+function numericSpinValue(data) {
+    const raw = data.value ?? data.displayValue;
+    const value = typeof raw === "number" ? raw : Number(raw);
+    return Number.isFinite(value) ? Math.round(value) : null;
+}
 
 function statusBadge(state) {
     switch (state.state) {
@@ -509,6 +576,11 @@ export default function App() {
 
     const badge = statusBadge(status);
     const isPaused = status.state === "stopped";
+    const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
+    const selectedResolution = resolutionKey(vddResolution);
+    const setVddResolution = (next) => {
+        setSettings({ ...settings, vdd_resolution: next });
+    };
 
     return (
         <div className={styles.root}>
@@ -540,7 +612,7 @@ export default function App() {
 
             <section className={styles.card}>
                 <div className={styles.rowGroup}>
-                    <div>
+                    <div className={styles.column}>
                         <Subtitle2 className={styles.cardTitle}>Encoder</Subtitle2>
                         <Field label="Bitrate (Mbps)" orientation="horizontal" className={styles.row}>
                             <SpinButton
@@ -567,6 +639,58 @@ export default function App() {
                                 <Option value="120">120 fps</Option>
                             </Dropdown>
                         </Field>
+                        <Field label="Virtual display" className={styles.resolutionField}>
+                            <div className={styles.resolutionControl}>
+                                <Dropdown
+                                    className={styles.resolutionDropdown}
+                                    value={resolutionLabel(vddResolution)}
+                                    selectedOptions={[selectedResolution]}
+                                    onOptionSelect={(_, d) => {
+                                        if (d.optionValue === "custom") return;
+                                        const preset = RESOLUTION_PRESETS.find((p) => p.key === d.optionValue);
+                                        if (preset) {
+                                            setVddResolution({ width: preset.width, height: preset.height });
+                                        }
+                                    }}
+                                >
+                                    {RESOLUTION_PRESETS.map((p) => (
+                                        <Option key={p.key} value={p.key}>{p.label}</Option>
+                                    ))}
+                                    <Option value="custom">Custom</Option>
+                                </Dropdown>
+                                <div className={styles.resolutionInputs}>
+                                    <SpinButton
+                                        aria-label="Virtual display width"
+                                        className={styles.resolutionSpin}
+                                        value={vddResolution.width}
+                                        min={640}
+                                        max={7680}
+                                        step={2}
+                                        onChange={(_, d) => {
+                                            const value = numericSpinValue(d);
+                                            if (value !== null) {
+                                                setVddResolution({ ...vddResolution, width: value });
+                                            }
+                                        }}
+                                    />
+                                    <Caption1 className={styles.resolutionSeparator}>×</Caption1>
+                                    <SpinButton
+                                        aria-label="Virtual display height"
+                                        className={styles.resolutionSpin}
+                                        value={vddResolution.height}
+                                        min={480}
+                                        max={4320}
+                                        step={2}
+                                        onChange={(_, d) => {
+                                            const value = numericSpinValue(d);
+                                            if (value !== null) {
+                                                setVddResolution({ ...vddResolution, height: value });
+                                            }
+                                        }}
+                                    />
+                                </div>
+                            </div>
+                        </Field>
                         <Field label="Codec" orientation="horizontal" className={styles.row}>
                             <Dropdown
                                 value={settings.codec === "hevc" ? "HEVC" : "H.264"}
@@ -578,7 +702,7 @@ export default function App() {
                             </Dropdown>
                         </Field>
                     </div>
-                    <div>
+                    <div className={styles.column}>
                         <Subtitle2 className={styles.cardTitle}>System</Subtitle2>
                         <div className={styles.row}>
                             <span className={styles.rowLabel} title="Add Penflow to your Windows logon">

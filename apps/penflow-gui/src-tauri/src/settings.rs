@@ -15,6 +15,11 @@ use serde::{Deserialize, Serialize};
 /// the predecessor `run_session` example used as hardcoded constants.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Settings {
+    /// Virtual display resolution to publish through the bundled VDD.
+    /// The engine captures whatever mode Windows enumerates after the
+    /// VDD is enabled, so changing this affects the next tablet session.
+    #[serde(default)]
+    pub vdd_resolution: DisplayResolution,
     /// Encoder bitrate in bits per second.
     #[serde(default = "default_bitrate")]
     pub bitrate_bps: u32,
@@ -52,6 +57,7 @@ fn default_hud_enabled() -> bool {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            vdd_resolution: DisplayResolution::default(),
             bitrate_bps: default_bitrate(),
             fps: default_fps(),
             codec: default_codec(),
@@ -71,6 +77,64 @@ fn default_fps() -> u32 {
 }
 fn default_codec() -> SettingsCodec {
     SettingsCodec::Hevc
+}
+
+pub const DEFAULT_VDD_WIDTH: u32 = 2880;
+pub const DEFAULT_VDD_HEIGHT: u32 = 1800;
+pub const MIN_VDD_WIDTH: u32 = 640;
+pub const MIN_VDD_HEIGHT: u32 = 480;
+pub const MAX_VDD_WIDTH: u32 = 7680;
+pub const MAX_VDD_HEIGHT: u32 = 4320;
+
+/// Width/height for the on-demand virtual display. Keep dimensions even:
+/// D3D11 texture conversion and hardware encoders expect 4:2:0-friendly
+/// frame sizes.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DisplayResolution {
+    #[serde(default = "default_vdd_width")]
+    pub width: u32,
+    #[serde(default = "default_vdd_height")]
+    pub height: u32,
+}
+
+impl Default for DisplayResolution {
+    fn default() -> Self {
+        Self {
+            width: DEFAULT_VDD_WIDTH,
+            height: DEFAULT_VDD_HEIGHT,
+        }
+    }
+}
+
+fn default_vdd_width() -> u32 {
+    DEFAULT_VDD_WIDTH
+}
+
+fn default_vdd_height() -> u32 {
+    DEFAULT_VDD_HEIGHT
+}
+
+impl DisplayResolution {
+    pub fn validate(self) -> Result<(), String> {
+        if !(MIN_VDD_WIDTH..=MAX_VDD_WIDTH).contains(&self.width) {
+            return Err(format!(
+                "VDD width must be between {MIN_VDD_WIDTH} and {MAX_VDD_WIDTH}"
+            ));
+        }
+        if !(MIN_VDD_HEIGHT..=MAX_VDD_HEIGHT).contains(&self.height) {
+            return Err(format!(
+                "VDD height must be between {MIN_VDD_HEIGHT} and {MAX_VDD_HEIGHT}"
+            ));
+        }
+        if self.width % 2 != 0 || self.height % 2 != 0 {
+            return Err("VDD width and height must be even numbers".into());
+        }
+        Ok(())
+    }
+}
+
+pub fn validate(s: &Settings) -> Result<(), String> {
+    s.vdd_resolution.validate()
 }
 
 /// Local serializable shadow of `penflow_core::encoder::Codec`. Wrapper
@@ -202,7 +266,106 @@ pub fn save(s: &Settings) -> std::io::Result<()> {
     Ok(())
 }
 
+pub fn installed_vdd_settings_path() -> PathBuf {
+    PathBuf::from(r"C:\VirtualDisplayDriver\vdd_settings.xml")
+}
+
+pub fn write_installed_vdd_settings(s: &Settings) -> std::io::Result<()> {
+    write_vdd_settings_file(&installed_vdd_settings_path(), s, true)
+}
+
+pub fn write_vdd_settings_file(
+    path: &std::path::Path,
+    s: &Settings,
+    create_parent: bool,
+) -> std::io::Result<()> {
+    validate(s).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    if create_parent {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let xml = render_vdd_settings_xml(s.vdd_resolution);
+    std::fs::write(path, xml)
+}
+
+fn render_vdd_settings_xml(resolution: DisplayResolution) -> String {
+    format!(
+        r#"<?xml version='1.0' encoding='utf-8'?>
+<!--
+  Penflow VDD configuration.
+
+  This installed copy is generated from the GUI's virtual-display
+  resolution setting. The checked-in template defaults to 2880x1800 for
+  the MovinkPad Pro 14, but users can choose another even width/height
+  and the next VDD enable cycle will publish that mode.
+-->
+<vdd_settings>
+    <monitors>
+        <count>1</count>
+    </monitors>
+    <gpu>
+        <friendlyname>default</friendlyname>
+    </gpu>
+    <global>
+        <g_refresh_rate>60</g_refresh_rate>
+        <g_refresh_rate>120</g_refresh_rate>
+    </global>
+    <resolutions>
+        <resolution>
+            <width>{}</width>
+            <height>{}</height>
+            <refresh_rate>120</refresh_rate>
+        </resolution>
+    </resolutions>
+    <options>
+        <CustomEdid>false</CustomEdid>
+        <PreventSpoof>false</PreventSpoof>
+        <EdidCeaOverride>false</EdidCeaOverride>
+        <HardwareCursor>true</HardwareCursor>
+        <SDR10bit>false</SDR10bit>
+        <HDRPlus>false</HDRPlus>
+        <logging>false</logging>
+        <debuglogging>false</debuglogging>
+    </options>
+</vdd_settings>
+"#,
+        resolution.width, resolution.height
+    )
+}
+
 /// Process-wide settings cell. The Tauri app holds this in its managed
 /// state so commands can read+write under a single lock; the running
 /// `Service` clones a fresh snapshot at the start of each session.
 pub type SharedSettings = Arc<RwLock<Settings>>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_vdd_resolution_is_valid() {
+        validate(&Settings::default()).expect("default settings should be valid");
+    }
+
+    #[test]
+    fn vdd_xml_uses_selected_resolution() {
+        let xml = render_vdd_settings_xml(DisplayResolution {
+            width: 1920,
+            height: 1200,
+        });
+        assert!(xml.contains("<width>1920</width>"));
+        assert!(xml.contains("<height>1200</height>"));
+    }
+
+    #[test]
+    fn vdd_resolution_rejects_odd_dimensions() {
+        let err = DisplayResolution {
+            width: 1921,
+            height: 1200,
+        }
+        .validate()
+        .expect_err("odd width should be rejected");
+        assert!(err.contains("even"));
+    }
+}

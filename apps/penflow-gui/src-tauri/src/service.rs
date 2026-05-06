@@ -23,7 +23,7 @@ use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
 
-use crate::settings::SharedSettings;
+use crate::settings::{write_installed_vdd_settings, SharedSettings};
 
 /// Lifecycle events emitted by the running [`Service`]. Forwarded to
 /// the Tauri frontend as window events.
@@ -193,7 +193,7 @@ impl Service {
             eprintln!("[service] building session config (VDD detect…)");
             let cfg = build_session_config(&self.settings);
             eprintln!(
-                "[service] session config: {}x{}@{} codec={:?} vdd={}",
+                "[service] session config: fallback={}x{}@{} codec={:?} vdd={}",
                 cfg.monitor.width,
                 cfg.monitor.height,
                 cfg.fps,
@@ -343,6 +343,15 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
             None
         }
     };
+    if vdd.is_some() {
+        match write_installed_vdd_settings(&s) {
+            Ok(()) => eprintln!(
+                "[service] VDD settings updated: {}x{}",
+                s.vdd_resolution.width, s.vdd_resolution.height
+            ),
+            Err(e) => eprintln!("[service] VDD settings update failed: {e}"),
+        }
+    }
 
     SessionConfig {
         monitor: attached,

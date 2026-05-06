@@ -2,11 +2,14 @@
 <!--
   Penflow VDD configuration — tuned for the MovinkPad Pro 14 (DTHA140).
 
-  Single virtual monitor at the panel's exact native resolution, 2880×1800,
-  with 60 Hz + 120 Hz advertised so MediaCodec on the tablet can pick its
-  preferred timing without us having to retune. No other resolutions —
-  Penflow always streams at 2880×1800 to match the MovinkPad's physical
-  panel and Krita-on-extended-monitor only needs that one mode.
+  Default single virtual monitor at the panel's exact native resolution,
+  2880×1800, with 60 Hz + 120 Hz advertised so MediaCodec on the tablet
+  can pick its preferred timing without us having to retune.
+
+  The GUI may rewrite the installed copy at
+  C:\VirtualDisplayDriver\vdd_settings.xml with a user-selected even
+  width/height before the next VDD enable cycle. This checked-in file is
+  still the safe default for fresh installs and recovery.
 
   Schema follows the format the currently-installed VDD binary
   auto-generates after install — the older minimal schema (just
