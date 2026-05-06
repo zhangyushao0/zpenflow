@@ -22,12 +22,53 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use windows::core::w;
+use windows::Win32::Foundation::HANDLE;
+use windows::Win32::System::Threading::{
+    AvRevertMmThreadCharacteristics, AvSetMmThreadCharacteristicsW, GetCurrentThread,
+    SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+};
+
 use crate::capture::dxgi::DxgiCapturer;
 use crate::color::{clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter};
 use crate::d3d11::D3d11Context;
 use crate::encoder::{EncodeSession, EncodedPacket};
 use crate::error::{EngineError, EngineResult};
 use crate::packet_queue::PacketQueue;
+
+/// RAII guard for an MMCSS task subscription. Holds the handle returned by
+/// `AvSetMmThreadCharacteristicsW` and reverts on drop. While alive, the
+/// owning thread runs in MMCSS's "Capture" task scheduling category — for
+/// our pipeline thread that means a Medium category boost (priority 16-22)
+/// and protection against starvation by lower-priority work.
+struct MmcssGuard {
+    handle: HANDLE,
+}
+
+impl MmcssGuard {
+    /// Subscribe the calling thread to the "Capture" MMCSS task. Returns
+    /// `None` if the call fails (e.g. MMCSS service disabled or the process
+    /// lacks the right). Best-effort — failure leaves the thread at default
+    /// priority.
+    fn acquire_capture() -> Option<Self> {
+        let mut task_index: u32 = 0;
+        // SAFETY: `AvSetMmThreadCharacteristicsW` writes the task index out
+        // through the pointer and returns INVALID_HANDLE_VALUE on failure
+        // (we treat any error result as failure and skip).
+        let handle =
+            unsafe { AvSetMmThreadCharacteristicsW(w!("Capture"), &mut task_index).ok()? };
+        Some(Self { handle })
+    }
+}
+
+impl Drop for MmcssGuard {
+    fn drop(&mut self) {
+        // SAFETY: `handle` came from a successful `AvSetMmThreadCharacteristicsW`.
+        unsafe {
+            let _ = AvRevertMmThreadCharacteristics(self.handle);
+        }
+    }
+}
 
 /// Tunables for the encoder loop. Defaults match the v1.0 reference rig.
 #[derive(Clone, Copy, Debug)]
@@ -40,8 +81,13 @@ pub struct PipelineConfig {
     /// more CPU spinning when the desktop is static. 200 ms is fine because
     /// we resubmit the keepalive on timeout.
     pub acquire_timeout: Duration,
-    /// Packet queue capacity. 8 ≈ 130 ms at 60 fps; deeper than the e2e
-    /// budget so any backlog is unambiguously a consumer problem.
+    /// Packet queue capacity. Drop-oldest-on-overflow (see `PacketQueue`),
+    /// so depth tunes how many frames of consumer stall can stack up before
+    /// the producer starts shedding stale frames. Default 2 keeps p99
+    /// recovery tight: a transient send stall of ~16 ms (one frame at 60 fps)
+    /// sheds rather than queues, so when the wire un-stalls the consumer
+    /// flushes only the freshest frame instead of catching up through 100+ ms
+    /// of stale backlog.
     pub packet_queue_capacity: usize,
     /// Anchor `Instant` for the per-frame `pts_ns` stamp (`pts = (now -
     /// pts_epoch).as_nanos()`). The server's TimeSync replies stamp t2/t3
@@ -65,7 +111,7 @@ impl Default for PipelineConfig {
             // rate** when DDA times out, and it must stay within the
             // tablet's HEVC decoder spec (Adreno 720: ~4K @ 60 fps).
             acquire_timeout: Duration::from_millis(16),
-            packet_queue_capacity: 8,
+            packet_queue_capacity: 2,
             pts_epoch: Instant::now(),
         }
     }
@@ -113,6 +159,18 @@ impl Pipeline {
         let handle = thread::Builder::new()
             .name("penflow-encode".into())
             .spawn(move || {
+                // Subscribe to the MMCSS "Capture" scheduling category and
+                // bump the thread to TIME_CRITICAL within it. The MMCSS
+                // handle is RAII-dropped at thread exit; SetThreadPriority
+                // is not reverted explicitly because the thread terminates
+                // immediately afterwards.
+                let _mmcss = MmcssGuard::acquire_capture();
+                // SAFETY: GetCurrentThread returns a pseudo-handle valid
+                // for the calling thread; SetThreadPriority on it is safe.
+                unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+                }
+
                 let pts_epoch = cfg.pts_epoch;
                 let mut state = LoopState {
                     ctx,

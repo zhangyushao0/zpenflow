@@ -5,7 +5,7 @@
 //! selected output. Cross-adapter capture is not supported in v1.0
 //! (design.md §6.1).
 
-use windows::core::Interface;
+use windows::core::{s, w, Interface};
 use windows::Win32::Foundation::HMODULE;
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
@@ -18,6 +18,8 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory2, IDXGIAdapter1, IDXGIDevice, IDXGIDevice1, IDXGIFactory6,
     DXGI_CREATE_FACTORY_FLAGS, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
 };
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Threading::GetCurrentProcess;
 
 use crate::error::{EngineError, EngineResult};
 
@@ -112,6 +114,15 @@ impl D3d11Context {
             let _ = unsafe { dxgi_dev.SetGPUThreadPriority(7) };
         }
 
+        // Process-wide GPU scheduling priority. Sunshine sets REALTIME by
+        // default and downgrades to HIGH on NVIDIA + HAGS to dodge a
+        // documented driver freeze (NVIDIA driver bug: REALTIME + HAGS +
+        // VRAM-near-full hangs the encoder). We default to HIGH for all
+        // vendors — REALTIME's upside vs HIGH is small (a few percent of
+        // p99 jitter under contention) and not worth carrying HAGS
+        // detection plus a fallback path.
+        set_d3dkmt_process_priority(D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH);
+
         Ok(Self {
             adapter,
             adapter_luid,
@@ -135,6 +146,34 @@ impl D3d11Context {
                 .map_err(|_| EngineError::NoAdapter)?
         };
         Self::create_on_adapter(adapter)
+    }
+}
+
+/// `D3DKMT_SCHEDULINGPRIORITYCLASS` enum values per `d3dkmthk.h`.
+/// HIGH (4) is the priority Sunshine downgrades to on NVIDIA+HAGS.
+const D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH: i32 = 4;
+
+/// Best-effort wrapper around `D3DKMTSetProcessSchedulingPriorityClass` from
+/// `gdi32.dll`. Resolved dynamically because the symbol isn't exposed in
+/// `windows-rs`'s public surface (it's a kernel-mode thunk). Failure is
+/// silently ignored — without elevated privileges or on unusual SKUs the
+/// call may fail with `STATUS_ACCESS_DENIED`, and the engine still works
+/// at default priority.
+fn set_d3dkmt_process_priority(priority: i32) {
+    type Fn = unsafe extern "system" fn(
+        h_process: windows::Win32::Foundation::HANDLE,
+        priority: i32,
+    ) -> i32;
+    unsafe {
+        let Ok(module) = GetModuleHandleW(w!("gdi32.dll")) else {
+            return;
+        };
+        let Some(proc) = GetProcAddress(module, s!("D3DKMTSetProcessSchedulingPriorityClass"))
+        else {
+            return;
+        };
+        let f: Fn = std::mem::transmute(proc);
+        let _ = f(GetCurrentProcess(), priority);
     }
 }
 
