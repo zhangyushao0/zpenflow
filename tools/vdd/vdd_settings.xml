@@ -47,7 +47,15 @@
         <CustomEdid>false</CustomEdid>
         <PreventSpoof>false</PreventSpoof>
         <EdidCeaOverride>false</EdidCeaOverride>
-        <HardwareCursor>true</HardwareCursor>
+        <!-- HardwareCursor=false so the OS draws the cursor INTO the
+             framebuffer. With true, the GPU overlays the cursor at scanout
+             time and DXGI Desktop Duplication captures the underlying
+             framebuffer without it — the encoded stream then has no
+             visible cursor on the tablet. We never look at the virtual
+             display on a physical PC monitor, so the software-cursor
+             render cost (≪1 ms in DWM) is invisible to the latency
+             budget. -->
+        <HardwareCursor>false</HardwareCursor>
         <SDR10bit>false</SDR10bit>
         <HDRPlus>false</HDRPlus>
         <logging>false</logging>

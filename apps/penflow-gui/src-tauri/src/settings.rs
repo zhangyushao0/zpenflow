@@ -322,7 +322,11 @@ fn render_vdd_settings_xml(resolution: DisplayResolution) -> String {
         <CustomEdid>false</CustomEdid>
         <PreventSpoof>false</PreventSpoof>
         <EdidCeaOverride>false</EdidCeaOverride>
-        <HardwareCursor>true</HardwareCursor>
+        <!-- HardwareCursor=false: cursor is drawn into the framebuffer by
+             Windows so DXGI Desktop Duplication captures it. With true,
+             the GPU overlays cursor at scanout (not in framebuffer) and
+             the tablet stream has no visible cursor. -->
+        <HardwareCursor>false</HardwareCursor>
         <SDR10bit>false</SDR10bit>
         <HDRPlus>false</HDRPlus>
         <logging>false</logging>
