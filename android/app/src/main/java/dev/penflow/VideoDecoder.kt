@@ -128,6 +128,21 @@ class VideoDecoder(
             setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
             setInteger(MediaFormat.KEY_FRAME_RATE, fps)
 
+            // Colour metadata. The PC encoder writes BT.709 full-range NV12
+            // (capture is sRGB scan-out, ColorConverter targets
+            // YCBCR_FULL_G22_LEFT_P709, MF input type carries
+            // MFNominalRange_0_255). Without telling MediaCodec this
+            // explicitly, some implementations and SurfaceFlinger fall back
+            // to the AVC/HEVC default of "limited range BT.709", clamping
+            // 16->0 and 235->255 with full clipping above 235 — visible as
+            // blown-out highlights on greyscale ramps (issue #1). Mirrors
+            // Moonlight's MediaCodecDecoderRenderer.createBaseMediaFormat.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                setInteger(MediaFormat.KEY_COLOR_RANGE, MediaFormat.COLOR_RANGE_FULL)
+                setInteger(MediaFormat.KEY_COLOR_STANDARD, MediaFormat.COLOR_STANDARD_BT709)
+                setInteger(MediaFormat.KEY_COLOR_TRANSFER, MediaFormat.COLOR_TRANSFER_SDR_VIDEO)
+            }
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                 if (isAdreno620) {
                     // §10.2: KEY_OPERATING_RATE=240 + KEY_PRIORITY=0

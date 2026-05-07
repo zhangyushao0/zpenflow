@@ -468,24 +468,27 @@ fn copy_h264_vui_with_patched_bitstream_restriction(
         let v = r.read_bits(1)?;
         w.write_bits(v, 1);
     }
+    // video_signal_type — we DROP whatever the input had and emit our own
+    // (full-range BT.709) so the decoder doesn't apply a 16-235 → 0-255
+    // expansion on samples that are already 0-255. Issue #1: NVIDIA's
+    // HEVC/H.264 MFTs are reported to silently ignore
+    // `MF_MT_VIDEO_NOMINAL_RANGE = MFNominalRange_0_255` on the input
+    // type, leaving `video_full_range_flag = 0` in the bitstream while
+    // the actual NV12 bytes are full-range — visible as blown-out
+    // highlights on greyscale ramps (Y >= 235 clip to 255 after the
+    // decoder's range-expansion).
     let video_signal_type_present = r.read_bits(1)?;
-    w.write_bits(video_signal_type_present, 1);
     if video_signal_type_present == 1 {
-        let v = r.read_bits(3)?; // video_format
-        w.write_bits(v, 3);
-        let v = r.read_bits(1)?; // video_full_range_flag
-        w.write_bits(v, 1);
+        let _ = r.read_bits(3)?; // video_format — discard
+        let _ = r.read_bits(1)?; // video_full_range_flag — discard
         let colour_desc = r.read_bits(1)?;
-        w.write_bits(colour_desc, 1);
         if colour_desc == 1 {
-            let v = r.read_bits(8)?;
-            w.write_bits(v, 8); // colour_primaries
-            let v = r.read_bits(8)?;
-            w.write_bits(v, 8); // transfer_characteristics
-            let v = r.read_bits(8)?;
-            w.write_bits(v, 8); // matrix_coefficients
+            let _ = r.read_bits(8)?; // colour_primaries — discard
+            let _ = r.read_bits(8)?; // transfer_characteristics — discard
+            let _ = r.read_bits(8)?; // matrix_coefficients — discard
         }
     }
+    write_full_range_bt709_video_signal_type(w);
     let chroma_loc_info_present = r.read_bits(1)?;
     w.write_bits(chroma_loc_info_present, 1);
     if chroma_loc_info_present == 1 {
@@ -582,7 +585,7 @@ fn copy_h264_hrd_parameters(r: &mut BitReader, w: &mut BitWriter) -> EngineResul
 fn emit_minimal_h264_vui(w: &mut BitWriter) {
     w.write_bits(0, 1); // aspect_ratio_info_present_flag
     w.write_bits(0, 1); // overscan_info_present_flag
-    w.write_bits(0, 1); // video_signal_type_present_flag
+    write_full_range_bt709_video_signal_type(w);
     w.write_bits(0, 1); // chroma_loc_info_present_flag
     w.write_bits(0, 1); // timing_info_present_flag
     w.write_bits(0, 1); // nal_hrd_parameters_present_flag
@@ -598,14 +601,195 @@ fn emit_minimal_h264_vui(w: &mut BitWriter) {
     w.write_ue(1); // max_dec_frame_buffering
 }
 
+/// Emit a `video_signal_type` block declaring full-range BT.709 colour.
+/// Used by both the H.264 and HEVC patchers so a single source of truth
+/// owns the override values. The bit layout is identical between the
+/// two specs (H.264 §E.1.1 / H.265 §E.2.1).
+fn write_full_range_bt709_video_signal_type(w: &mut BitWriter) {
+    w.write_bits(1, 1); // video_signal_type_present_flag = 1
+    w.write_bits(5, 3); // video_format = 5 (Unspecified)
+    w.write_bits(1, 1); // video_full_range_flag = 1
+    w.write_bits(1, 1); // colour_description_present_flag = 1
+    w.write_bits(1, 8); // colour_primaries = 1 (BT.709)
+    w.write_bits(1, 8); // transfer_characteristics = 1 (BT.709)
+    w.write_bits(1, 8); // matrix_coefficients = 1 (BT.709)
+}
+
 // ===================================================================
 // HEVC SPS rewriter (ITU-T H.265 §7.3.2.2.1)
 // ===================================================================
 
+/// Top-level HEVC SPS patcher. Tries the comprehensive walk
+/// (`patch_hevc_sps_full`) which patches DPB depth AND overrides VUI
+/// colour info to full-range BT.709. If the SPS uses HEVC features
+/// the parser doesn't implement (e.g. an in-band scaling list, or a
+/// `st_ref_pic_set` predictive form we haven't covered), falls back
+/// to the original DPB-only patch. The legacy fallback always
+/// succeeds on any SPS our DPB patcher used to handle, so the engine
+/// never regresses on encoders / driver versions we don't yet cover.
 fn patch_hevc_sps_rbsp(rbsp: &[u8]) -> EngineResult<Vec<u8>> {
+    if let Ok(v) = patch_hevc_sps_full(rbsp) {
+        return Ok(v);
+    }
+    patch_hevc_sps_dpb_only(rbsp)
+}
+
+/// Original behaviour: walk to `sps_max_latency_increase_plus1`,
+/// patch the DPB triplet, copy the rest of the SPS verbatim. Used as
+/// the fallback when `patch_hevc_sps_full` doesn't recognise some
+/// downstream SPS feature.
+fn patch_hevc_sps_dpb_only(rbsp: &[u8]) -> EngineResult<Vec<u8>> {
     let mut r = BitReader::new(rbsp);
     let mut w = BitWriter::new();
+    walk_hevc_sps_through_dpb(&mut r, &mut w)?;
 
+    // Everything from here to the end of the SPS is COPIED bit-for-bit.
+    // The remainder includes log2_min_luma_coding_block_size_minus3 and
+    // a dozen more fields, ending at the SPS extensions + RBSP trailing
+    // bits. Rather than re-implement the entire parser, copy the
+    // unread tail of `rbsp` directly into the writer at the current
+    // bit offset.
+    copy_remaining_bits(&mut r, &mut w);
+
+    // The trailing `1` + zero-pad is already inside the copied tail
+    // (the original SPS ended with rbsp_trailing_bits()), so we don't
+    // emit our own.
+    Ok(w.into_bytes())
+}
+
+/// Full HEVC SPS walk. Patches the DPB triplet AND continues all the
+/// way to the VUI to override `video_signal_type_present_flag`,
+/// `video_full_range_flag`, and the colour description (issue #1 —
+/// blown-out highlights when the encoder writes the bytes in 0-255
+/// but the bitstream's VUI declares 16-235). On failure (HEVC features
+/// the parser doesn't implement) returns Err and the caller falls
+/// back to the DPB-only patch.
+fn patch_hevc_sps_full(rbsp: &[u8]) -> EngineResult<Vec<u8>> {
+    let mut r = BitReader::new(rbsp);
+    let mut w = BitWriter::new();
+    walk_hevc_sps_through_dpb(&mut r, &mut w)?;
+    let log2_max_poc = walk_hevc_sps_dpb_log2_max_poc(rbsp)?;
+
+    // log2_min_luma_coding_block_size_minus3 ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+    // log2_diff_max_min_luma_coding_block_size ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+    // log2_min_luma_transform_block_size_minus2 ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+    // log2_diff_max_min_luma_transform_block_size ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+    // max_transform_hierarchy_depth_inter ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+    // max_transform_hierarchy_depth_intra ue
+    let v = r.read_ue()?;
+    w.write_ue(v);
+
+    // scaling_list_enabled_flag u(1) [+ optional scaling_list_data]
+    let scaling_list_enabled = r.read_bits(1)?;
+    w.write_bits(scaling_list_enabled, 1);
+    if scaling_list_enabled == 1 {
+        let sps_scaling_list_data_present = r.read_bits(1)?;
+        w.write_bits(sps_scaling_list_data_present, 1);
+        if sps_scaling_list_data_present == 1 {
+            // scaling_list_data() — non-trivial, NVENC ULL doesn't emit
+            // it. Bail so the caller falls back to the legacy DPB-only
+            // patch (the bitstream still works, just no VUI override).
+            return Err(EngineError::NotInitialized);
+        }
+    }
+
+    // amp_enabled_flag u(1), sample_adaptive_offset_enabled_flag u(1)
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1);
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1);
+
+    // pcm_enabled_flag u(1)
+    let pcm_enabled = r.read_bits(1)?;
+    w.write_bits(pcm_enabled, 1);
+    if pcm_enabled == 1 {
+        let v = r.read_bits(4)?;
+        w.write_bits(v, 4); // pcm_sample_bit_depth_luma_minus1
+        let v = r.read_bits(4)?;
+        w.write_bits(v, 4); // pcm_sample_bit_depth_chroma_minus1
+        let v = r.read_ue()?;
+        w.write_ue(v); // log2_min_pcm_luma_coding_block_size_minus3
+        let v = r.read_ue()?;
+        w.write_ue(v); // log2_diff_max_min_pcm_luma_coding_block_size
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1); // pcm_loop_filter_disabled_flag
+    }
+
+    // num_short_term_ref_pic_sets ue + array of st_ref_pic_set(i).
+    let num_short_term_ref_pic_sets = r.read_ue()?;
+    w.write_ue(num_short_term_ref_pic_sets);
+    let mut num_delta_pocs = Vec::with_capacity(num_short_term_ref_pic_sets as usize);
+    for st_rps_idx in 0..num_short_term_ref_pic_sets {
+        let n = copy_hevc_st_ref_pic_set(&mut r, &mut w, st_rps_idx, &num_delta_pocs)?;
+        num_delta_pocs.push(n);
+    }
+
+    // long_term_ref_pics_present_flag u(1) + table
+    let long_term_present = r.read_bits(1)?;
+    w.write_bits(long_term_present, 1);
+    if long_term_present == 1 {
+        let num_long_term = r.read_ue()?;
+        w.write_ue(num_long_term);
+        let lt_lsb_bits = log2_max_poc + 4;
+        for _ in 0..num_long_term {
+            let v = r.read_bits(lt_lsb_bits)?;
+            w.write_bits(v, lt_lsb_bits); // lt_ref_pic_poc_lsb_sps[i]
+            let v = r.read_bits(1)?;
+            w.write_bits(v, 1); // used_by_curr_pic_lt_sps_flag[i]
+        }
+    }
+
+    // sps_temporal_mvp_enabled_flag u(1), strong_intra_smoothing_enabled_flag u(1)
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1);
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1);
+
+    // vui_parameters_present_flag — always force = 1 in output, then
+    // either rewrite the existing VUI's video_signal_type or emit a
+    // fresh one.
+    let vui_present = r.read_bits(1)?;
+    w.write_bits(1, 1);
+    if vui_present == 1 {
+        copy_hevc_vui_with_full_range_bt709(&mut r, &mut w)?;
+    } else {
+        emit_minimal_hevc_vui(&mut w);
+    }
+
+    // sps_extension_present_flag u(1) and any extensions. We don't
+    // know which extensions are in use, so if the flag is set we bail
+    // and let the fallback path copy the SPS through. This is rare
+    // for ULL streams but harmless to be safe.
+    let sps_extension_present = r.read_bits(1)?;
+    if sps_extension_present == 1 {
+        return Err(EngineError::NotInitialized);
+    }
+    w.write_bits(0, 1); // sps_extension_present_flag = 0
+
+    // rbsp_trailing_bits() — not in source SPS yet at our cursor,
+    // append our own. (We deliberately don't read trailing bits from
+    // input because we may have rewritten preceding fields to
+    // different bit lengths; the input's trailing bits no longer line
+    // up.)
+    w.write_rbsp_trailing_bits();
+    Ok(w.into_bytes())
+}
+
+/// Walk the leading bytes of an HEVC SPS RBSP up to (and including)
+/// the DPB-shaping triplet. Patches `sps_max_dec_pic_buffering_minus1`,
+/// `sps_max_num_reorder_pics`, `sps_max_latency_increase_plus1` to 0.
+/// Shared by the DPB-only fallback path and the full walk.
+fn walk_hevc_sps_through_dpb(r: &mut BitReader, w: &mut BitWriter) -> EngineResult<()> {
     // sps_video_parameter_set_id u(4)
     let v = r.read_bits(4)?;
     w.write_bits(v, 4);
@@ -617,7 +801,7 @@ fn patch_hevc_sps_rbsp(rbsp: &[u8]) -> EngineResult<Vec<u8>> {
     w.write_bits(v, 1);
 
     // profile_tier_level(profilePresentFlag=1, maxNumSubLayersMinus1=sps_max_sub_layers_minus1)
-    copy_hevc_profile_tier_level(&mut r, &mut w, sps_max_sub_layers_minus1)?;
+    copy_hevc_profile_tier_level(r, w, sps_max_sub_layers_minus1)?;
 
     // sps_seq_parameter_set_id ue(v)
     let v = r.read_ue()?;
@@ -669,19 +853,236 @@ fn patch_hevc_sps_rbsp(rbsp: &[u8]) -> EngineResult<Vec<u8>> {
         let _ = r.read_ue()?;
         w.write_ue(0);
     }
+    Ok(())
+}
 
-    // Everything from here to the end of the SPS is COPIED bit-for-bit.
-    // The remainder includes log2_min_luma_coding_block_size_minus3 and
-    // a dozen more fields, ending at the SPS extensions + RBSP trailing
-    // bits. Rather than re-implement the entire parser, copy the
-    // unread tail of `rbsp` directly into the writer at the current
-    // bit offset.
-    copy_remaining_bits(&mut r, &mut w);
+/// Re-parse the SPS just to recover `log2_max_pic_order_cnt_lsb_minus4`,
+/// which `long_term_ref_pics_present_flag = 1` needs to know in order
+/// to read fixed-width `lt_ref_pic_poc_lsb_sps[i]` fields. We do this
+/// out-of-band rather than threading the value through `walk_hevc_sps_through_dpb`
+/// because the latter is shared with the DPB-only path that doesn't
+/// need it.
+fn walk_hevc_sps_dpb_log2_max_poc(rbsp: &[u8]) -> EngineResult<u32> {
+    let mut r = BitReader::new(rbsp);
+    let _ = r.read_bits(4)?; // sps_video_parameter_set_id
+    let sps_max_sub_layers_minus1 = r.read_bits(3)?;
+    let _ = r.read_bits(1)?; // sps_temporal_id_nesting_flag
 
-    // The trailing `1` + zero-pad is already inside the copied tail
-    // (the original SPS ended with rbsp_trailing_bits()), so we don't
-    // emit our own.
-    Ok(w.into_bytes())
+    // Skip profile_tier_level by re-running it through a throwaway writer.
+    let mut throwaway = BitWriter::new();
+    copy_hevc_profile_tier_level(&mut r, &mut throwaway, sps_max_sub_layers_minus1)?;
+
+    let _ = r.read_ue()?; // sps_seq_parameter_set_id
+    let chroma_format_idc = r.read_ue()?;
+    if chroma_format_idc == 3 {
+        let _ = r.read_bits(1)?;
+    }
+    let _ = r.read_ue()?; // pic_width
+    let _ = r.read_ue()?; // pic_height
+    let conformance_window = r.read_bits(1)?;
+    if conformance_window == 1 {
+        for _ in 0..4 {
+            let _ = r.read_ue()?;
+        }
+    }
+    let _ = r.read_ue()?; // bit_depth_luma_minus8
+    let _ = r.read_ue()?; // bit_depth_chroma_minus8
+    let log2_max_poc = r.read_ue()?;
+    Ok(log2_max_poc)
+}
+
+/// Copy `st_ref_pic_set(stRpsIdx)` per H.265 §7.3.7. Returns the
+/// `NumDeltaPocs[stRpsIdx]` value the decoder will compute, so the
+/// caller can use it when subsequent rps's predict from this one.
+///
+/// SPS context only — `stRpsIdx < num_short_term_ref_pic_sets` always,
+/// so the slice-header-only `delta_idx_minus1` branch is never taken.
+fn copy_hevc_st_ref_pic_set(
+    r: &mut BitReader,
+    w: &mut BitWriter,
+    st_rps_idx: u32,
+    num_delta_pocs: &[u32],
+) -> EngineResult<u32> {
+    let inter_ref_pic_set_prediction_flag = if st_rps_idx != 0 {
+        let f = r.read_bits(1)?;
+        w.write_bits(f, 1);
+        f
+    } else {
+        0
+    };
+    if inter_ref_pic_set_prediction_flag == 1 {
+        // delta_rps_sign u(1)
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1);
+        // abs_delta_rps_minus1 ue
+        let v = r.read_ue()?;
+        w.write_ue(v);
+        // RIdx = stRpsIdx - (delta_idx_minus1 + 1); in SPS context
+        // delta_idx_minus1 isn't coded so it's implicitly 0, RIdx = stRpsIdx - 1.
+        let r_idx = st_rps_idx
+            .checked_sub(1)
+            .ok_or(EngineError::NotInitialized)? as usize;
+        let n_dp = *num_delta_pocs
+            .get(r_idx)
+            .ok_or(EngineError::NotInitialized)?;
+        let mut new_num_delta_pocs = 0u32;
+        // Loop bound is INCLUSIVE per spec: j in [0, NumDeltaPocs[RIdx]].
+        for _ in 0..=n_dp {
+            let used_by_curr_pic_flag = r.read_bits(1)?;
+            w.write_bits(used_by_curr_pic_flag, 1);
+            if used_by_curr_pic_flag == 0 {
+                let use_delta_flag = r.read_bits(1)?;
+                w.write_bits(use_delta_flag, 1);
+                if use_delta_flag == 1 {
+                    new_num_delta_pocs += 1;
+                }
+            } else {
+                new_num_delta_pocs += 1;
+            }
+        }
+        Ok(new_num_delta_pocs)
+    } else {
+        let num_neg = r.read_ue()?;
+        w.write_ue(num_neg);
+        let num_pos = r.read_ue()?;
+        w.write_ue(num_pos);
+        for _ in 0..num_neg {
+            let v = r.read_ue()?;
+            w.write_ue(v); // delta_poc_s0_minus1[i]
+            let v = r.read_bits(1)?;
+            w.write_bits(v, 1); // used_by_curr_pic_s0_flag[i]
+        }
+        for _ in 0..num_pos {
+            let v = r.read_ue()?;
+            w.write_ue(v); // delta_poc_s1_minus1[i]
+            let v = r.read_bits(1)?;
+            w.write_bits(v, 1); // used_by_curr_pic_s1_flag[i]
+        }
+        Ok(num_neg + num_pos)
+    }
+}
+
+/// Copy the HEVC VUI (H.265 §E.2.1) bit-for-bit, except replace the
+/// `video_signal_type` block with our full-range BT.709 override. The
+/// rest of the VUI (timing, HRD, bitstream restriction) is sensitive
+/// to the encoder's actual configuration, so we keep it.
+fn copy_hevc_vui_with_full_range_bt709(r: &mut BitReader, w: &mut BitWriter) -> EngineResult<()> {
+    let aspect_ratio_info_present = r.read_bits(1)?;
+    w.write_bits(aspect_ratio_info_present, 1);
+    if aspect_ratio_info_present == 1 {
+        let aspect_ratio_idc = r.read_bits(8)?;
+        w.write_bits(aspect_ratio_idc, 8);
+        if aspect_ratio_idc == 255 {
+            let v = r.read_bits(16)?;
+            w.write_bits(v, 16);
+            let v = r.read_bits(16)?;
+            w.write_bits(v, 16);
+        }
+    }
+    let overscan_info_present = r.read_bits(1)?;
+    w.write_bits(overscan_info_present, 1);
+    if overscan_info_present == 1 {
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1);
+    }
+
+    // === video_signal_type — DROP whatever the input had, emit ours.
+    let video_signal_type_present = r.read_bits(1)?;
+    if video_signal_type_present == 1 {
+        let _ = r.read_bits(3)?; // video_format
+        let _ = r.read_bits(1)?; // video_full_range_flag
+        let colour_desc = r.read_bits(1)?;
+        if colour_desc == 1 {
+            let _ = r.read_bits(8)?; // colour_primaries
+            let _ = r.read_bits(8)?; // transfer_characteristics
+            let _ = r.read_bits(8)?; // matrix_coeffs
+        }
+    }
+    write_full_range_bt709_video_signal_type(w);
+
+    let chroma_loc_info_present = r.read_bits(1)?;
+    w.write_bits(chroma_loc_info_present, 1);
+    if chroma_loc_info_present == 1 {
+        let v = r.read_ue()?;
+        w.write_ue(v);
+        let v = r.read_ue()?;
+        w.write_ue(v);
+    }
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1); // neutral_chroma_indication_flag
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1); // field_seq_flag
+    let v = r.read_bits(1)?;
+    w.write_bits(v, 1); // frame_field_info_present_flag
+    let default_display_window = r.read_bits(1)?;
+    w.write_bits(default_display_window, 1);
+    if default_display_window == 1 {
+        for _ in 0..4 {
+            let v = r.read_ue()?;
+            w.write_ue(v);
+        }
+    }
+
+    let vui_timing_info_present = r.read_bits(1)?;
+    w.write_bits(vui_timing_info_present, 1);
+    if vui_timing_info_present == 1 {
+        let v = r.read_bits(32)?;
+        w.write_bits(v, 32); // vui_num_units_in_tick
+        let v = r.read_bits(32)?;
+        w.write_bits(v, 32); // vui_time_scale
+        let poc_proportional = r.read_bits(1)?;
+        w.write_bits(poc_proportional, 1);
+        if poc_proportional == 1 {
+            let v = r.read_ue()?;
+            w.write_ue(v);
+        }
+        let vui_hrd_present = r.read_bits(1)?;
+        if vui_hrd_present == 1 {
+            // hrd_parameters() is non-trivial. NVENC ULL with
+            // `outputBufferingPeriodSEI = 0` doesn't emit one, so this
+            // is a rare path. Bail and let the DPB-only fallback ship
+            // the bitstream unmodified.
+            return Err(EngineError::NotInitialized);
+        }
+        w.write_bits(0, 1); // vui_hrd_parameters_present_flag = 0
+    }
+
+    let bitstream_restriction = r.read_bits(1)?;
+    w.write_bits(bitstream_restriction, 1);
+    if bitstream_restriction == 1 {
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1); // tiles_fixed_structure_flag
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1); // motion_vectors_over_pic_boundaries_flag
+        let v = r.read_bits(1)?;
+        w.write_bits(v, 1); // restricted_ref_pic_lists_flag
+        let v = r.read_ue()?;
+        w.write_ue(v); // min_spatial_segmentation_idc
+        let v = r.read_ue()?;
+        w.write_ue(v); // max_bytes_per_pic_denom
+        let v = r.read_ue()?;
+        w.write_ue(v); // max_bits_per_min_cu_denom
+        let v = r.read_ue()?;
+        w.write_ue(v); // log2_max_mv_length_horizontal
+        let v = r.read_ue()?;
+        w.write_ue(v); // log2_max_mv_length_vertical
+    }
+    Ok(())
+}
+
+/// Synthesise a minimal HEVC VUI carrying just the colour info we
+/// care about. Used when the encoder didn't emit a VUI at all.
+fn emit_minimal_hevc_vui(w: &mut BitWriter) {
+    w.write_bits(0, 1); // aspect_ratio_info_present_flag
+    w.write_bits(0, 1); // overscan_info_present_flag
+    write_full_range_bt709_video_signal_type(w);
+    w.write_bits(0, 1); // chroma_loc_info_present_flag
+    w.write_bits(0, 1); // neutral_chroma_indication_flag
+    w.write_bits(0, 1); // field_seq_flag
+    w.write_bits(0, 1); // frame_field_info_present_flag
+    w.write_bits(0, 1); // default_display_window_flag
+    w.write_bits(0, 1); // vui_timing_info_present_flag
+    w.write_bits(0, 1); // bitstream_restriction_flag
 }
 
 fn copy_hevc_profile_tier_level(
@@ -898,11 +1299,56 @@ mod tests {
         }
         let vui = r.read_bits(1).unwrap();
         let restriction = if vui == 1 {
-            // Skip aspect/overscan/video/chroma/timing/nal_hrd/vcl_hrd/pic_struct
-            // — minimal VUI in this test has them all = 0.
-            for _ in 0..8 {
+            // aspect_ratio_info_present_flag (0 in our synthetic VUI; the
+            // patcher copies the input value through).
+            let aspect_present = r.read_bits(1).unwrap();
+            if aspect_present == 1 {
+                let aspect_idc = r.read_bits(8).unwrap();
+                if aspect_idc == 255 {
+                    let _ = r.read_bits(16).unwrap();
+                    let _ = r.read_bits(16).unwrap();
+                }
+            }
+            // overscan_info_present_flag
+            let overscan_present = r.read_bits(1).unwrap();
+            if overscan_present == 1 {
                 let _ = r.read_bits(1).unwrap();
             }
+            // video_signal_type_present_flag — the patcher always forces
+            // this to 1, so the patched output will go into the if.
+            let video_signal_type_present = r.read_bits(1).unwrap();
+            if video_signal_type_present == 1 {
+                let _video_format = r.read_bits(3).unwrap();
+                let _video_full_range = r.read_bits(1).unwrap();
+                let colour_desc = r.read_bits(1).unwrap();
+                if colour_desc == 1 {
+                    let _ = r.read_bits(8).unwrap();
+                    let _ = r.read_bits(8).unwrap();
+                    let _ = r.read_bits(8).unwrap();
+                }
+            }
+            // chroma_loc_info_present_flag
+            let chroma_present = r.read_bits(1).unwrap();
+            if chroma_present == 1 {
+                let _ = r.read_ue().unwrap();
+                let _ = r.read_ue().unwrap();
+            }
+            // timing_info_present_flag
+            let timing_present = r.read_bits(1).unwrap();
+            if timing_present == 1 {
+                let _ = r.read_bits(32).unwrap();
+                let _ = r.read_bits(32).unwrap();
+                let _ = r.read_bits(1).unwrap();
+            }
+            let nal_hrd = r.read_bits(1).unwrap();
+            if nal_hrd == 1 {
+                panic!("test SPS doesn't carry nal_hrd; patcher would copy it through");
+            }
+            let vcl_hrd = r.read_bits(1).unwrap();
+            if vcl_hrd == 1 {
+                panic!("test SPS doesn't carry vcl_hrd");
+            }
+            let _pic_struct = r.read_bits(1).unwrap();
             let bs_restr = r.read_bits(1).unwrap();
             if bs_restr == 1 {
                 let _ = r.read_bits(1).unwrap(); // motion_vectors_over_pic_boundaries_flag
@@ -920,6 +1366,72 @@ mod tests {
             None
         };
         (max_num_ref_frames, restriction)
+    }
+
+    /// Extract `(video_signal_type_present, video_full_range_flag,
+    /// colour_description_present, primaries, transfer, matrix)` from
+    /// an H.264 SPS RBSP. Used to verify the issue-#1 colour patch.
+    #[allow(clippy::type_complexity)]
+    fn read_h264_sps_video_signal_type(
+        rbsp: &[u8],
+    ) -> (bool, Option<(u32, bool, Option<(u32, u32, u32)>)>) {
+        let mut r = BitReader::new(rbsp);
+        let _ = r.read_bits(8).unwrap(); // profile
+        let _ = r.read_bits(8).unwrap();
+        let _ = r.read_bits(8).unwrap();
+        let _ = r.read_ue().unwrap(); // sps_id
+        let _ = r.read_ue().unwrap(); // log2_max_frame_num_minus4
+        let pic_order_cnt_type = r.read_ue().unwrap();
+        if pic_order_cnt_type == 0 {
+            let _ = r.read_ue().unwrap();
+        }
+        let _ = r.read_ue().unwrap(); // max_num_ref_frames
+        let _ = r.read_bits(1).unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let frame_mbs_only = r.read_bits(1).unwrap();
+        if frame_mbs_only == 0 {
+            let _ = r.read_bits(1).unwrap();
+        }
+        let _ = r.read_bits(1).unwrap();
+        let crop = r.read_bits(1).unwrap();
+        if crop == 1 {
+            for _ in 0..4 {
+                let _ = r.read_ue().unwrap();
+            }
+        }
+        let vui = r.read_bits(1).unwrap();
+        if vui == 0 {
+            return (false, None);
+        }
+        let aspect_present = r.read_bits(1).unwrap();
+        if aspect_present == 1 {
+            let aspect_idc = r.read_bits(8).unwrap();
+            if aspect_idc == 255 {
+                let _ = r.read_bits(16).unwrap();
+                let _ = r.read_bits(16).unwrap();
+            }
+        }
+        let overscan_present = r.read_bits(1).unwrap();
+        if overscan_present == 1 {
+            let _ = r.read_bits(1).unwrap();
+        }
+        let vst_present = r.read_bits(1).unwrap();
+        if vst_present == 0 {
+            return (true, None);
+        }
+        let video_format = r.read_bits(3).unwrap();
+        let full_range = r.read_bits(1).unwrap() == 1;
+        let colour_desc = r.read_bits(1).unwrap();
+        let cd = if colour_desc == 1 {
+            let p = r.read_bits(8).unwrap();
+            let t = r.read_bits(8).unwrap();
+            let m = r.read_bits(8).unwrap();
+            Some((p, t, m))
+        } else {
+            None
+        };
+        (true, Some((video_format, full_range, cd)))
     }
 
     #[test]
@@ -1070,5 +1582,432 @@ mod tests {
         ];
         let out = patch_packet_for_low_latency_dpb(Codec::H264, bytes).expect("patch");
         assert_eq!(out, bytes);
+    }
+
+    // ===================================================================
+    // Issue #1 — full-range BT.709 VUI override tests
+    // ===================================================================
+
+    /// H.264 path: input SPS has no VUI at all. Patched output must
+    /// synthesise a VUI with `video_signal_type_present_flag = 1`,
+    /// `video_full_range_flag = 1`, and BT.709 colour description.
+    #[test]
+    fn patch_h264_sps_no_vui_synthesises_full_range_bt709() {
+        let rbsp = build_synthetic_h264_baseline_sps(4, false);
+        let (orig_vui, _) = read_h264_sps_video_signal_type(&rbsp);
+        assert!(!orig_vui, "synthetic input had no VUI");
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::H264, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[5..]);
+        let (vui, vsi) = read_h264_sps_video_signal_type(&patched_rbsp);
+        assert!(vui, "patched output must carry a VUI");
+        let (_video_format, full_range, cd) = vsi.expect("video_signal_type fields");
+        assert!(full_range, "video_full_range_flag must be 1");
+        assert_eq!(
+            cd,
+            Some((1, 1, 1)),
+            "colour_description must be BT.709 (primaries=1, transfer=1, matrix=1)"
+        );
+    }
+
+    /// H.264 path: input SPS already has a VUI (built by the helper
+    /// without video_signal_type). Patched output must still set
+    /// full-range BT.709, overriding the absent video_signal_type.
+    #[test]
+    fn patch_h264_sps_existing_vui_gets_full_range_bt709() {
+        let rbsp = build_synthetic_h264_baseline_sps(4, true);
+        let (orig_vui, orig_vst) = read_h264_sps_video_signal_type(&rbsp);
+        assert!(orig_vui);
+        assert!(
+            orig_vst.is_none(),
+            "synthetic VUI helper omits video_signal_type"
+        );
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::H264, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[5..]);
+        let (vui, vsi) = read_h264_sps_video_signal_type(&patched_rbsp);
+        assert!(vui);
+        let (_video_format, full_range, cd) = vsi.expect("video_signal_type fields");
+        assert!(full_range);
+        assert_eq!(cd, Some((1, 1, 1)));
+    }
+
+    /// H.264 path: input SPS already has a VUI carrying a WRONG
+    /// video_signal_type (limited-range BT.601). Patched output must
+    /// override it with full-range BT.709.
+    #[test]
+    fn patch_h264_sps_overrides_wrong_video_signal_type() {
+        let rbsp = build_h264_sps_with_video_signal_type(/*limited_range*/ false, 6, 6, 6);
+        let (orig_vst, orig_vsi) = read_h264_sps_video_signal_type(&rbsp);
+        assert!(orig_vst);
+        assert_eq!(
+            orig_vsi,
+            Some((5, false, Some((6, 6, 6)))),
+            "synthetic input declared limited-range BT.601"
+        );
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x67];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::H264, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[5..]);
+        let (vst, vsi) = read_h264_sps_video_signal_type(&patched_rbsp);
+        assert!(vst);
+        let (_, full_range, cd) = vsi.expect("video_signal_type fields");
+        assert!(full_range, "wrong limited-range flag must be overridden");
+        assert_eq!(
+            cd,
+            Some((1, 1, 1)),
+            "wrong BT.601 colour description must be overridden to BT.709"
+        );
+    }
+
+    /// Build an H.264 SPS RBSP with a VUI carrying an explicit
+    /// `video_signal_type` block. Used by the override test.
+    fn build_h264_sps_with_video_signal_type(
+        full_range: bool,
+        primaries: u32,
+        transfer: u32,
+        matrix: u32,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(66, 8); // profile_idc
+        w.write_bits(0xC0, 8);
+        w.write_bits(40, 8);
+        w.write_ue(0); // sps_id
+        w.write_ue(0); // log2_max_frame_num_minus4
+        w.write_ue(0); // pic_order_cnt_type
+        w.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        w.write_ue(4); // max_num_ref_frames
+        w.write_bits(0, 1); // gaps_in_frame_num_value_allowed_flag
+        w.write_ue(119); // pic_width_in_mbs_minus1
+        w.write_ue(67); // pic_height_in_map_units_minus1
+        w.write_bits(1, 1); // frame_mbs_only_flag
+        w.write_bits(1, 1); // direct_8x8_inference_flag
+        w.write_bits(0, 1); // frame_cropping_flag
+        w.write_bits(1, 1); // vui_parameters_present_flag
+                            // VUI:
+        w.write_bits(0, 1); // aspect_ratio_info_present_flag
+        w.write_bits(0, 1); // overscan_info_present_flag
+        w.write_bits(1, 1); // video_signal_type_present_flag = 1
+        w.write_bits(5, 3); // video_format = Unspecified
+        w.write_bits(if full_range { 1 } else { 0 }, 1); // video_full_range_flag
+        w.write_bits(1, 1); // colour_description_present_flag
+        w.write_bits(primaries, 8);
+        w.write_bits(transfer, 8);
+        w.write_bits(matrix, 8);
+        w.write_bits(0, 1); // chroma_loc_info_present_flag
+        w.write_bits(0, 1); // timing_info_present_flag
+        w.write_bits(0, 1); // nal_hrd_parameters_present_flag
+        w.write_bits(0, 1); // vcl_hrd_parameters_present_flag
+        w.write_bits(0, 1); // pic_struct_present_flag
+        w.write_bits(0, 1); // bitstream_restriction_flag
+        w.write_rbsp_trailing_bits();
+        w.into_bytes()
+    }
+
+    /// Build a *complete* HEVC SPS RBSP — every field present including
+    /// the post-DPB block needed to reach the VUI. Configurable
+    /// `video_full_range_flag` and colour-description triple so we can
+    /// verify the patcher overrides whatever the encoder wrote.
+    fn build_complete_hevc_sps(
+        sps_max_dec_pic_buffering_minus1: u32,
+        full_range_in: bool,
+        primaries_in: u32,
+        transfer_in: u32,
+        matrix_in: u32,
+        with_vui: bool,
+    ) -> Vec<u8> {
+        let mut w = BitWriter::new();
+        w.write_bits(0, 4); // sps_video_parameter_set_id
+        w.write_bits(0, 3); // sps_max_sub_layers_minus1 = 0
+        w.write_bits(1, 1); // sps_temporal_id_nesting_flag
+                            // profile_tier_level: 96 bits when max_num_sub_layers_minus1 = 0.
+        for _ in 0..12 {
+            w.write_bits(0, 8);
+        }
+        w.write_ue(0); // sps_seq_parameter_set_id
+        w.write_ue(1); // chroma_format_idc = 4:2:0
+        w.write_ue(1920); // pic_width_in_luma_samples
+        w.write_ue(1080); // pic_height_in_luma_samples
+        w.write_bits(0, 1); // conformance_window_flag
+        w.write_ue(0); // bit_depth_luma_minus8
+        w.write_ue(0); // bit_depth_chroma_minus8
+        w.write_ue(4); // log2_max_pic_order_cnt_lsb_minus4
+        w.write_bits(1, 1); // sps_sub_layer_ordering_info_present_flag
+        w.write_ue(sps_max_dec_pic_buffering_minus1);
+        w.write_ue(0); // sps_max_num_reorder_pics
+        w.write_ue(0); // sps_max_latency_increase_plus1
+
+        // Post-DPB block — sensible NVENC ULL defaults.
+        w.write_ue(0); // log2_min_luma_coding_block_size_minus3
+        w.write_ue(3); // log2_diff_max_min_luma_coding_block_size
+        w.write_ue(0); // log2_min_luma_transform_block_size_minus2
+        w.write_ue(3); // log2_diff_max_min_luma_transform_block_size
+        w.write_ue(0); // max_transform_hierarchy_depth_inter
+        w.write_ue(0); // max_transform_hierarchy_depth_intra
+        w.write_bits(0, 1); // scaling_list_enabled_flag
+        w.write_bits(1, 1); // amp_enabled_flag
+        w.write_bits(1, 1); // sample_adaptive_offset_enabled_flag
+        w.write_bits(0, 1); // pcm_enabled_flag
+        w.write_ue(0); // num_short_term_ref_pic_sets
+        w.write_bits(0, 1); // long_term_ref_pics_present_flag
+        w.write_bits(1, 1); // sps_temporal_mvp_enabled_flag
+        w.write_bits(0, 1); // strong_intra_smoothing_enabled_flag
+        w.write_bits(if with_vui { 1 } else { 0 }, 1); // vui_parameters_present_flag
+
+        if with_vui {
+            w.write_bits(0, 1); // aspect_ratio_info_present_flag
+            w.write_bits(0, 1); // overscan_info_present_flag
+            w.write_bits(1, 1); // video_signal_type_present_flag
+            w.write_bits(5, 3); // video_format = Unspecified
+            w.write_bits(if full_range_in { 1 } else { 0 }, 1);
+            w.write_bits(1, 1); // colour_description_present_flag
+            w.write_bits(primaries_in, 8);
+            w.write_bits(transfer_in, 8);
+            w.write_bits(matrix_in, 8);
+            w.write_bits(0, 1); // chroma_loc_info_present_flag
+            w.write_bits(0, 1); // neutral_chroma_indication_flag
+            w.write_bits(0, 1); // field_seq_flag
+            w.write_bits(0, 1); // frame_field_info_present_flag
+            w.write_bits(0, 1); // default_display_window_flag
+            w.write_bits(0, 1); // vui_timing_info_present_flag
+            w.write_bits(0, 1); // bitstream_restriction_flag
+        }
+
+        w.write_bits(0, 1); // sps_extension_present_flag
+        w.write_rbsp_trailing_bits();
+        w.into_bytes()
+    }
+
+    /// Walk an HEVC SPS RBSP all the way to the VUI's
+    /// `video_signal_type` block and return its values. Returns
+    /// `(vui_present, video_signal_type)` where the inner option is
+    /// `(full_range, colour_description)`.
+    #[allow(clippy::type_complexity)]
+    fn read_hevc_sps_video_signal_type(
+        rbsp: &[u8],
+    ) -> (bool, Option<(bool, Option<(u32, u32, u32)>)>) {
+        let mut r = BitReader::new(rbsp);
+        let _ = r.read_bits(4).unwrap();
+        let sps_max_sub_layers_minus1 = r.read_bits(3).unwrap();
+        let _ = r.read_bits(1).unwrap();
+        let mut throwaway = BitWriter::new();
+        copy_hevc_profile_tier_level(&mut r, &mut throwaway, sps_max_sub_layers_minus1).unwrap();
+        let _ = r.read_ue().unwrap();
+        let chroma_format_idc = r.read_ue().unwrap();
+        if chroma_format_idc == 3 {
+            let _ = r.read_bits(1).unwrap();
+        }
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let conformance = r.read_bits(1).unwrap();
+        if conformance == 1 {
+            for _ in 0..4 {
+                let _ = r.read_ue().unwrap();
+            }
+        }
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let sub_layer_info_present = r.read_bits(1).unwrap();
+        let i_start = if sub_layer_info_present == 1 {
+            0
+        } else {
+            sps_max_sub_layers_minus1
+        };
+        for _ in i_start..=sps_max_sub_layers_minus1 {
+            let _ = r.read_ue().unwrap();
+            let _ = r.read_ue().unwrap();
+            let _ = r.read_ue().unwrap();
+        }
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let scaling_enabled = r.read_bits(1).unwrap();
+        assert_eq!(scaling_enabled, 0);
+        let _ = r.read_bits(1).unwrap(); // amp
+        let _ = r.read_bits(1).unwrap(); // sao
+        let pcm_enabled = r.read_bits(1).unwrap();
+        assert_eq!(pcm_enabled, 0);
+        let n_rps = r.read_ue().unwrap();
+        assert_eq!(n_rps, 0, "test SPS doesn't model st_ref_pic_set");
+        let lt_present = r.read_bits(1).unwrap();
+        assert_eq!(lt_present, 0);
+        let _ = r.read_bits(1).unwrap(); // sps_temporal_mvp_enabled_flag
+        let _ = r.read_bits(1).unwrap(); // strong_intra_smoothing
+        let vui_present = r.read_bits(1).unwrap();
+        if vui_present == 0 {
+            return (false, None);
+        }
+        let aspect = r.read_bits(1).unwrap();
+        if aspect == 1 {
+            let idc = r.read_bits(8).unwrap();
+            if idc == 255 {
+                let _ = r.read_bits(16).unwrap();
+                let _ = r.read_bits(16).unwrap();
+            }
+        }
+        let overscan = r.read_bits(1).unwrap();
+        if overscan == 1 {
+            let _ = r.read_bits(1).unwrap();
+        }
+        let vst = r.read_bits(1).unwrap();
+        if vst == 0 {
+            return (true, None);
+        }
+        let _ = r.read_bits(3).unwrap();
+        let full_range = r.read_bits(1).unwrap() == 1;
+        let cd_present = r.read_bits(1).unwrap();
+        let cd = if cd_present == 1 {
+            let p = r.read_bits(8).unwrap();
+            let t = r.read_bits(8).unwrap();
+            let m = r.read_bits(8).unwrap();
+            Some((p, t, m))
+        } else {
+            None
+        };
+        (true, Some((full_range, cd)))
+    }
+
+    /// HEVC path: complete SPS with a wrong limited-range BT.601
+    /// video_signal_type. Patched output must override to full-range
+    /// BT.709 AND keep DPB triplet patched to (0, 0, 0).
+    #[test]
+    fn patch_hevc_sps_overrides_wrong_video_signal_type() {
+        let rbsp = build_complete_hevc_sps(3, false, 6, 6, 6, true);
+        let (vui, vst) = read_hevc_sps_video_signal_type(&rbsp);
+        assert!(vui);
+        assert_eq!(vst, Some((false, Some((6, 6, 6)))));
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x42, 0x01];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::Hevc, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[6..]);
+
+        let (dpb, reorder, lat) = read_hevc_sps_dpb_fields_via_full_walk(&patched_rbsp);
+        assert_eq!(
+            (dpb, reorder, lat),
+            (0, 0, 0),
+            "DPB triplet must still be patched"
+        );
+
+        let (vui_p, vst_p) = read_hevc_sps_video_signal_type(&patched_rbsp);
+        assert!(vui_p);
+        let (full_range, cd) = vst_p.expect("video_signal_type present in patched output");
+        assert!(full_range);
+        assert_eq!(cd, Some((1, 1, 1)));
+    }
+
+    /// HEVC path: complete SPS without a VUI. Patcher must synthesise
+    /// one declaring full-range BT.709.
+    #[test]
+    fn patch_hevc_sps_no_vui_synthesises_full_range_bt709() {
+        let rbsp = build_complete_hevc_sps(3, false, 0, 0, 0, false);
+        let (vui, _) = read_hevc_sps_video_signal_type(&rbsp);
+        assert!(!vui, "input SPS had no VUI");
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x42, 0x01];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::Hevc, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[6..]);
+
+        let (vui_p, vst_p) = read_hevc_sps_video_signal_type(&patched_rbsp);
+        assert!(vui_p, "patcher must force vui_parameters_present_flag = 1");
+        let (full_range, cd) = vst_p.expect("video_signal_type synthesised");
+        assert!(full_range);
+        assert_eq!(cd, Some((1, 1, 1)));
+    }
+
+    /// Read DPB triplet from a complete HEVC SPS (the existing
+    /// `read_hevc_sps_dpb_fields` helper assumes the synthetic SPS
+    /// shape; this one walks the realistic structure).
+    fn read_hevc_sps_dpb_fields_via_full_walk(rbsp: &[u8]) -> (u32, u32, u32) {
+        let mut r = BitReader::new(rbsp);
+        let _ = r.read_bits(4).unwrap();
+        let sps_max_sub_layers_minus1 = r.read_bits(3).unwrap();
+        let _ = r.read_bits(1).unwrap();
+        let mut throwaway = BitWriter::new();
+        copy_hevc_profile_tier_level(&mut r, &mut throwaway, sps_max_sub_layers_minus1).unwrap();
+        let _ = r.read_ue().unwrap();
+        let chroma_format_idc = r.read_ue().unwrap();
+        if chroma_format_idc == 3 {
+            let _ = r.read_bits(1).unwrap();
+        }
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let conformance = r.read_bits(1).unwrap();
+        if conformance == 1 {
+            for _ in 0..4 {
+                let _ = r.read_ue().unwrap();
+            }
+        }
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_ue().unwrap();
+        let _ = r.read_bits(1).unwrap(); // sub_layer_info_present
+        let dpb = r.read_ue().unwrap();
+        let reorder = r.read_ue().unwrap();
+        let latency = r.read_ue().unwrap();
+        (dpb, reorder, latency)
+    }
+
+    /// HEVC fallback path: an SPS that uses scaling_list_data must
+    /// still get the DPB patch even though we bail on VUI override.
+    #[test]
+    fn patch_hevc_sps_with_scaling_list_falls_back_to_dpb_only() {
+        let mut w = BitWriter::new();
+        w.write_bits(0, 4); // sps_video_parameter_set_id
+        w.write_bits(0, 3); // sps_max_sub_layers_minus1
+        w.write_bits(1, 1); // sps_temporal_id_nesting_flag
+        for _ in 0..12 {
+            w.write_bits(0, 8);
+        } // profile_tier_level
+        w.write_ue(0); // sps_seq_parameter_set_id
+        w.write_ue(1); // chroma_format_idc
+        w.write_ue(1920);
+        w.write_ue(1080);
+        w.write_bits(0, 1); // conformance_window_flag
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_ue(4);
+        w.write_bits(1, 1); // sps_sub_layer_ordering_info_present_flag
+        w.write_ue(3); // sps_max_dec_pic_buffering_minus1 (non-zero — should still get patched)
+        w.write_ue(2); // sps_max_num_reorder_pics
+        w.write_ue(5); // sps_max_latency_increase_plus1
+        w.write_ue(0);
+        w.write_ue(3);
+        w.write_ue(0);
+        w.write_ue(3);
+        w.write_ue(0);
+        w.write_ue(0);
+        w.write_bits(1, 1); // scaling_list_enabled_flag = 1 → triggers fallback
+        w.write_bits(1, 1); // sps_scaling_list_data_present_flag = 1
+                            // Sentinel garbage where scaling_list_data should be — the full
+                            // walk will return Err, the DPB-only fallback will copy through.
+        for _ in 0..8 {
+            w.write_bits(0xAB, 8);
+        }
+        w.write_rbsp_trailing_bits();
+        let rbsp = w.into_bytes();
+
+        let mut nal = vec![0x00, 0x00, 0x00, 0x01, 0x42, 0x01];
+        nal.extend_from_slice(&rbsp_escape(&rbsp));
+        let patched = patch_packet_for_low_latency_dpb(Codec::Hevc, &nal).expect("patch");
+        let patched_rbsp = rbsp_unescape(&patched[6..]);
+
+        // DPB triplet must be patched to (0, 0, 0) by the fallback.
+        let (dpb, reorder, latency) = read_hevc_sps_dpb_fields_via_full_walk(&patched_rbsp);
+        assert_eq!(
+            (dpb, reorder, latency),
+            (0, 0, 0),
+            "fallback must still patch DPB"
+        );
     }
 }
