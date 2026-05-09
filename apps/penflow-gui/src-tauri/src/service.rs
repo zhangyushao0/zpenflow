@@ -18,12 +18,21 @@ use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
 use tokio::task::JoinHandle;
 
+use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, PenButtonProfile};
 use penflow_core::Engine;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT,
+    VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE, VK_TAB,
+    VK_UP,
+};
 
-use crate::settings::{write_installed_vdd_settings, SharedSettings};
+use crate::settings::{
+    self, write_installed_vdd_settings, MouseButton as SettingsMouseButton, PenBindings,
+    SharedSettings,
+};
 
 /// Lifecycle events emitted by the running [`Service`]. Forwarded to
 /// the Tauri frontend as window events.
@@ -368,6 +377,145 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
+        pen_profile: build_pen_profile(&s.bindings),
+    }
+}
+
+/// Convert the GUI's user-edited `settings::PenBindings` into the engine's
+/// runtime `PenButtonProfile` (issue #6). The settings layer stores key
+/// names as strings (`"Ctrl"`, `"Ctrl+E"`) for editor portability; the
+/// engine wants `VIRTUAL_KEY` constants.
+fn build_pen_profile(b: &PenBindings) -> PenButtonProfile {
+    PenButtonProfile {
+        barrel_1: convert_binding(&b.button_0),
+        barrel_2: convert_binding(&b.button_1),
+        tertiary: convert_binding(&b.button_2),
+        tip_threshold: 0.0,
+    }
+}
+
+fn convert_binding(b: &settings::Binding) -> CoreBinding {
+    match b {
+        settings::Binding::None => CoreBinding::None,
+        settings::Binding::EraserToggle => CoreBinding::EraserToggle,
+        settings::Binding::MouseButton { button } => CoreBinding::MouseButton(match button {
+            SettingsMouseButton::Left => MouseButtonKind::Left,
+            SettingsMouseButton::Right => MouseButtonKind::Right,
+            SettingsMouseButton::Middle => MouseButtonKind::Middle,
+        }),
+        settings::Binding::KeyTap { key } => match parse_key_combo(key) {
+            Some(keys) if keys.len() == 1 => CoreBinding::KeyTap(keys[0]),
+            Some(keys) if keys.len() > 1 => CoreBinding::KeyChord(keys),
+            _ => {
+                eprintln!("[bindings] unrecognised KeyTap spec '{key}'; mapping to None");
+                CoreBinding::None
+            }
+        },
+        settings::Binding::KeyHold { key } => match parse_key_combo(key) {
+            Some(keys) if keys.len() == 1 => CoreBinding::KeyHold(keys[0]),
+            Some(keys) if keys.len() > 1 => {
+                // Multi-key hold isn't representable in the current engine
+                // `Binding` enum (only single-VK `KeyHold`). Fall back to a
+                // chord (down-then-up burst on press) so the binding does
+                // *something* recognisable; document the limitation.
+                eprintln!(
+                    "[bindings] multi-key Hold '{key}' degrades to KeyChord — \
+                     true held-modifier semantics not yet supported"
+                );
+                CoreBinding::KeyChord(keys)
+            }
+            _ => {
+                eprintln!("[bindings] unrecognised KeyHold spec '{key}'; mapping to None");
+                CoreBinding::None
+            }
+        },
+        settings::Binding::KeyChord { keys } => {
+            let mut out = Vec::with_capacity(keys.len());
+            for k in keys {
+                match parse_key_token(k) {
+                    Some(vk) => out.push(vk),
+                    None => {
+                        eprintln!("[bindings] unrecognised KeyChord token '{k}'; skipping");
+                    }
+                }
+            }
+            if out.is_empty() {
+                CoreBinding::None
+            } else {
+                CoreBinding::KeyChord(out)
+            }
+        }
+    }
+}
+
+/// Parse a `+`-separated key combo like "Ctrl+Shift+E" into ordered VKs.
+/// Returns `None` if any token fails to resolve. Empty input → `Some(vec![])`
+/// — caller should treat that the same as an unrecognised binding.
+fn parse_key_combo(spec: &str) -> Option<Vec<VIRTUAL_KEY>> {
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::new();
+    for tok in trimmed.split('+') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        out.push(parse_key_token(t)?);
+    }
+    Some(out)
+}
+
+/// Map one key name (modifier or single key) to a Win32 `VIRTUAL_KEY`.
+/// Case-insensitive on letter / modifier names. Returns `None` for
+/// unknown tokens — caller decides the fallback (skip / abort the
+/// whole combo / log).
+fn parse_key_token(name: &str) -> Option<VIRTUAL_KEY> {
+    let upper = name.to_ascii_uppercase();
+    match upper.as_str() {
+        // Modifiers, including the JS KeyboardEvent.code aliases the UI
+        // can produce ("Meta" → Win key on macOS-style hardware).
+        "CTRL" | "CONTROL" => Some(VK_CONTROL),
+        "SHIFT" => Some(VK_SHIFT),
+        "ALT" | "MENU" | "OPTION" => Some(VK_MENU),
+        "WIN" | "META" | "LWIN" | "CMD" | "COMMAND" | "SUPER" => Some(VK_LWIN),
+        // Whitespace + edit keys.
+        "SPACE" | " " => Some(VK_SPACE),
+        "TAB" => Some(VK_TAB),
+        "ENTER" | "RETURN" => Some(VK_RETURN),
+        "ESC" | "ESCAPE" => Some(VK_ESCAPE),
+        "BACKSPACE" | "BACK" => Some(VK_BACK),
+        "DEL" | "DELETE" => Some(VK_DELETE),
+        "INS" | "INSERT" => Some(VK_INSERT),
+        "HOME" => Some(VK_HOME),
+        "END" => Some(VK_END),
+        "PAGEUP" | "PRIOR" => Some(VK_PRIOR),
+        "PAGEDOWN" | "NEXT" => Some(VK_NEXT),
+        // Arrow keys, including KeyboardEvent.key style ("ArrowUp").
+        "UP" | "ARROWUP" => Some(VK_UP),
+        "DOWN" | "ARROWDOWN" => Some(VK_DOWN),
+        "LEFT" | "ARROWLEFT" => Some(VK_LEFT),
+        "RIGHT" | "ARROWRIGHT" => Some(VK_RIGHT),
+        // F1..F24.
+        s if s.starts_with('F') && s.len() <= 3 => {
+            let n: u16 = s[1..].parse().ok()?;
+            if (1..=24).contains(&n) {
+                // VK_F1 = 0x70, VK_F2 = 0x71, … VK_F24 = 0x87.
+                Some(VIRTUAL_KEY(0x6F + n))
+            } else {
+                None
+            }
+        }
+        // Single ASCII letter A..Z → VK code = the byte itself.
+        s if s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic()) => {
+            Some(VIRTUAL_KEY(s.as_bytes()[0] as u16))
+        }
+        // Single digit 0..9 → VK code = the byte itself.
+        s if s.len() == 1 && s.chars().all(|c| c.is_ascii_digit()) => {
+            Some(VIRTUAL_KEY(s.as_bytes()[0] as u16))
+        }
+        _ => None,
     }
 }
 
@@ -387,5 +535,91 @@ fn stub_monitor() -> penflow_core::monitors::MonitorInfo {
         rotation: 1,
         attached_to_desktop: false,
         looks_virtual: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows::Win32::UI::Input::KeyboardAndMouse::{VK_E, VK_F1};
+
+    #[test]
+    fn parses_letters_case_insensitively() {
+        assert_eq!(parse_key_token("E"), Some(VK_E));
+        assert_eq!(parse_key_token("e"), Some(VK_E));
+    }
+
+    #[test]
+    fn parses_modifier_aliases() {
+        assert_eq!(parse_key_token("Ctrl"), Some(VK_CONTROL));
+        assert_eq!(parse_key_token("Control"), Some(VK_CONTROL));
+        assert_eq!(parse_key_token("Meta"), Some(VK_LWIN));
+        assert_eq!(parse_key_token("Win"), Some(VK_LWIN));
+    }
+
+    #[test]
+    fn parses_function_keys_in_range() {
+        assert_eq!(parse_key_token("F1"), Some(VK_F1));
+        assert_eq!(parse_key_token("F24"), Some(VIRTUAL_KEY(0x87)));
+        assert_eq!(parse_key_token("F25"), None);
+        assert_eq!(parse_key_token("F0"), None);
+    }
+
+    #[test]
+    fn parses_digit_keys() {
+        assert_eq!(parse_key_token("5"), Some(VIRTUAL_KEY(b'5' as u16)));
+    }
+
+    #[test]
+    fn rejects_unknown_token() {
+        assert_eq!(parse_key_token("HyperUltra"), None);
+    }
+
+    #[test]
+    fn key_combo_splits_on_plus() {
+        let v = parse_key_combo("Ctrl+Shift+E").unwrap();
+        assert_eq!(v.len(), 3);
+        assert_eq!(v[0], VK_CONTROL);
+        assert_eq!(v[1], VK_SHIFT);
+        assert_eq!(v[2], VK_E);
+    }
+
+    #[test]
+    fn key_combo_returns_none_when_any_token_invalid() {
+        assert!(parse_key_combo("Ctrl+Nope").is_none());
+    }
+
+    #[test]
+    fn convert_keyhold_single_key_keeps_keyhold() {
+        let b = settings::Binding::KeyHold { key: "Ctrl".into() };
+        match convert_binding(&b) {
+            CoreBinding::KeyHold(vk) => assert_eq!(vk, VK_CONTROL),
+            other => panic!("expected KeyHold(VK_CONTROL), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_keytap_with_combo_falls_back_to_chord() {
+        let b = settings::Binding::KeyTap {
+            key: "Ctrl+S".into(),
+        };
+        match convert_binding(&b) {
+            CoreBinding::KeyChord(keys) => {
+                assert_eq!(keys.len(), 2);
+                assert_eq!(keys[0], VK_CONTROL);
+            }
+            other => panic!("expected KeyChord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_mouse_button_passes_kind() {
+        let b = settings::Binding::MouseButton {
+            button: SettingsMouseButton::Right,
+        };
+        match convert_binding(&b) {
+            CoreBinding::MouseButton(MouseButtonKind::Right) => {}
+            other => panic!("expected MouseButton(Right), got {other:?}"),
+        }
     }
 }

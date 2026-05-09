@@ -29,8 +29,10 @@ use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
-    VIRTUAL_KEY,
+    SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
+    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
+    MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
     InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
@@ -44,7 +46,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::error::{EngineError, EngineResult};
 
-use super::binding::{Binding, PenButtonProfile};
+use super::binding::{Binding, MouseButtonKind, PenButtonProfile};
 use super::{PenSample, TouchPoint};
 
 /// Multi-touch device capacity. Win32 docs allow up to 256, but the kernel
@@ -142,8 +144,14 @@ impl InputInjector {
                 1 => &self.pen_profile.barrel_2,
                 _ => &self.pen_profile.tertiary,
             };
-            if let Binding::KeyHold(vk) = binding {
-                let _ = send_key(*vk, false);
+            match binding {
+                Binding::KeyHold(vk) => {
+                    let _ = send_key(*vk, false);
+                }
+                Binding::MouseButton(kind) => {
+                    let _ = send_mouse_button(*kind, false);
+                }
+                _ => {}
             }
         }
         self.last_pen_buttons = 0;
@@ -206,6 +214,7 @@ impl InputInjector {
                             send_key(*vk, false)?;
                         }
                     }
+                    Binding::MouseButton(kind) => send_mouse_button(*kind, true)?,
                     Binding::EraserToggle => {
                         self.pen_eraser_sticky = !self.pen_eraser_sticky;
                     }
@@ -213,8 +222,10 @@ impl InputInjector {
             }
 
             if released_now & mask != 0 {
-                if let Binding::KeyHold(vk) = binding {
-                    send_key(*vk, false)?;
+                match binding {
+                    Binding::KeyHold(vk) => send_key(*vk, false)?,
+                    Binding::MouseButton(kind) => send_mouse_button(*kind, false)?,
+                    _ => {}
                 }
             }
         }
@@ -438,6 +449,40 @@ fn send_key(vk: VIRTUAL_KEY, down: bool) -> EngineResult<()> {
             ki: KEYBDINPUT {
                 wVk: vk,
                 wScan: 0,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [input];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        return Err(EngineError::Win32(windows::core::Error::from_thread()));
+    }
+    Ok(())
+}
+
+/// One `SendInput` mouse-button event for a `Binding::MouseButton`.
+/// HANDOFF §2.3 #4 warned that mouse-button presses get filtered by Windows
+/// Ink during in-stroke pen contact — it's still useful for off-stroke
+/// barrel-button → right-click style mappings (Wacom Cintiq convention).
+fn send_mouse_button(kind: MouseButtonKind, down: bool) -> EngineResult<()> {
+    let flags: MOUSE_EVENT_FLAGS = match (kind, down) {
+        (MouseButtonKind::Left, true) => MOUSEEVENTF_LEFTDOWN,
+        (MouseButtonKind::Left, false) => MOUSEEVENTF_LEFTUP,
+        (MouseButtonKind::Right, true) => MOUSEEVENTF_RIGHTDOWN,
+        (MouseButtonKind::Right, false) => MOUSEEVENTF_RIGHTUP,
+        (MouseButtonKind::Middle, true) => MOUSEEVENTF_MIDDLEDOWN,
+        (MouseButtonKind::Middle, false) => MOUSEEVENTF_MIDDLEUP,
+    };
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: 0,
                 dwFlags: flags,
                 time: 0,
                 dwExtraInfo: 0,

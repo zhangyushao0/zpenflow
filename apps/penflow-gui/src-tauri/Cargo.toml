@@ -31,11 +31,14 @@ penflow-transport = { path = "../../../crates/penflow-transport" }
 
 [target.'cfg(windows)'.dependencies]
 # Registry access (autostart) and ShellExecuteW (admin re-launch).
-windows = { version = "0.61", features = [
+# Pinned to the same major as penflow-core so VK / etc. types from the
+# binding-conversion path match across crates (issue #6 surfacing).
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Registry",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
     "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }

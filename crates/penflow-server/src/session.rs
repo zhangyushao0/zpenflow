@@ -145,6 +145,12 @@ pub struct SessionConfig {
     /// Whether the Android HUD overlay should be enabled. Forwarded to
     /// the client via `MSG_CLIENT_CONFIG` immediately after the handshake.
     pub hud_enabled: bool,
+    /// Pen-button bindings to apply on the per-session injector. Default
+    /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
+    /// GUI converts user-edited `settings::PenBindings` to this struct
+    /// in `service.rs::build_session_config` so the saved bindings
+    /// actually reach the synthetic-pointer layer (issue #6).
+    pub pen_profile: penflow_core::inject::binding::PenButtonProfile,
 }
 
 impl Default for SessionConfig {
@@ -196,6 +202,7 @@ impl Default for SessionConfig {
             vdd: None,
             vdd_target_resolution: None,
             hud_enabled: true,
+            pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
     }
 }
@@ -458,6 +465,14 @@ impl Session {
         //    A single WinRT InputInjector instance handles both pen and
         //    touch — agile object, safe to call from any tokio worker.
         let injector = Arc::new(Mutex::new(InputInjector::new()?));
+        // Apply user-configured pen-button bindings (issue #6). The
+        // injector starts with `PenButtonProfile::default()` baked in;
+        // overwriting it here makes the saved settings.json bindings
+        // actually take effect on each session.
+        injector
+            .lock()
+            .await
+            .set_pen_profile(self.cfg.pen_profile.clone());
         // Map DXGI rotation enum (1=identity, 2=90°, 3=180°, 4=270°) to
         // degrees for the AffineTransform.
         let rotation_deg: u32 = match engine.monitor().rotation {

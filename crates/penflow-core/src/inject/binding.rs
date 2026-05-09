@@ -17,6 +17,14 @@
 
 use windows::Win32::UI::Input::KeyboardAndMouse::{VIRTUAL_KEY, VK_CONTROL, VK_E, VK_SHIFT};
 
+/// Which physical mouse button a `Binding::MouseButton` synthesises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseButtonKind {
+    Left,
+    Right,
+    Middle,
+}
+
 #[derive(Clone, Debug)]
 pub enum Binding {
     /// No-op. Useful as a "disabled" slot in a profile.
@@ -27,7 +35,14 @@ pub enum Binding {
     KeyHold(VIRTUAL_KEY),
     /// Send all keys down, then all up, in order. Useful for `Ctrl+Z` style.
     KeyChord(Vec<VIRTUAL_KEY>),
-    /// Flip the WinRT `Inverted` bit on subsequent pen samples until
+    /// Hold a synthetic mouse button while the barrel is pressed: down on
+    /// press, up on release. Used by people who like the Wacom convention
+    /// of mapping a barrel button to right-click for the context menu.
+    /// HANDOFF §2.3 #4 cautions that mouse-button presses get filtered by
+    /// Windows Ink **during ongoing pen contact** — keep this for off-stroke
+    /// hover use; for in-stroke modifiers prefer `KeyHold`.
+    MouseButton(MouseButtonKind),
+    /// Flip the `PEN_FLAG_INVERTED` bit on subsequent pen samples until
     /// pressed again. Krita Windows Ink mode reads the bit as "this is the
     /// eraser end of the pen".
     EraserToggle,
