@@ -17,6 +17,13 @@ on:
       - "v*"
   workflow_dispatch:
 
+# Cancel a stale release run when a newer tag is pushed to the same ref
+# (e.g. force-retag during recovery). Tags don't normally get reused, so
+# this group only fires on the rare manual-dispatch retry.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: write   # required to create / update GitHub Releases
 
@@ -46,7 +53,14 @@ jobs:
           cache-dependency-path: apps/penflow-gui/ui/package-lock.json
 
       - name: Install Tauri CLI
-        run: cargo install tauri-cli --version "^2.0" --locked
+        # Use the prebuilt release binary from the tauri-cli GitHub
+        # release assets — `cargo install tauri-cli --locked` was
+        # spending ~10 minutes building from source on every release
+        # (~56% of the entire MSI job's runtime). The action below
+        # downloads the matching prebuilt binary in seconds.
+        uses: taiki-e/install-action@v2
+        with:
+          tool: tauri-cli@2
 
       - name: Install frontend deps
         working-directory: apps/penflow-gui/ui

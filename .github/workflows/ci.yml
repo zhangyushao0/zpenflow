@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+# When a new commit lands on the same PR / branch, cancel the older run
+# in progress. The newer commit supersedes it; saves time + minutes when
+# fixing CI typos via rapid-fire pushes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build / clippy / fmt / test (windows-latest)
