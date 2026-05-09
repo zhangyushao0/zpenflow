@@ -21,10 +21,11 @@ use windows::Win32::Graphics::Dxgi::{
     },
     IDXGIOutput, IDXGIOutput1, IDXGIOutput5, IDXGIOutputDuplication, IDXGIResource,
     DXGI_ERROR_ACCESS_DENIED, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT,
-    DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 use windows::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED};
 
+use super::cursor_shape::{decode_shape, CursorShape};
 use crate::d3d11::D3d11Context;
 use crate::error::{EngineError, EngineResult};
 use crate::monitors::MonitorInfo;
@@ -65,12 +66,83 @@ pub struct AcquiredFrame<'a> {
     capturer: &'a mut DxgiCapturer,
 }
 
+/// Cursor screen position reported alongside one DDA frame.
+///
+/// `visible == false` means the OS thinks the cursor is on a different
+/// monitor, or hidden — the compositor should skip the blit.
+/// Coordinates are in the duplicated output's local pixel space, with
+/// origin (0,0) at the top-left of THIS monitor (not the virtual screen).
+#[derive(Clone, Copy, Debug)]
+pub struct PointerPosition {
+    pub x: i32,
+    pub y: i32,
+    pub visible: bool,
+}
+
 impl<'a> AcquiredFrame<'a> {
     /// True iff this frame's `LastPresentTime == 0`, meaning DDA had no new
     /// content but woke us up because the cursor moved. Encoder pipelines
     /// generally treat this as "no new frame, reuse keepalive".
     pub fn is_cursor_only(&self) -> bool {
         self.frame_info.LastPresentTime == 0
+    }
+
+    /// Cursor position iff DDA reports a non-zero `LastMouseUpdateTime`
+    /// (i.e. the cursor moved since the previous frame). When `None`, the
+    /// caller should reuse whatever position it last cached. The `visible`
+    /// flag distinguishes "cursor is on this monitor" from "cursor is
+    /// elsewhere or hidden" — the compositor blits only when visible.
+    pub fn pointer_position(&self) -> Option<PointerPosition> {
+        if self.frame_info.LastMouseUpdateTime == 0 {
+            return None;
+        }
+        Some(PointerPosition {
+            x: self.frame_info.PointerPosition.Position.x,
+            y: self.frame_info.PointerPosition.Position.y,
+            visible: self.frame_info.PointerPosition.Visible.as_bool(),
+        })
+    }
+
+    /// Pull the latest cursor shape from DDA, if this frame includes one.
+    ///
+    /// `frame_info.PointerShapeBufferSize == 0` means "no shape change
+    /// this frame, reuse the one you already have." For non-zero values we
+    /// allocate (or reuse) a buffer of that size, call `GetFramePointerShape`,
+    /// and decode into the engine-side BGRA representation.
+    ///
+    /// Returns `Ok(None)` when no shape was provided this frame.
+    pub fn take_shape_update(&mut self) -> EngineResult<Option<CursorShape>> {
+        let needed = self.frame_info.PointerShapeBufferSize;
+        if needed == 0 {
+            return Ok(None);
+        }
+        let mut buf = vec![0u8; needed as usize];
+        let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
+        let mut required: u32 = 0;
+        unsafe {
+            self.capturer.duplication.GetFramePointerShape(
+                needed,
+                buf.as_mut_ptr() as *mut _,
+                &mut required,
+                &mut info,
+            )?;
+        }
+        // The buffer may not be entirely filled — `required` is the actual
+        // payload length when smaller than `needed`. Truncate so decode
+        // sees only valid bytes.
+        if (required as usize) < buf.len() {
+            buf.truncate(required as usize);
+        }
+        let shape = decode_shape(
+            info.Type,
+            info.Width,
+            info.Height,
+            info.Pitch,
+            info.HotSpot.x,
+            info.HotSpot.y,
+            &buf,
+        )?;
+        Ok(Some(shape))
     }
 }
 

@@ -7,4 +7,6 @@
 //! enemy of clarity.
 
 #[cfg(windows)]
+pub mod cursor_shape;
+#[cfg(windows)]
 pub mod dxgi;

@@ -29,8 +29,9 @@ use windows::Win32::System::Threading::{
     SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 
-use crate::capture::dxgi::DxgiCapturer;
+use crate::capture::dxgi::{DxgiCapturer, PointerPosition};
 use crate::color::{clear_bgra_texture_to_black, create_bgra_keepalive_texture, ColorConverter};
+use crate::cursor_blit::CursorBlitter;
 use crate::d3d11::D3d11Context;
 use crate::encoder::{EncodeSession, EncodedPacket};
 use crate::error::{EngineError, EngineResult};
@@ -151,6 +152,23 @@ impl Pipeline {
         // valid input no matter what.
         clear_bgra_texture_to_black(&ctx, &keepalive)?;
 
+        // Cursor compositor: bound once to the keepalive's RTV. Failing to
+        // build it shouldn't kill the session — fall back to a no-cursor
+        // stream rather than refusing to start. The most likely failure is
+        // D3DCompile / D3DCompiler_47.dll missing, which is rare on Win10+
+        // but possible on hardened images.
+        let cursor_blitter = match CursorBlitter::new(&ctx, &keepalive, cfg.width, cfg.height) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                eprintln!(
+                    "[pipeline] CursorBlitter::new failed ({:?}); cursor will not be visible \
+                     in the stream. Set HardwareCursor=false in vdd_settings.xml as a fallback.",
+                    e
+                );
+                None
+            }
+        };
+
         let q = Arc::clone(&queue);
         let s = Arc::clone(&stop);
         let idr = Arc::clone(&idr_request);
@@ -177,6 +195,8 @@ impl Pipeline {
                     converter,
                     encoder,
                     keepalive,
+                    cursor_blitter,
+                    last_pointer: None,
                     queue: q,
                     stop: s,
                     idr_request: idr,
@@ -245,6 +265,14 @@ struct LoopState {
     converter: ColorConverter,
     encoder: Box<dyn EncodeSession>,
     keepalive: windows::Win32::Graphics::Direct3D11::ID3D11Texture2D,
+    /// `None` if compositor failed to build (see Pipeline::start). When
+    /// `None`, cursor blits are silently skipped.
+    cursor_blitter: Option<CursorBlitter>,
+    /// Last pointer position seen from DDA. Persisted across frames because
+    /// `AcquiredFrame::pointer_position()` returns `None` on frames where
+    /// the cursor didn't move; we still need to draw it at the previous
+    /// location since `CopyResource` overwrites the keepalive each tick.
+    last_pointer: Option<PointerPosition>,
     queue: Arc<PacketQueue<EncodedPacket>>,
     stop: Arc<AtomicBool>,
     idr_request: Arc<AtomicBool>,
@@ -281,7 +309,7 @@ impl LoopState {
         let now = Instant::now();
 
         match acquired {
-            Some(frame) => {
+            Some(mut frame) => {
                 if trace {
                     eprintln!("[pipeline] got DDA frame, copying to keepalive");
                     eprintln!(
@@ -302,7 +330,43 @@ impl LoopState {
                         .CopyResource(&self.keepalive, &frame.texture);
                 }
                 self.has_real_frame = true;
+
+                // Pull cursor state. Shape only ships when it changed — if
+                // GetFramePointerShape errors we keep the cached one rather
+                // than failing the whole tick (a missing cursor for one
+                // frame is far cheaper than aborting the session).
+                if let Some(blitter) = self.cursor_blitter.as_mut() {
+                    match frame.take_shape_update() {
+                        Ok(Some(shape)) => {
+                            if let Err(e) = blitter.update_shape(&self.ctx, &shape) {
+                                eprintln!("[pipeline] cursor update_shape err: {e:?}");
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            eprintln!("[pipeline] take_shape_update err: {e:?}");
+                        }
+                    }
+                }
+                if let Some(pos) = frame.pointer_position() {
+                    self.last_pointer = Some(pos);
+                }
                 drop(frame);
+
+                // Composite the cursor onto the freshly-copied keepalive. The
+                // CopyResource above wipes any cursor we drew last tick, so we
+                // always re-blit. When `Visible=false` (cursor on a different
+                // monitor) we skip — the keepalive then carries no cursor
+                // until DDA tells us otherwise.
+                if let (Some(blitter), Some(pos)) =
+                    (self.cursor_blitter.as_ref(), self.last_pointer)
+                {
+                    if pos.visible {
+                        if let Err(e) = blitter.composite(&self.ctx, pos.x, pos.y) {
+                            eprintln!("[pipeline] cursor composite err: {e:?}");
+                        }
+                    }
+                }
             }
             None => {
                 // DDA timed out. Re-encode the keepalive texture. Two
