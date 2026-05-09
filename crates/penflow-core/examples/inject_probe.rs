@@ -1,150 +1,152 @@
-//! Wave-2 gate: WinRT `InputInjector` packaging probe.
+//! Pen-injection smoke probe for the Win32 synthetic-pointer path.
 //!
 //! Reference: design.md §6.6, HANDOFF §5.1.
 //!
-//! Microsoft documents `Windows.UI.Input.Preview.Injection.InputInjector` as
-//! requiring the `inputInjectionBrokered` restricted capability for packaged
-//! Windows apps. The predecessor `penflow` proves the API path works as an
-//! unpackaged Python process. The Rust port needs to confirm:
-//!   1. `InputInjector::TryCreate()` succeeds in an unpackaged Rust binary.
-//!   2. `InitializePenInjection` does not refuse with a capability error.
-//!   3. A real `InjectPenInput` call returns success (not just "API exists").
+//! Earlier waves used `Windows.UI.Input.Preview.Injection.InputInjector`
+//! (the WinRT wrapper). Issue #3 — pen offset proportional to monitor
+//! arrangement on 3-monitor setups — traced back to that wrapper's opaque
+//! coordinate-space handling, so the engine moved to the underlying Win32
+//! API directly: `CreateSyntheticPointerDevice` + `InjectSyntheticPointerInput`.
 //!
-//! Once this passes, the same shape needs to be re-tested through the WiX/MSI
-//! packaging path during Wave 5 — there's no way to do that from a `cargo run`
-//! example today, so that remains a gate-3.5 for later.
+//! What the probe checks:
+//!   1. `CreateSyntheticPointerDevice(PT_PEN, 1, …)` succeeds (no special
+//!      capability needed for Win32; the WinRT-only `inputInjectionBrokered`
+//!      restriction does not apply here).
+//!   2. A real `InjectSyntheticPointerInput` call returns success on the
+//!      virtual-screen coordinate `ptPixelLocation` we set.
 //!
-//! What the probe does on PASS: it draws a tiny ~80px horizontal stroke at
-//! mid-screen (Pressure 0.5) — enough that you can confirm Krita / OneNote /
-//! any Windows Ink consumer received pen pressure rather than mouse.
+//! On PASS: a tiny ~80px horizontal stroke is drawn at mid-screen with
+//! pressure 0.5–0.9. Open Krita / OneNote / any Windows Ink consumer to
+//! confirm the events arrive as **pen** (with pressure) and not mouse.
 //!
 //! Run: `cargo run -p penflow-core --example inject_probe`.
-//! Exit code 0 = PASS, 1 = API rejected (capability/packaging issue), 2 = setup error.
+//! Exit code 0 = PASS, 1 = injection rejected, 2 = setup error.
 
 use std::process::ExitCode;
 use std::thread::sleep;
 use std::time::Duration;
 
 use windows::core::Result;
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::Controls::{
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
+    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
-use windows::UI::Input::Preview::Injection::{
-    InjectedInputPenButtons, InjectedInputPenInfo, InjectedInputPenParameters, InjectedInputPoint,
-    InjectedInputPointerInfo, InjectedInputPointerOptions, InjectedInputVisualizationMode,
-    InputInjector,
+use windows::Win32::UI::Input::Pointer::{
+    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
+    POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW, POINTER_FLAG_UP,
+    POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO,
 };
+use windows::Win32::UI::WindowsAndMessaging::{PEN_MASK_PRESSURE, PT_PEN};
 
 fn main() -> ExitCode {
     unsafe {
-        if let Err(e) = CoInitializeEx(None, COINIT_MULTITHREADED).ok() {
-            eprintln!("[setup-fail] CoInitializeEx: {e:?}");
-            return ExitCode::from(2);
-        }
         // PER_MONITOR_AWARE_V2 so injected pixel coordinates are physical
         // pixels and not DIPs. Without this, on a 4K monitor at 150% scaling,
         // a click at "(1920, 1080)" lands at the wrong place.
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 
-    let code = match run_probe() {
+    match run_probe() {
         Ok(()) => {
             println!();
             println!("=== VERDICT: PASS ===");
-            println!("WinRT InputInjector works in this unpackaged Rust binary.");
-            println!("Pen pressure (0.5) and tilt were injected at mid-screen — verify in Krita");
-            println!("(Windows Ink mode) or OneNote that you saw a pressured stroke, not a click.");
-            println!();
-            println!("Remaining gate-3.5: re-run this probe inside the WiX/MSI release shape");
-            println!(
-                "during Wave 5. If it fails there, switch to MSIX-with-restricted-capability,"
-            );
-            println!("a small broker process, or virtual HID. (See design.md §6.6.)");
+            println!("Win32 synthetic pointer injection works in this binary.");
+            println!("A pen stroke (pressure ramp 0.5→0.9) was drawn at mid-screen — verify in");
+            println!("Krita (Windows Ink mode) or OneNote that you saw a pressured stroke.");
             ExitCode::SUCCESS
         }
         Err(e) => {
             eprintln!("[FAIL] {e:?}");
             eprintln!();
             eprintln!("=== VERDICT: FAIL ===");
-            eprintln!("The InputInjector API was refused in this packaging. Likely causes:");
-            eprintln!("  - Process not granted inputInjectionBrokered (MSIX-only capability)");
+            eprintln!("Win32 synthetic pointer injection was refused. Likely causes:");
             eprintln!("  - Service-context isolation (running under SYSTEM/Service)");
             eprintln!("  - Group policy disabling input injection");
-            eprintln!("Switch packaging strategy before locking the design. See design.md §6.6.");
+            eprintln!("  - Session 0 isolation (no interactive desktop available)");
             ExitCode::from(1)
         }
-    };
-
-    unsafe { CoUninitialize() };
-    code
+    }
 }
 
 fn run_probe() -> Result<()> {
-    println!("[probe] InputInjector::TryCreate()");
-    let injector = InputInjector::TryCreate()?;
+    println!("[probe] CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)");
+    let device = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)? };
 
-    println!("[probe] InitializePenInjection(Default)");
-    injector.InitializePenInjection(InjectedInputVisualizationMode::Default)?;
-
-    // Inject a short pressured stroke at mid-screen so a human watching in
-    // Krita / OneNote can confirm pen semantics (pressure, tilt, eraser bit)
-    // actually arrived, not just a mouse click.
     let mid_x: i32 = 1920;
     let mid_y: i32 = 1080;
     let stroke_len = 80;
     let steps = 16;
 
     println!("[probe] injecting pen-down + {steps} move samples + pen-up at ({mid_x},{mid_y})");
-    inject_pen(&injector, mid_x, mid_y, 0.0, true, false)?; // hover-arrival
+
+    // Hover-arrival.
+    inject(
+        device,
+        mid_x,
+        mid_y,
+        0.0,
+        POINTER_FLAG_INRANGE | POINTER_FLAG_NEW | POINTER_FLAG_UPDATE,
+    )?;
     sleep(Duration::from_millis(8));
+
+    // Pen-down on the first step, then update on subsequent.
     for i in 0..=steps {
         let x = mid_x + (i * stroke_len / steps);
-        let pressure = 0.5 + 0.4 * ((i as f64) / (steps as f64));
-        inject_pen(&injector, x, mid_y, pressure, true, true)?;
+        let pressure = 0.5 + 0.4 * ((i as f32) / (steps as f32));
+        let flags = if i == 0 {
+            POINTER_FLAG_INRANGE
+                | POINTER_FLAG_INCONTACT
+                | POINTER_FLAG_FIRSTBUTTON
+                | POINTER_FLAG_DOWN
+        } else {
+            POINTER_FLAG_INRANGE
+                | POINTER_FLAG_INCONTACT
+                | POINTER_FLAG_FIRSTBUTTON
+                | POINTER_FLAG_UPDATE
+        };
+        inject(device, x, mid_y, pressure, flags)?;
         sleep(Duration::from_millis(8));
     }
-    inject_pen(&injector, mid_x + stroke_len, mid_y, 0.0, false, false)?; // pen-up
 
-    injector.UninitializePenInjection()?;
-    println!("[probe] InjectPenInput sequence completed without error");
+    // Pen-up.
+    inject(device, mid_x + stroke_len, mid_y, 0.0, POINTER_FLAG_UP)?;
+
+    unsafe { DestroySyntheticPointerDevice(device) };
+    println!("[probe] InjectSyntheticPointerInput sequence completed without error");
     Ok(())
 }
 
-fn inject_pen(
-    injector: &InputInjector,
+fn inject(
+    device: HSYNTHETICPOINTERDEVICE,
     x: i32,
     y: i32,
-    pressure: f64,
-    in_range: bool,
-    in_contact: bool,
+    pressure: f32,
+    flags: POINTER_FLAGS,
 ) -> Result<()> {
-    let info = InjectedInputPenInfo::new()?;
-
-    let mut opts = InjectedInputPointerOptions::None;
-    if in_range {
-        opts |= InjectedInputPointerOptions::InRange;
-    }
-    if in_contact {
-        opts = opts | InjectedInputPointerOptions::InContact | InjectedInputPointerOptions::Update;
-    }
-    if !in_range && !in_contact {
-        opts |= InjectedInputPointerOptions::PointerUp;
-    }
-
-    let pointer = InjectedInputPointerInfo {
-        PointerId: 1,
-        PointerOptions: opts,
-        PixelLocation: InjectedInputPoint {
-            PositionX: x,
-            PositionY: y,
+    let pen_info = POINTER_PEN_INFO {
+        pointerInfo: POINTER_INFO {
+            pointerType: PT_PEN,
+            pointerId: 1,
+            pointerFlags: flags,
+            ptPixelLocation: POINT { x, y },
+            ..Default::default()
         },
-        TimeOffsetInMilliseconds: 0,
-        PerformanceCount: 0,
+        penFlags: 0,
+        penMask: PEN_MASK_PRESSURE,
+        pressure: (pressure.clamp(0.0, 1.0) * 1024.0).round() as u32,
+        rotation: 0,
+        tiltX: 0,
+        tiltY: 0,
     };
-    info.SetPointerInfo(pointer)?;
-    info.SetPenButtons(InjectedInputPenButtons::None)?;
-    info.SetPenParameters(InjectedInputPenParameters::Pressure)?;
-    info.SetPressure(pressure)?;
-    injector.InjectPenInput(&info)
+
+    let info = POINTER_TYPE_INFO {
+        r#type: PT_PEN,
+        Anonymous: POINTER_TYPE_INFO_0 { penInfo: pen_info },
+    };
+
+    unsafe { InjectSyntheticPointerInput(device, &[info]) }
 }

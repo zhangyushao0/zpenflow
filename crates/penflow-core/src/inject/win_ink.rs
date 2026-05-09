@@ -1,27 +1,30 @@
-//! Unified pen + touch injection via the WinRT `InputInjector` (Windows Ink).
+//! Unified pen + touch injection via Win32 synthetic pointer devices.
 //!
-//! Why one injector for both: the WinRT
-//! `Windows.UI.Input.Preview.Injection.InputInjector` class is **agile**
-//! (its methods are thread-safe and can be called from any thread without
-//! marshaling). By contrast Win32 `InjectTouchInput` has hard
-//! thread-affinity (the same thread that called `InitializeTouchInjection`
-//! must call `InjectTouchInput`); driving it from tokio's worker pool
-//! returns `E_INVALIDARG` because the worker thread shifts between awaits.
+//! Replaces the earlier `Windows.UI.Input.Preview.Injection.InputInjector`
+//! WinRT wrapper. The downstream effect is identical — Windows kernel
+//! routes synthetic pointer events to Windows Ink-aware apps the same way
+//! whether they originated from the WinRT wrapper or from a direct
+//! `InjectSyntheticPointerInput` call. We moved off WinRT because that
+//! layer was opaque about how it interpreted `PixelLocation` in 3+ monitor
+//! topologies (issue #3 reproducer: VDD's pen offset proportional to a
+//! third monitor's position in the virtual desktop). The Win32 API contract
+//! is documented: `POINTER_INFO.ptPixelLocation` is virtual-screen pixels,
+//! period.
 //!
-//! HANDOFF.md §2.3 #3 noted that the predecessor's Python build moved
-//! touch injection to Win32 because of misleading `winsdk` Python signatures
-//! for the WinRT touch API (`InitializeTouchInjection(mode)` single-arg vs.
-//! C# two-arg, `InjectTouchInput` iterable vs. single). Those signature
-//! issues are Python-bindings-only — `windows-rs` generates types directly
-//! from the WinRT IDL, so we can use the WinRT API uniformly here.
-//!
-//! Design choice: hold ONE `InputInjector` and call both
-//! `InitializePenInjection` and `InitializeTouchInjection` on it. The
-//! injector then accepts both `InjectPenInput` and `InjectTouchInput`
-//! across its lifetime.
+//! Wave-2 packaging note carried forward: `CreateSyntheticPointerDevice` is
+//! a documented user32 export with no `inputInjectionBrokered` capability
+//! requirement (that was a WinRT-side restriction). It works in unpackaged
+//! and packaged Win32 processes alike, as long as the process is not under
+//! a Service-context isolation that strips access to the active console
+//! session's input subsystem.
 
 use std::collections::{HashMap, HashSet};
 
+use windows::Win32::Foundation::POINT;
+use windows::Win32::UI::Controls::{
+    CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
+    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+};
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
 };
@@ -29,83 +32,94 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     VIRTUAL_KEY,
 };
-use windows::UI::Input::Preview::Injection::{
-    InjectedInputPenButtons, InjectedInputPenInfo, InjectedInputPenParameters, InjectedInputPoint,
-    InjectedInputPointerInfo, InjectedInputPointerOptions, InjectedInputTouchInfo,
-    InjectedInputTouchParameters, InjectedInputVisualizationMode,
-    InputInjector as WinRtInputInjector,
+use windows::Win32::UI::Input::Pointer::{
+    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
+    POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW, POINTER_FLAG_PRIMARY,
+    POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
-use windows_collections::IIterable;
+use windows::Win32::UI::WindowsAndMessaging::{
+    PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
+    TOUCH_MASK_NONE,
+};
 
 use crate::error::{EngineError, EngineResult};
 
 use super::binding::{Binding, PenButtonProfile};
 use super::{PenSample, TouchPoint};
 
-/// Unified pen + touch injector backed by `Windows.UI.Input.Preview.Injection.InputInjector`.
+/// Multi-touch device capacity. Win32 docs allow up to 256, but the kernel
+/// caps practical injection at MAX_TOUCH_COUNT=10. Matches the predecessor
+/// (HANDOFF §1.5) and is plenty for the MovinkPad's 10-finger panel.
+const MAX_TOUCH_CONTACTS: u32 = 10;
+
+/// Unified pen + touch injector backed by Win32 synthetic pointer devices.
 pub struct InputInjector {
-    injector: WinRtInputInjector,
-    /// Whether `InitializePenInjection` succeeded (gates the pen-side
-    /// teardown in `Drop`).
-    pen_initialized: bool,
-    /// Whether `InitializeTouchInjection` succeeded.
-    touch_initialized: bool,
+    /// `CreateSyntheticPointerDevice(PT_PEN, 1, …)` handle. Must outlive
+    /// every `InjectSyntheticPointerInput` we issue.
+    pen_device: HSYNTHETICPOINTERDEVICE,
+    /// `CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, …)`.
+    touch_device: HSYNTHETICPOINTERDEVICE,
 
     // --- pen flip-then-flush state (HANDOFF §1.5) ---
     last_pen_eraser: bool,
     last_pen_in_range: bool,
+    /// Tracks the previous `in_contact` separately from `in_range` so we can
+    /// emit the correct DOWN/UP/UPDATE transition bits — the WinRT layer
+    /// computed these internally, the Win32 contract makes us explicit.
+    last_pen_in_contact: bool,
 
     // --- pen-button state machine ---
-    /// Active binding profile for the three barrel buttons. Default is
-    /// `PenButtonProfile::default()` (Ctrl/Shift hold + EraserToggle on the
-    /// tertiary). The GUI will be able to swap this in Wave 4.
     pen_profile: PenButtonProfile,
-    /// Last seen barrel-button bitmask (bit 0 = barrel-1, bit 1 = barrel-2,
-    /// bit 2 = tertiary). Drives edge-triggered binding dispatch.
     last_pen_buttons: u8,
-    /// Sticky eraser flag toggled by a `Binding::EraserToggle` press. ORed
-    /// with `PenSample::eraser` (the physical eraser-end-of-stylus signal)
-    /// to produce the WinRT `Inverted` bit.
     pen_eraser_sticky: bool,
 
     // --- touch state machine ---
-    /// Last submitted snapshot keyed by contact id; used to fabricate
-    /// `New | PointerDown` for arrivals and `PointerUp` at the previous
-    /// position for departures.
     last_touch_pos: HashMap<u32, (i32, i32)>,
 }
 
-// SAFETY: WinRT InputInjector is agile; the only non-trivial state is the
-// HashMap and the bookkeeping bools, all of which are Send. We only ever
-// own this struct on one thread at a time.
+// SAFETY: Win32 synthetic pointer device handles are documented as usable
+// from any thread once created (unlike Win32 InjectTouchInput, which has
+// hard thread-affinity to whichever thread called InitializeTouchInjection).
+// We serialise calls through the session's `Mutex<InputInjector>` anyway.
 unsafe impl Send for InputInjector {}
 
 impl InputInjector {
-    /// Build the injector and initialise both pen and touch subsystems.
-    /// Sets `PER_MONITOR_AWARE_V2` process-wide so injected pixel coordinates
-    /// are physical pixels, not DIPs (gate-2 finding §4.4b).
+    /// Build the injector and register synthetic pointer devices for both
+    /// pen (max 1 simultaneous) and touch (max 10). Sets
+    /// `PER_MONITOR_AWARE_V2` process-wide so injected pixel coordinates are
+    /// physical pixels, not DIPs.
     pub fn new() -> EngineResult<Self> {
         // Process-wide; idempotent. Returns an error if already set, which
         // we ignore — that case means the host (Tauri) already configured
-        // it.
+        // a DPI awareness mode. Note: if the host set it to something other
+        // than per-monitor-aware-v2, we silently inherit that mode and
+        // ptPixelLocation will be interpreted as DIPs. The matching call
+        // in `Engine::start` enumerates monitors under the same context, so
+        // the input/output spaces stay consistent either way.
         let _ =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
-        let injector = WinRtInputInjector::TryCreate().map_err(EngineError::from)?;
-
-        injector
-            .InitializePenInjection(InjectedInputVisualizationMode::Default)
-            .map_err(EngineError::from)?;
-        injector
-            .InitializeTouchInjection(InjectedInputVisualizationMode::Default)
-            .map_err(EngineError::from)?;
+        let pen_device = unsafe {
+            CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
+                .map_err(EngineError::from)?
+        };
+        let touch_device = match unsafe {
+            CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, POINTER_FEEDBACK_DEFAULT)
+        } {
+            Ok(h) => h,
+            Err(e) => {
+                // Tear down the pen device before bailing — we own it now.
+                unsafe { DestroySyntheticPointerDevice(pen_device) };
+                return Err(EngineError::from(e));
+            }
+        };
 
         Ok(Self {
-            injector,
-            pen_initialized: true,
-            touch_initialized: true,
+            pen_device,
+            touch_device,
             last_pen_eraser: false,
             last_pen_in_range: false,
+            last_pen_in_contact: false,
             pen_profile: PenButtonProfile::default(),
             last_pen_buttons: 0,
             pen_eraser_sticky: false,
@@ -117,8 +131,6 @@ impl InputInjector {
     /// held by the previous profile via `Binding::KeyHold` are released
     /// before the swap so they don't get stuck.
     pub fn set_pen_profile(&mut self, profile: PenButtonProfile) {
-        // Release any held keys from the outgoing profile, by pretending
-        // every barrel button just went up.
         let bits_to_release = self.last_pen_buttons;
         for slot in 0u8..3 {
             let mask = 1u8 << slot;
@@ -138,21 +150,16 @@ impl InputInjector {
         self.pen_profile = profile;
     }
 
-    /// Inject one pen sample. Implements the eraser flip-then-flush
-    /// protocol from HANDOFF §1.5: when the eraser bit changes mid-stroke,
-    /// emit one synthetic out-of-range frame at the previous coordinates
-    /// (with the OLD eraser state) so the driver sees a clean `Inverted`
-    /// transition.
+    /// Inject one pen sample. Implements the eraser flip-then-flush protocol
+    /// from HANDOFF §1.5: when the eraser bit changes mid-stroke, emit one
+    /// synthetic out-of-range frame at the previous coordinates with the
+    /// OLD eraser state so the driver sees a clean `Inverted` transition.
     ///
     /// Also dispatches barrel-button transitions through the active
-    /// `PenButtonProfile` BEFORE the pen sample lands, so a Ctrl/Shift
-    /// modifier or an `EraserToggle` flip is in effect for that very
-    /// frame on the receiving app side.
+    /// `PenButtonProfile` BEFORE the pen sample lands.
     pub fn inject_pen(&mut self, sample: &PenSample) -> EngineResult<()> {
         self.dispatch_pen_buttons(sample.buttons)?;
 
-        // Combined eraser: physical eraser end of the stylus OR the sticky
-        // bit toggled by an `EraserToggle` barrel-button binding.
         let effective_eraser = sample.eraser || self.pen_eraser_sticky;
 
         if effective_eraser != self.last_pen_eraser && self.last_pen_in_range {
@@ -165,14 +172,11 @@ impl InputInjector {
         self.write_pen(sample, effective_eraser)?;
         self.last_pen_eraser = effective_eraser;
         self.last_pen_in_range = sample.in_range;
+        self.last_pen_in_contact = sample.in_contact;
         Ok(())
     }
 
-    /// Edge-triggered binding dispatch for the three barrel buttons. Press
-    /// edges (rising) trigger the active binding's "press" action; release
-    /// edges (falling) only matter for `KeyHold`, which sends the
-    /// corresponding keyup. `EraserToggle` flips `pen_eraser_sticky` on
-    /// rising edges only — release is a no-op.
+    /// Edge-triggered binding dispatch for the three barrel buttons.
     fn dispatch_pen_buttons(&mut self, now_bits: u8) -> EngineResult<()> {
         let prev = self.last_pen_buttons;
         let pressed_now = !prev & now_bits;
@@ -220,99 +224,92 @@ impl InputInjector {
     }
 
     fn write_pen(&self, sample: &PenSample, eraser: bool) -> EngineResult<()> {
-        let info = InjectedInputPenInfo::new().map_err(EngineError::from)?;
-
-        let mut opts = InjectedInputPointerOptions::None;
-        if sample.in_range {
-            opts |= InjectedInputPointerOptions::InRange;
-        }
-        if sample.in_contact {
-            opts =
-                opts | InjectedInputPointerOptions::InContact | InjectedInputPointerOptions::Update;
-        }
-        if !sample.in_range && !sample.in_contact {
-            opts |= InjectedInputPointerOptions::PointerUp;
+        // Both prior states false AND both new states false → nothing to
+        // synthesise. The Win32 API rejects a frame with neither INRANGE
+        // nor UP/DOWN as ERROR_INVALID_PARAMETER, whereas the WinRT layer
+        // tolerated it.
+        if !self.last_pen_in_range && !sample.in_range {
+            return Ok(());
         }
 
-        let pointer = InjectedInputPointerInfo {
-            PointerId: 1,
-            PointerOptions: opts,
-            PixelLocation: InjectedInputPoint {
-                PositionX: sample.x,
-                PositionY: sample.y,
+        let flags = pen_pointer_flags(
+            self.last_pen_in_range,
+            self.last_pen_in_contact,
+            sample.in_range,
+            sample.in_contact,
+        );
+
+        let pen_flags: u32 = if eraser { PEN_FLAG_INVERTED } else { 0 };
+        let pressure_1024 = (sample.pressure.clamp(0.0, 1.0) * 1024.0).round() as u32;
+        let tilt_x = sample.tilt_x_deg.clamp(-90, 90);
+        let tilt_y = sample.tilt_y_deg.clamp(-90, 90);
+
+        let pen_info = POINTER_PEN_INFO {
+            pointerInfo: POINTER_INFO {
+                pointerType: PT_PEN,
+                pointerId: 1,
+                pointerFlags: flags,
+                ptPixelLocation: POINT {
+                    x: sample.x,
+                    y: sample.y,
+                },
+                ..Default::default()
             },
-            TimeOffsetInMilliseconds: 0,
-            PerformanceCount: 0,
+            penFlags: pen_flags,
+            penMask: PEN_MASK_PRESSURE | PEN_MASK_TILT_X | PEN_MASK_TILT_Y,
+            pressure: pressure_1024,
+            rotation: 0,
+            tiltX: tilt_x,
+            tiltY: tilt_y,
         };
-        info.SetPointerInfo(pointer).map_err(EngineError::from)?;
 
-        let buttons = if eraser {
-            InjectedInputPenButtons::Inverted
-        } else {
-            InjectedInputPenButtons::None
+        let info = POINTER_TYPE_INFO {
+            r#type: PT_PEN,
+            Anonymous: POINTER_TYPE_INFO_0 { penInfo: pen_info },
         };
-        info.SetPenButtons(buttons).map_err(EngineError::from)?;
 
-        let params = InjectedInputPenParameters::Pressure
-            | InjectedInputPenParameters::TiltX
-            | InjectedInputPenParameters::TiltY;
-        info.SetPenParameters(params).map_err(EngineError::from)?;
-        info.SetPressure(sample.pressure as f64)
-            .map_err(EngineError::from)?;
-        info.SetTiltX(sample.tilt_x_deg)
-            .map_err(EngineError::from)?;
-        info.SetTiltY(sample.tilt_y_deg)
-            .map_err(EngineError::from)?;
-
-        self.injector
-            .InjectPenInput(&info)
-            .map_err(EngineError::from)?;
+        let infos = [info];
+        unsafe { InjectSyntheticPointerInput(self.pen_device, &infos).map_err(EngineError::from)? };
         Ok(())
     }
 
-    /// Inject a multi-touch snapshot. The struct compares against the
-    /// previous snapshot to compute the right `InjectedInputPointerOptions`
-    /// for each contact:
+    /// Inject a multi-touch snapshot. Diff against the previous snapshot to
+    /// compute per-contact transition bits:
     ///
-    /// - **New id** (not in previous): `New | InRange | InContact | PointerDown`
-    /// - **Persistent id** (in both): `InRange | InContact | Update`
-    /// - **Lost id** (in previous, missing now): `PointerUp` at the last
-    ///   known position
+    /// - **New id** (not in previous): `NEW | DOWN | INCONTACT | INRANGE | FIRSTBUTTON`
+    /// - **Persistent id** (in both): `UPDATE | INCONTACT | INRANGE | FIRSTBUTTON`
+    /// - **Lost id** (in previous, missing now): `UP` at the last known position
     ///
-    /// The first contact in the snapshot also gets `Primary`.
-    ///
-    /// `state` field on `TouchPoint` is **ignored** — the diff overrides
-    /// whatever the caller passed.
+    /// The first contact in the snapshot also gets `PRIMARY`. `state` field
+    /// on `TouchPoint` is **ignored** — the diff overrides whatever the caller
+    /// passed.
     pub fn inject_touch(&mut self, snapshot: &[TouchPoint]) -> EngineResult<()> {
-        // No contacts and no previous contacts → nothing to inject.
         if snapshot.is_empty() && self.last_touch_pos.is_empty() {
             return Ok(());
         }
 
-        let mut infos: Vec<InjectedInputTouchInfo> = Vec::new();
+        let mut infos: Vec<POINTER_TYPE_INFO> = Vec::new();
         let mut current_ids: HashSet<u32> = HashSet::with_capacity(snapshot.len());
 
         // 1. Down / Update for every contact in the new snapshot.
         for (i, tp) in snapshot.iter().enumerate() {
             current_ids.insert(tp.id);
             let was_down = self.last_touch_pos.contains_key(&tp.id);
-            let mut opts =
-                InjectedInputPointerOptions::InRange | InjectedInputPointerOptions::InContact;
+            let mut flags =
+                POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
             if was_down {
-                opts |= InjectedInputPointerOptions::Update;
+                flags |= POINTER_FLAG_UPDATE;
             } else {
-                opts = opts
-                    | InjectedInputPointerOptions::New
-                    | InjectedInputPointerOptions::PointerDown;
+                flags |= POINTER_FLAG_NEW | POINTER_FLAG_DOWN;
             }
             if i == 0 {
-                opts |= InjectedInputPointerOptions::Primary;
+                flags |= POINTER_FLAG_PRIMARY;
             }
-            infos.push(make_touch_info(tp.id, tp.x, tp.y, opts)?);
+            infos.push(make_touch_info(tp.id, tp.x, tp.y, flags));
         }
 
         // 2. Up for ids that disappeared this frame, using the last known
-        //    position.
+        //    position (Win32 requires UP at a real coord, not (0,0)).
         let mut lost: Vec<(u32, i32, i32)> = Vec::new();
         for (id, pos) in self.last_touch_pos.iter() {
             if !current_ids.contains(id) {
@@ -320,29 +317,19 @@ impl InputInjector {
             }
         }
         for (id, x, y) in lost {
-            infos.push(make_touch_info(
-                id,
-                x,
-                y,
-                InjectedInputPointerOptions::PointerUp,
-            )?);
+            infos.push(make_touch_info(id, x, y, POINTER_FLAG_UP));
         }
 
         if infos.is_empty() {
             return Ok(());
         }
+        // Hard ceiling per CreateSyntheticPointerDevice's maxCount.
+        debug_assert!(infos.len() <= MAX_TOUCH_CONTACTS as usize);
 
-        // 3. Wrap as IIterable<InjectedInputTouchInfo> and inject.
-        //    `T::Default` for an interface/class type is `Option<T>`, so we
-        //    map each value into `Some` for the `From<Vec<T::Default>>`
-        //    impl.
-        let optional: Vec<Option<InjectedInputTouchInfo>> = infos.into_iter().map(Some).collect();
-        let iterable: IIterable<InjectedInputTouchInfo> = optional.into();
-        self.injector
-            .InjectTouchInput(&iterable)
-            .map_err(EngineError::from)?;
+        unsafe {
+            InjectSyntheticPointerInput(self.touch_device, &infos).map_err(EngineError::from)?
+        };
 
-        // 4. Update last_touch_pos to mirror the new snapshot.
         self.last_touch_pos.clear();
         for tp in snapshot {
             self.last_touch_pos.insert(tp.id, (tp.x, tp.y));
@@ -353,19 +340,92 @@ impl InputInjector {
 
 impl Drop for InputInjector {
     fn drop(&mut self) {
-        if self.touch_initialized {
-            let _ = self.injector.UninitializeTouchInjection();
-        }
-        if self.pen_initialized {
-            let _ = self.injector.UninitializePenInjection();
+        unsafe {
+            DestroySyntheticPointerDevice(self.touch_device);
+            DestroySyntheticPointerDevice(self.pen_device);
         }
     }
 }
 
+/// Compose the per-frame pointer-flag set for a pen sample given the
+/// previous and current `(in_range, in_contact)` states. Pure function so
+/// the transition matrix is unit-testable without spinning up a real
+/// pointer device.
+fn pen_pointer_flags(
+    was_in_range: bool,
+    was_in_contact: bool,
+    in_range: bool,
+    in_contact: bool,
+) -> POINTER_FLAGS {
+    if !in_range {
+        // Leaving proximity (or already gone). UP is the documented terminal
+        // transition; INRANGE is intentionally cleared.
+        return POINTER_FLAG_UP;
+    }
+
+    let mut flags = POINTER_FLAG_INRANGE;
+    if !was_in_range {
+        flags |= POINTER_FLAG_NEW;
+    }
+    if in_contact {
+        flags |= POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON;
+        if was_in_contact {
+            flags |= POINTER_FLAG_UPDATE;
+        } else {
+            flags |= POINTER_FLAG_DOWN;
+        }
+    } else if was_in_contact {
+        // Contact → hover-only: lift but stay in range.
+        flags |= POINTER_FLAG_UP;
+    } else {
+        flags |= POINTER_FLAG_UPDATE;
+    }
+    flags
+}
+
+/// Build a single touch contact's POINTER_TYPE_INFO. Contact rect is the
+/// pixel itself (1×1) — we don't have geometric contact-area data from the
+/// Android side, and apps that don't query rcContact are unaffected.
+fn make_touch_info(id: u32, x: i32, y: i32, flags: POINTER_FLAGS) -> POINTER_TYPE_INFO {
+    let touch_info = POINTER_TOUCH_INFO {
+        pointerInfo: POINTER_INFO {
+            pointerType: PT_TOUCH,
+            pointerId: id,
+            pointerFlags: flags,
+            ptPixelLocation: POINT { x, y },
+            ..Default::default()
+        },
+        touchFlags: 0,
+        touchMask: TOUCH_MASK_NONE,
+        rcContact: windows::Win32::Foundation::RECT {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + 1,
+        },
+        rcContactRaw: windows::Win32::Foundation::RECT {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + 1,
+        },
+        orientation: 0,
+        pressure: 0,
+    };
+
+    POINTER_TYPE_INFO {
+        r#type: PT_TOUCH,
+        Anonymous: POINTER_TYPE_INFO_0 {
+            touchInfo: touch_info,
+        },
+    }
+}
+
 /// One `SendInput` keyboard event. `down=true` is keydown, `false` is keyup.
-/// We use `SendInput` rather than the WinRT injector because pen-button
-/// modifier keys must look like a real keyboard to apps like Krita that
-/// only honour modifiers during ongoing pen contact (HANDOFF §2.3 #4).
+/// We use `SendInput` rather than the synthetic pointer path because
+/// pen-button modifier keys must look like a real keyboard to apps like
+/// Krita that only honour modifiers during ongoing pen contact (HANDOFF §2.3
+/// #4).
 fn send_key(vk: VIRTUAL_KEY, down: bool) -> EngineResult<()> {
     let flags = if down {
         KEYBD_EVENT_FLAGS(0)
@@ -392,46 +452,68 @@ fn send_key(vk: VIRTUAL_KEY, down: bool) -> EngineResult<()> {
     Ok(())
 }
 
-fn make_touch_info(
-    id: u32,
-    x: i32,
-    y: i32,
-    options: InjectedInputPointerOptions,
-) -> EngineResult<InjectedInputTouchInfo> {
-    let info = InjectedInputTouchInfo::new().map_err(EngineError::from)?;
-    let pointer = InjectedInputPointerInfo {
-        PointerId: id,
-        PointerOptions: options,
-        PixelLocation: InjectedInputPoint {
-            PositionX: x,
-            PositionY: y,
-        },
-        TimeOffsetInMilliseconds: 0,
-        PerformanceCount: 0,
-    };
-    info.SetPointerInfo(pointer).map_err(EngineError::from)?;
-    // No pressure / orientation provided — leave TouchParameters at None.
-    info.SetTouchParameters(InjectedInputTouchParameters::None)
-        .map_err(EngineError::from)?;
-    Ok(info)
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::TouchState;
     use super::*;
 
-    /// Smoke: build the unified injector. Initialises COM apartment if the
-    /// harness hasn't.
+    #[test]
+    fn pen_flags_hover_arrival() {
+        // Pen first appears in range, no contact — NEW | INRANGE | UPDATE.
+        let f = pen_pointer_flags(false, false, true, false);
+        assert!(f & POINTER_FLAG_NEW != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INRANGE != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_UPDATE != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INCONTACT == POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_contact_arrival_without_hover() {
+        // Pen jumps directly from out-of-range to contact (rare but possible
+        // when the Android side coalesces the hover frame).
+        let f = pen_pointer_flags(false, false, true, true);
+        assert!(f & POINTER_FLAG_NEW != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_DOWN != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INCONTACT != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_FIRSTBUTTON != POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_hover_to_contact_emits_down() {
+        let f = pen_pointer_flags(true, false, true, true);
+        assert!(f & POINTER_FLAG_DOWN != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_NEW == POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_contact_continuing_emits_update() {
+        let f = pen_pointer_flags(true, true, true, true);
+        assert!(f & POINTER_FLAG_UPDATE != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_DOWN == POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INCONTACT != POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_contact_to_hover_emits_up_inrange() {
+        // Lift-but-still-detected: UP transition while INRANGE persists.
+        let f = pen_pointer_flags(true, true, true, false);
+        assert!(f & POINTER_FLAG_UP != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INRANGE != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INCONTACT == POINTER_FLAGS(0));
+    }
+
+    #[test]
+    fn pen_flags_leave_proximity_drops_inrange() {
+        let f = pen_pointer_flags(true, false, false, false);
+        assert!(f & POINTER_FLAG_UP != POINTER_FLAGS(0));
+        assert!(f & POINTER_FLAG_INRANGE == POINTER_FLAGS(0));
+    }
+
+    /// Smoke: build the unified injector. The only failure modes here are
+    /// ones we can't fix from inside the test (Service-isolated context, or
+    /// a stripped-down WinPE shell with no input subsystem).
     #[test]
     fn create_injector() {
-        let _ = unsafe {
-            windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_MULTITHREADED,
-            )
-            .ok()
-        };
         match InputInjector::new() {
             Ok(_) => {}
             Err(EngineError::Win32(e)) => {
@@ -445,13 +527,6 @@ mod tests {
     /// (1, 1). Cursor blip is the same as the gate-3 probe, harmless.
     #[test]
     fn pen_and_touch_smoke() {
-        let _ = unsafe {
-            windows::Win32::System::Com::CoInitializeEx(
-                None,
-                windows::Win32::System::Com::COINIT_MULTITHREADED,
-            )
-            .ok()
-        };
         let mut inj = match InputInjector::new() {
             Ok(i) => i,
             Err(EngineError::Win32(e)) => {
@@ -482,7 +557,6 @@ mod tests {
             state: TouchState::Update,
         }];
         inj.inject_touch(&touch_down).expect("touch down");
-        // Lift it.
         inj.inject_touch(&[]).expect("touch up");
     }
 }
