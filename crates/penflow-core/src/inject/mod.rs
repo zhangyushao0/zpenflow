@@ -1,18 +1,22 @@
 //! Pen + touch input injection.
 //!
-//! `win_ink` is the unified backend: a single WinRT
-//! `Windows.UI.Input.Preview.Injection.InputInjector` instance handles both
-//! pen pressure / tilt / hover / buttons / eraser AND multi-touch contacts.
-//! Gate-3-proven (HANDOFF §3.3 / §5.1) for the pen path; touch is the same
-//! WinRT API.
+//! `win_ink` is the unified backend: two Win32 synthetic pointer devices
+//! (one PT_PEN, one PT_TOUCH) registered via `CreateSyntheticPointerDevice`,
+//! driven by `InjectSyntheticPointerInput`. Pen path supplies pressure /
+//! tilt / hover / eraser; touch path handles up to 10 simultaneous contacts.
 //!
-//! Predecessor used Win32 `InjectTouchInput` for touch (HANDOFF §2.3 #3)
-//! to dodge Python `winsdk` signature ambiguities. Those don't apply to
-//! `windows-rs`, and Win32's hard thread-affinity rule (the calling thread
-//! that ran `InitializeTouchInjection` must be the only thread that ever
-//! calls `InjectTouchInput`) is incompatible with tokio's worker-thread
-//! shuffling. WinRT's `InputInjector` is **agile** so we can drive it
-//! freely from any tokio task.
+//! Why not the WinRT `InputInjector` wrapper anymore: it interposed
+//! undocumented coordinate-space handling between us and the kernel,
+//! producing a position-dependent offset on 3+ monitor virtual desktops
+//! (issue #3). The Win32 path is documented to take virtual-screen pixels
+//! verbatim. The downstream apps (Krita, OneNote, anything Windows
+//! Ink-aware) consume identical pointer messages either way — we just
+//! removed a layer of opaque wrapping.
+//!
+//! `InjectSyntheticPointerInput` does not have the hard thread-affinity
+//! rule that the older Win32 `InjectTouchInput` did (HANDOFF §2.3 #3), so
+//! we can drive it from any tokio worker through the session's
+//! `Mutex<InputInjector>` like before.
 //!
 //! Cross-cutting helpers:
 //!   - `coords::AffineTransform` — input area → output area mapping.
@@ -27,7 +31,7 @@ pub mod win_ink;
 use std::time::Instant;
 
 /// One pen sample after coordinate transform — i.e., already in virtual-screen
-/// pixels and ready for WinRT `InputInjector`.
+/// pixels and ready for `InjectSyntheticPointerInput`.
 #[derive(Clone, Copy, Debug)]
 pub struct PenSample {
     pub x: i32,
@@ -43,7 +47,7 @@ pub struct PenSample {
     /// True iff the **physical eraser end** of the stylus is in use (Android
     /// reports `MotionEvent.TOOL_TYPE_ERASER`). The barrel-button-driven
     /// "eraser toggle" is handled separately inside the injector via the
-    /// active `PenButtonProfile`; both contribute to the WinRT `Inverted`
+    /// active `PenButtonProfile`; both contribute to the `PEN_FLAG_INVERTED`
     /// bit. HANDOFF §1.5 "flip-then-flush" still applies — a one-frame
     /// out-of-range sample is emitted whenever the *combined* eraser state
     /// changes.
