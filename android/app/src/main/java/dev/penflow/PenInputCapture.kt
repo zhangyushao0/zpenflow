@@ -96,12 +96,21 @@ class PenInputCapture(
 
         // pressure & orientation/tilt are reported per-pointer
         val pressure = ev.getPressure(penIndex).coerceIn(0f, 1f)
-        // Android encodes tilt as a single AXIS_TILT (radians, 0..π/2 with
-        // AXIS_ORIENTATION giving the direction). Convert to (tiltX, tiltY).
-        val tilt = ev.getAxisValue(MotionEvent.AXIS_TILT, penIndex)
+        // Android reports AXIS_TILT in **radians** (0..π/2; 0 = perpendicular,
+        // π/2 = laying flat) and AXIS_ORIENTATION in **radians** for the
+        // azimuth. The wire protocol carries Tilt-X / Tilt-Y in **degrees**
+        // (signed, ±90 max) — that's what the PC injector forwards verbatim
+        // to `POINTER_PEN_INFO.tiltX/tiltY`, which Win32 also documents as
+        // degrees. Decompose tilt into X/Y components AND convert to degrees
+        // here; the previous code skipped the radians→degrees step, which
+        // meant we were sending values in the [-1.57, +1.57] range as if
+        // they were degrees and tilt-aware brushes (Rebelle, Clip Studio
+        // Paint) saw effectively zero tilt (issue #5).
+        val tiltRad = ev.getAxisValue(MotionEvent.AXIS_TILT, penIndex)
         val orient = ev.getAxisValue(MotionEvent.AXIS_ORIENTATION, penIndex)
-        val tiltX = (Math.sin(orient.toDouble()) * tilt).toFloat()
-        val tiltY = (-Math.cos(orient.toDouble()) * tilt).toFloat()
+        val tiltDeg = Math.toDegrees(tiltRad.toDouble())
+        val tiltX = (Math.sin(orient.toDouble()) * tiltDeg).toFloat()
+        val tiltY = (-Math.cos(orient.toDouble()) * tiltDeg).toFloat()
 
         val rawButtons = ev.buttonState
         val newPrimary = (rawButtons and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
