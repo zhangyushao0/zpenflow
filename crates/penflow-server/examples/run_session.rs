@@ -179,6 +179,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         // from `Settings::vdd_resolution` for the production path.
         vdd_target_resolution: None,
         hud_enabled: true,
+        pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
     };
 
     // Subscribe to lifecycle events so the operator sees them.
