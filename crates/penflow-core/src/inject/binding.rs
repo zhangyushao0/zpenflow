@@ -31,8 +31,12 @@ pub enum Binding {
     None,
     /// Send `keydown(vk); keyup(vk)` once per button press.
     KeyTap(VIRTUAL_KEY),
-    /// Send `keydown(vk)` on press, `keyup(vk)` on release.
-    KeyHold(VIRTUAL_KEY),
+    /// Hold one or more keys for the lifetime of the press. On press, each
+    /// key is sent down in order; on release, each is sent up in reverse
+    /// order (so a `Ctrl+Shift` hold releases Shift before Ctrl, matching
+    /// the natural "release inner modifier first" expectation). A
+    /// single-key hold is just a one-element `Vec`.
+    KeyHold(Vec<VIRTUAL_KEY>),
     /// Send all keys down, then all up, in order. Useful for `Ctrl+Z` style.
     KeyChord(Vec<VIRTUAL_KEY>),
     /// Hold a synthetic mouse button while the barrel is pressed: down on
@@ -77,8 +81,8 @@ impl Default for PenButtonProfile {
     /// tertiary button on physical Wacom tablets.
     fn default() -> Self {
         Self {
-            barrel_1: Binding::KeyHold(VK_CONTROL),
-            barrel_2: Binding::KeyHold(VK_SHIFT),
+            barrel_1: Binding::KeyHold(vec![VK_CONTROL]),
+            barrel_2: Binding::KeyHold(vec![VK_SHIFT]),
             tertiary: Binding::KeyTap(VK_E),
             tip_threshold: 0.0,
         }
@@ -91,8 +95,8 @@ impl PenButtonProfile {
     /// want bit-for-bit compatibility while migrating from the old build.
     pub fn predecessor_compat() -> Self {
         Self {
-            barrel_1: Binding::KeyHold(VK_CONTROL),
-            barrel_2: Binding::KeyHold(VK_SHIFT),
+            barrel_1: Binding::KeyHold(vec![VK_CONTROL]),
+            barrel_2: Binding::KeyHold(vec![VK_SHIFT]),
             tertiary: Binding::KeyTap(VK_E),
             tip_threshold: 0.0,
         }
@@ -106,8 +110,14 @@ mod tests {
     #[test]
     fn default_profile_matches_design_recommendation() {
         let p = PenButtonProfile::default();
-        assert!(matches!(p.barrel_1, Binding::KeyHold(VK_CONTROL)));
-        assert!(matches!(p.barrel_2, Binding::KeyHold(VK_SHIFT)));
+        match &p.barrel_1 {
+            Binding::KeyHold(keys) => assert_eq!(keys.as_slice(), &[VK_CONTROL]),
+            other => panic!("expected KeyHold([VK_CONTROL]), got {other:?}"),
+        }
+        match &p.barrel_2 {
+            Binding::KeyHold(keys) => assert_eq!(keys.as_slice(), &[VK_SHIFT]),
+            other => panic!("expected KeyHold([VK_SHIFT]), got {other:?}"),
+        }
         assert!(matches!(p.tertiary, Binding::KeyTap(VK_E)));
         assert_eq!(p.tip_threshold, 0.0);
     }

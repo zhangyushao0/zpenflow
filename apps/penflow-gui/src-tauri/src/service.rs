@@ -412,18 +412,7 @@ fn convert_binding(b: &settings::Binding) -> CoreBinding {
             }
         },
         settings::Binding::KeyHold { key } => match parse_key_combo(key) {
-            Some(keys) if keys.len() == 1 => CoreBinding::KeyHold(keys[0]),
-            Some(keys) if keys.len() > 1 => {
-                // Multi-key hold isn't representable in the current engine
-                // `Binding` enum (only single-VK `KeyHold`). Fall back to a
-                // chord (down-then-up burst on press) so the binding does
-                // *something* recognisable; document the limitation.
-                eprintln!(
-                    "[bindings] multi-key Hold '{key}' degrades to KeyChord — \
-                     true held-modifier semantics not yet supported"
-                );
-                CoreBinding::KeyChord(keys)
-            }
+            Some(keys) if !keys.is_empty() => CoreBinding::KeyHold(keys),
             _ => {
                 eprintln!("[bindings] unrecognised KeyHold spec '{key}'; mapping to None");
                 CoreBinding::None
@@ -593,8 +582,21 @@ mod tests {
     fn convert_keyhold_single_key_keeps_keyhold() {
         let b = settings::Binding::KeyHold { key: "Ctrl".into() };
         match convert_binding(&b) {
-            CoreBinding::KeyHold(vk) => assert_eq!(vk, VK_CONTROL),
-            other => panic!("expected KeyHold(VK_CONTROL), got {other:?}"),
+            CoreBinding::KeyHold(keys) => assert_eq!(keys.as_slice(), &[VK_CONTROL]),
+            other => panic!("expected KeyHold([VK_CONTROL]), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_keyhold_multi_key_preserves_full_combo() {
+        let b = settings::Binding::KeyHold {
+            key: "Ctrl+Shift".into(),
+        };
+        match convert_binding(&b) {
+            CoreBinding::KeyHold(keys) => {
+                assert_eq!(keys.as_slice(), &[VK_CONTROL, VK_SHIFT]);
+            }
+            other => panic!("expected KeyHold([VK_CONTROL, VK_SHIFT]), got {other:?}"),
         }
     }
 

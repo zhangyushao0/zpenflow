@@ -145,8 +145,10 @@ impl InputInjector {
                 _ => &self.pen_profile.tertiary,
             };
             match binding {
-                Binding::KeyHold(vk) => {
-                    let _ = send_key(*vk, false);
+                Binding::KeyHold(keys) => {
+                    for vk in keys.iter().rev() {
+                        let _ = send_key(*vk, false);
+                    }
                 }
                 Binding::MouseButton(kind) => {
                     let _ = send_mouse_button(*kind, false);
@@ -205,7 +207,14 @@ impl InputInjector {
                         send_key(*vk, true)?;
                         send_key(*vk, false)?;
                     }
-                    Binding::KeyHold(vk) => send_key(*vk, true)?,
+                    Binding::KeyHold(keys) => {
+                        // Send each key down in declared order. Release
+                        // happens below in the falling-edge branch — same
+                        // keys, reverse order.
+                        for vk in keys {
+                            send_key(*vk, true)?;
+                        }
+                    }
                     Binding::KeyChord(keys) => {
                         for vk in keys {
                             send_key(*vk, true)?;
@@ -223,7 +232,16 @@ impl InputInjector {
 
             if released_now & mask != 0 {
                 match binding {
-                    Binding::KeyHold(vk) => send_key(*vk, false)?,
+                    Binding::KeyHold(keys) => {
+                        // Reverse-order release so that, for `Ctrl+Shift`,
+                        // Shift releases first and Ctrl second — matches
+                        // what users actually do on a keyboard and avoids
+                        // a brief "just Ctrl" window between releases that
+                        // some apps treat as a tool-mode change.
+                        for vk in keys.iter().rev() {
+                            send_key(*vk, false)?;
+                        }
+                    }
                     Binding::MouseButton(kind) => send_mouse_button(*kind, false)?,
                     _ => {}
                 }
