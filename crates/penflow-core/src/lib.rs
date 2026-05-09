@@ -14,6 +14,8 @@ pub mod capture;
 #[cfg(windows)]
 pub mod color;
 #[cfg(windows)]
+pub mod cursor_blit;
+#[cfg(windows)]
 pub mod d3d11;
 #[cfg(windows)]
 pub mod encoder;
