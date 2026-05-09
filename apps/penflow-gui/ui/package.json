@@ -1,7 +1,7 @@
 {
     "name": "penflow-gui-ui",
     "private": true,
-    "version": "0.1.1",
+    "version": "0.1.2",
     "type": "module",
     "description": "Penflow desktop GUI frontend (React + Fluent UI v9, Vite-bundled).",
     "scripts": {
