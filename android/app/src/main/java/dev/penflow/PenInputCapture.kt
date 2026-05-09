@@ -16,6 +16,19 @@ import android.view.MotionEvent
  *
  * The chord-detection fallback is kept as a defensive code path in case we
  * ever encounter older firmware that does encode btn3 as a chord.
+ *
+ * **Pointer-index handling**: Android merges pen and finger events into the
+ * same [MotionEvent] when they happen simultaneously. The "primary pointer"
+ * (index 0) is whichever physical contact landed first — if the user's palm
+ * touches before the pen tip, the palm becomes index 0 and the pen ends up
+ * at a higher index. The earlier `getToolType(0)` check made us drop the
+ * entire event in that case (visible symptom: strokes leaving no mark when
+ * the palm rests on the screen first). We now scan all pointers, latch on
+ * the first STYLUS/ERASER index, and decode phase from the action's
+ * `actionIndex` relative to that — preserving correct DOWN/UP transitions
+ * when fingers join or leave a gesture mid-stroke. This is the
+ * software-side analogue of the firmware-level "pen present → suppress
+ * touch" behaviour real Wacom tablets do in hardware.
  */
 class PenInputCapture(
     private val viewWidth: () -> Int,
@@ -47,28 +60,34 @@ class PenInputCapture(
     )
 
     fun consume(ev: MotionEvent): Boolean {
-        if (ev.getToolType(0) !in TOOL_TYPES) return false
+        // Find the stylus pointer at any index — not just 0. With palm-first
+        // contact, the pen lands at index 1+ and the old `getToolType(0)`
+        // check would silently drop the entire stroke.
+        val penIndex = findPenIndex(ev)
+        if (penIndex < 0) return false
 
-        val tool = if (ev.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER) 1 else 0
-        val phase = mapPhase(ev.actionMasked)
+        val tool = if (ev.getToolType(penIndex) == MotionEvent.TOOL_TYPE_ERASER) 1 else 0
+        val phase = mapPhase(ev, penIndex)
 
         // Dead-zone gate: suppress new DOWN/HOVER samples that land within
         // DEAD_ZONE_PX of the last UP, within DEAD_ZONE_MS. Tap-then-tap
         // sequences come through reliably (separated by enough time);
         // accidental "fast lift, finger trembled, brief re-contact" does
         // not (HANDOFF §1.3 / design §10.7).
+        val penX = ev.getX(penIndex)
+        val penY = ev.getY(penIndex)
         val isFreshContact = phase == 1 || phase == 0  // DOWN or HOVER_*
         if (isFreshContact && !lastUpX.isNaN()) {
-            val dx = ev.x - lastUpX
-            val dy = ev.y - lastUpY
+            val dx = penX - lastUpX
+            val dy = penY - lastUpY
             val dt = ev.eventTime - lastUpTimeMs
             if (dt < DEAD_ZONE_MS && (dx * dx + dy * dy) < DEAD_ZONE_PX_SQ) {
                 return true  // consume but emit nothing
             }
         }
-        if (phase == 3) {  // ACTION_UP
-            lastUpX = ev.x
-            lastUpY = ev.y
+        if (phase == 3) {  // UP at the pen's index
+            lastUpX = penX
+            lastUpY = penY
             lastUpTimeMs = ev.eventTime
         }
 
@@ -76,11 +95,11 @@ class PenInputCapture(
         val h = viewHeight().coerceAtLeast(1).toFloat()
 
         // pressure & orientation/tilt are reported per-pointer
-        val pressure = ev.pressure.coerceIn(0f, 1f)
+        val pressure = ev.getPressure(penIndex).coerceIn(0f, 1f)
         // Android encodes tilt as a single AXIS_TILT (radians, 0..π/2 with
         // AXIS_ORIENTATION giving the direction). Convert to (tiltX, tiltY).
-        val tilt = ev.getAxisValue(MotionEvent.AXIS_TILT)
-        val orient = ev.getAxisValue(MotionEvent.AXIS_ORIENTATION)
+        val tilt = ev.getAxisValue(MotionEvent.AXIS_TILT, penIndex)
+        val orient = ev.getAxisValue(MotionEvent.AXIS_ORIENTATION, penIndex)
         val tiltX = (Math.sin(orient.toDouble()) * tilt).toFloat()
         val tiltY = (-Math.cos(orient.toDouble()) * tilt).toFloat()
 
@@ -107,9 +126,9 @@ class PenInputCapture(
                 PenSample(
                     tsNs = ev.getHistoricalEventTime(i) * 1_000_000L,
                     phase = phase,
-                    xNorm = (ev.getHistoricalX(0, i) / w).coerceIn(0f, 1f),
-                    yNorm = (ev.getHistoricalY(0, i) / h).coerceIn(0f, 1f),
-                    pressure = ev.getHistoricalPressure(0, i).coerceIn(0f, 1f),
+                    xNorm = (ev.getHistoricalX(penIndex, i) / w).coerceIn(0f, 1f),
+                    yNorm = (ev.getHistoricalY(penIndex, i) / h).coerceIn(0f, 1f),
+                    pressure = ev.getHistoricalPressure(penIndex, i).coerceIn(0f, 1f),
                     tiltX = tiltX,
                     tiltY = tiltY,
                     buttons = decodedButtons,
@@ -122,8 +141,8 @@ class PenInputCapture(
             PenSample(
                 tsNs = ev.eventTime * 1_000_000L,
                 phase = phase,
-                xNorm = (ev.x / w).coerceIn(0f, 1f),
-                yNorm = (ev.y / h).coerceIn(0f, 1f),
+                xNorm = (penX / w).coerceIn(0f, 1f),
+                yNorm = (penY / h).coerceIn(0f, 1f),
                 pressure = pressure,
                 tiltX = tiltX,
                 tiltY = tiltY,
@@ -134,13 +153,38 @@ class PenInputCapture(
         return true
     }
 
-    private fun mapPhase(action: Int): Int = when (action) {
-        MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> 0
-        MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> 1
-        MotionEvent.ACTION_MOVE -> 2
-        MotionEvent.ACTION_UP, MotionEvent.ACTION_POINTER_UP -> 3
-        MotionEvent.ACTION_HOVER_EXIT, MotionEvent.ACTION_CANCEL -> 4
-        else -> 2
+    /** First pointer index whose toolType is STYLUS or ERASER, or -1. */
+    private fun findPenIndex(ev: MotionEvent): Int {
+        for (i in 0 until ev.pointerCount) {
+            if (ev.getToolType(i) in TOOL_TYPES) return i
+        }
+        return -1
+    }
+
+    /**
+     * Map an Android action to our wire phase, considering whether the
+     * action is about the pen pointer or about another (finger) pointer
+     * coexisting with it.
+     *
+     * `ACTION_POINTER_DOWN` / `ACTION_POINTER_UP` carry an [actionIndex];
+     * if it matches `penIndex`, the pen itself is going down/up. If it
+     * doesn't, a non-pen pointer joined or left a gesture and the pen
+     * state is unchanged — we emit `move` so the PC keeps tracking the
+     * pen's coordinates without spurious DOWN/UP transitions.
+     */
+    private fun mapPhase(ev: MotionEvent, penIndex: Int): Int {
+        val action = ev.actionMasked
+        val isPenAction = ev.actionIndex == penIndex
+        return when (action) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> 0
+            MotionEvent.ACTION_DOWN -> if (isPenAction) 1 else 2
+            MotionEvent.ACTION_POINTER_DOWN -> if (isPenAction) 1 else 2
+            MotionEvent.ACTION_MOVE -> 2
+            MotionEvent.ACTION_UP -> if (isPenAction) 3 else 2
+            MotionEvent.ACTION_POINTER_UP -> if (isPenAction) 3 else 2
+            MotionEvent.ACTION_HOVER_EXIT, MotionEvent.ACTION_CANCEL -> 4
+            else -> 2
+        }
     }
 
     /**

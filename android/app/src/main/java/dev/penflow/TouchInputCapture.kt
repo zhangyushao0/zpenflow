@@ -18,8 +18,13 @@ import android.view.MotionEvent
  * event for the action-index lookup). On `ACTION_CANCEL` we emit an empty
  * snapshot so the server lifts everything.
  *
- * Filters by index-0 toolType: only TOOL_TYPE_FINGER events are forwarded as
- * touch. Stylus events are handled by [PenInputCapture].
+ * Stylus / pen events are handled exclusively by [PenInputCapture] — the
+ * activity dispatches to it first, so by the time we run the event has no
+ * stylus pointers in it. As cheap defence-in-depth we still filter the
+ * per-contact loop to `TOOL_TYPE_FINGER`, in case an event slips through
+ * with mixed tool types (e.g. a `TOOL_TYPE_PALM` at index 0 plus real
+ * fingers at higher indices) and we'd otherwise inject a non-finger
+ * coordinate as a touch contact on the PC.
  */
 class TouchInputCapture(
     private val viewWidth: () -> Int,
@@ -55,6 +60,11 @@ class TouchInputCapture(
                 val list = ArrayList<Protocol.TouchContact>(n)
                 for (i in 0 until n) {
                     if (i == liftedIndex) continue
+                    // Only forward genuine finger contacts — drops any
+                    // stylus/eraser/palm pointer that managed to coexist
+                    // with fingers in this event so we never inject a
+                    // non-finger position as a touch on the PC side.
+                    if (ev.getToolType(i) != MotionEvent.TOOL_TYPE_FINGER) continue
                     list.add(
                         Protocol.TouchContact(
                             pointerId = ev.getPointerId(i),
