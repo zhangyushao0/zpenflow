@@ -7,9 +7,21 @@
 //! `InjectSyntheticPointerInput` call. We moved off WinRT because that
 //! layer was opaque about how it interpreted `PixelLocation` in 3+ monitor
 //! topologies (issue #3 reproducer: VDD's pen offset proportional to a
-//! third monitor's position in the virtual desktop). The Win32 API contract
-//! is documented: `POINTER_INFO.ptPixelLocation` is virtual-screen pixels,
-//! period.
+//! third monitor's position in the virtual desktop).
+//!
+//! Coordinate-space note (issue #16): MSDN documents
+//! `POINTER_INFO.ptPixelLocation` as virtual-desktop pixels — primary
+//! monitor's top-left = (0, 0), with negative coords allowed for monitors
+//! above/left of primary. The kernel synthetic-pointer router does NOT
+//! follow this convention: it treats `ptPixelLocation` as offset from the
+//! **virtual-screen bounding box** (i.e., from
+//! `(SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN)`). When the topology has any
+//! monitor extending above or left of primary, the two spaces differ by
+//! exactly that origin, and pen strokes land the same delta away from the
+//! pen tip (issue #16: 4K monitor taller than primary → primary's `top` is
+//! negative in DXGI coords → injected coords land ~3 cm above the physical
+//! touch on the VDD). We translate primary-relative → bbox-relative inside
+//! `virtual_screen_origin()`.
 //!
 //! Wave-2 packaging note carried forward: `CreateSyntheticPointerDevice` is
 //! a documented user32 export with no `inputInjectionBrokered` capability
@@ -40,8 +52,8 @@ use windows::Win32::UI::Input::Pointer::{
     POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y, PT_PEN, PT_TOUCH,
-    TOUCH_MASK_NONE,
+    GetSystemMetrics, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
+    PT_PEN, PT_TOUCH, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TOUCH_MASK_NONE,
 };
 
 use crate::error::{EngineError, EngineResult};
@@ -273,14 +285,15 @@ impl InputInjector {
         let tilt_x = sample.tilt_x_deg.clamp(-90, 90);
         let tilt_y = sample.tilt_y_deg.clamp(-90, 90);
 
+        let (vx, vy) = virtual_screen_origin();
         let pen_info = POINTER_PEN_INFO {
             pointerInfo: POINTER_INFO {
                 pointerType: PT_PEN,
                 pointerId: 1,
                 pointerFlags: flags,
                 ptPixelLocation: POINT {
-                    x: sample.x,
-                    y: sample.y,
+                    x: sample.x - vx,
+                    y: sample.y - vy,
                 },
                 ..Default::default()
             },
@@ -376,6 +389,39 @@ impl Drop for InputInjector {
     }
 }
 
+/// `(SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN)` — the top-left corner of the
+/// virtual desktop's bounding rectangle. Equal to (0, 0) only when no
+/// monitor extends above or left of the primary; otherwise negative in the
+/// extended dimension.
+///
+/// We need this because of an undocumented coordinate-space mismatch on
+/// `InjectSyntheticPointerInput`. The MSDN docs describe `ptPixelLocation`
+/// as virtual-desktop pixels (primary-relative, with negatives allowed for
+/// monitors that hang above or left of the primary) — same convention as
+/// `IDXGIOutput::GetDesc().DesktopCoordinates`. In practice the kernel
+/// pointer router treats `ptPixelLocation` as **bbox-relative** (offset
+/// from `(SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN)`), so feeding raw DXGI
+/// coords lands the synthetic pen exactly `(SM_XVIRTUALSCREEN,
+/// SM_YVIRTUALSCREEN)` away from where it should be on any topology with a
+/// non-zero virtual-screen origin (issue #16: VDD on the right of a 4K
+/// taller than primary → 4K's `top` is negative → pen strokes appear ~3 cm
+/// above the physical touch). Subtracting the origin here converts our
+/// primary-relative coords to bbox-relative so the kernel routes events
+/// onto the right monitor.
+///
+/// Re-queried per call rather than cached: cheap (~tens of ns), and
+/// monitor topology changes (hot-plug, display-arrangement edit) move
+/// `SM_*VIRTUALSCREEN` mid-session — caching would freeze the offset at
+/// session start.
+fn virtual_screen_origin() -> (i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+        )
+    }
+}
+
 /// Compose the per-frame pointer-flag set for a pen sample given the
 /// previous and current `(in_range, in_contact)` states. Pure function so
 /// the transition matrix is unit-testable without spinning up a real
@@ -415,28 +461,36 @@ fn pen_pointer_flags(
 /// Build a single touch contact's POINTER_TYPE_INFO. Contact rect is the
 /// pixel itself (1×1) — we don't have geometric contact-area data from the
 /// Android side, and apps that don't query rcContact are unaffected.
+///
+/// `(x, y)` arrives in primary-monitor-relative virtual-desktop pixels (DXGI
+/// `DesktopCoordinates` space). We translate to virtual-screen-bbox-relative
+/// pixels here so the kernel pointer router lands events on the correct
+/// monitor — see `virtual_screen_origin` for why.
 fn make_touch_info(id: u32, x: i32, y: i32, flags: POINTER_FLAGS) -> POINTER_TYPE_INFO {
+    let (vx, vy) = virtual_screen_origin();
+    let kx = x - vx;
+    let ky = y - vy;
     let touch_info = POINTER_TOUCH_INFO {
         pointerInfo: POINTER_INFO {
             pointerType: PT_TOUCH,
             pointerId: id,
             pointerFlags: flags,
-            ptPixelLocation: POINT { x, y },
+            ptPixelLocation: POINT { x: kx, y: ky },
             ..Default::default()
         },
         touchFlags: 0,
         touchMask: TOUCH_MASK_NONE,
         rcContact: windows::Win32::Foundation::RECT {
-            left: x,
-            top: y,
-            right: x + 1,
-            bottom: y + 1,
+            left: kx,
+            top: ky,
+            right: kx + 1,
+            bottom: ky + 1,
         },
         rcContactRaw: windows::Win32::Foundation::RECT {
-            left: x,
-            top: y,
-            right: x + 1,
-            bottom: y + 1,
+            left: kx,
+            top: ky,
+            right: kx + 1,
+            bottom: ky + 1,
         },
         orientation: 0,
         pressure: 0,
