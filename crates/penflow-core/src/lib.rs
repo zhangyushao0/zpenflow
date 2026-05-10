@@ -15,13 +15,16 @@ pub mod capture;
 pub mod color;
 #[cfg(windows)]
 pub mod cursor_blit;
-pub mod tonemap_blit;
 #[cfg(windows)]
 pub mod d3d11;
 #[cfg(windows)]
 pub mod encoder;
 #[cfg(windows)]
 pub mod monitors;
+#[cfg(windows)]
+pub mod sdr_white_level;
+#[cfg(windows)]
+pub mod tonemap_blit;
 
 pub mod inject;
 pub mod packet_queue;
@@ -271,6 +274,22 @@ impl EngineBuilder {
             },
         )?;
 
+        // Query the user's "SDR content brightness" slider (Windows HDR
+        // settings). When > 1.0, SDR content is placed at scRGB > 1.0
+        // and the tonemap shader has to divide it back down before
+        // clamping. `None` (HDR off, query failed) → assume 1.0, which
+        // is correct for non-HDR captures where the shader path isn't
+        // exercised anyway.
+        let scrgb_sdr_scale =
+            crate::sdr_white_level::query_sdr_white_level_scale(&monitor.device_name)
+                .unwrap_or(1.0);
+        eprintln!(
+            "[engine] SDR brightness scale for {}: {:.3} (scRGB SDR-white = {:.0} nits)",
+            monitor.device_name,
+            scrgb_sdr_scale,
+            scrgb_sdr_scale * 80.0,
+        );
+
         let pipeline = Pipeline::start(
             ctx,
             capturer,
@@ -283,6 +302,7 @@ impl EngineBuilder {
                 acquire_timeout: self.acquire_timeout,
                 packet_queue_capacity: self.packet_queue_capacity,
                 pts_epoch: self.pts_epoch.unwrap_or_else(Instant::now),
+                scrgb_sdr_scale,
             },
         )?;
 

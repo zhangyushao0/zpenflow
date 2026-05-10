@@ -99,6 +99,14 @@ pub struct PipelineConfig {
     /// instead of the actual ~20 ms e2e. The session passes its own
     /// `session_start` so both clocks share an epoch.
     pub pts_epoch: Instant,
+    /// "SDR content brightness" slider value, expressed as the scRGB
+    /// multiplier Windows applies to SDR content on a Windows-HDR-on
+    /// desktop. 1.0 = default / HDR off / unknown. Values > 1 are
+    /// common (boosted SDR for OLED HDR setups). Used by the tonemap
+    /// shader to renormalise scRGB before clamping. Queried from
+    /// `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)` in
+    /// `Engine::start`.
+    pub scrgb_sdr_scale: f32,
 }
 
 impl Default for PipelineConfig {
@@ -114,6 +122,7 @@ impl Default for PipelineConfig {
             acquire_timeout: Duration::from_millis(16),
             packet_queue_capacity: 2,
             pts_epoch: Instant::now(),
+            scrgb_sdr_scale: 1.0,
         }
     }
 }
@@ -178,7 +187,20 @@ impl Pipeline {
         // surface shader-compile failures at session start rather than
         // mid-stream when HDR happens to switch on.
         let tonemap_blitter = match TonemapBlitter::new(&ctx, &keepalive, cfg.width, cfg.height) {
-            Ok(b) => Some(b),
+            Ok(b) => {
+                // Push the user's "SDR content brightness" slider value
+                // into the shader cbuffer. Without this, scRGB inputs
+                // get clamp-clipped at 1.0 and any SDR content the
+                // user has boosted above 80 nits looks "blown out" on
+                // the tablet — the visible "Windows UI is overexposed"
+                // symptom. See `sdr_white_level.rs`.
+                b.set_scrgb_sdr_scale(cfg.scrgb_sdr_scale);
+                eprintln!(
+                    "[pipeline] tonemap blitter ready; scRGB SDR scale = {:.3}",
+                    cfg.scrgb_sdr_scale,
+                );
+                Some(b)
+            }
             Err(e) => {
                 eprintln!(
                     "[pipeline] TonemapBlitter::new failed ({:?}); HDR-display capture will \
@@ -616,6 +638,7 @@ mod tests {
             acquire_timeout: Duration::from_millis(50),
             packet_queue_capacity: 16,
             pts_epoch: Instant::now(),
+            scrgb_sdr_scale: 1.0,
         };
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         // Build the encoder session BEFORE moving ctx into the capturer

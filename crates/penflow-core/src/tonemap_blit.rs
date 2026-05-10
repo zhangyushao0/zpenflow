@@ -97,7 +97,13 @@ SamplerState      samp      : register(s0);
 
 cbuffer ConvertParams : register(b0) {
     uint  input_color_space; // 0=sRGB SDR (passthrough), 1=scRGB linear, 2=HDR10 PQ
-    float sdr_white_nits;    // 80 nits for scRGB convention
+    // The "SDR content brightness" slider in Windows HDR settings.
+    // When > 1, Windows places SDR-white at scRGB > 1.0 (e.g. slider
+    // at ~half gives ~2.25, putting SDR-white at 180 nits). The shader
+    // divides scRGB by this before clamping so SDR content renders
+    // correctly regardless of the user's slider position.
+    // Read from `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)`.
+    float scrgb_sdr_scale;
     float _pad0;
     float _pad1;
 };
@@ -164,14 +170,12 @@ float4 ps_main(VS_OUT i) : SV_TARGET {
         // the lift portion of the curve fires). Symptom on the tablet:
         // every screenshot looks washed-out / over-exposed.
         //
-        // Correct path for SDR-in-scRGB at default Windows settings is
-        // just clamp + sRGB encode. Caveat: Windows' "SDR content
-        // brightness" slider can place SDR-white at scRGB > 1.0; this
-        // commit doesn't yet honour that and will look slightly
-        // overexposed when the slider is boosted. Follow-up commit
-        // queries the slider via `DisplayConfigGetDeviceInfo` and
-        // divides scRGB by the scale here.
-        sdr_linear = saturate(src.rgb);
+        // First normalise back to "SDR-as-the-app-meant-it" range by
+        // dividing out the user's slider boost, then clamp. After this:
+        //   - SDR content renders byte-identical to a native SDR display
+        //   - True HDR highlights (rare on desktops) clip to white,
+        //     which is acceptable for a stylus-display use case
+        sdr_linear = saturate(src.rgb / max(scrgb_sdr_scale, 0.0001));
     } else /* input_color_space == 2 */ {
         // HDR10 PQ, BT.2020 primaries. PQ encodes absolute luminance:
         // 1.0 = 10000 nits, so a typical desktop fits in [0, 0.5]
@@ -180,8 +184,9 @@ float4 ps_main(VS_OUT i) : SV_TARGET {
         //
         // Decode PQ EOTF, normalise to scRGB convention (1.0 = 80 nits),
         // re-primary BT.2020 → BT.709, then ACES Filmic.
+        const float SCRGB_WHITE_NITS = 80.0;
         float3 linear_bt2020_abs = ST2084ToLinear(src.rgb);
-        float3 linear_bt2020_scrgb = linear_bt2020_abs * (10000.0 / sdr_white_nits);
+        float3 linear_bt2020_scrgb = linear_bt2020_abs * (10000.0 / SCRGB_WHITE_NITS);
         float3 linear_rec709 = mul(REC2020_TO_REC709, linear_bt2020_scrgb);
         sdr_linear = ToneMapACESFilmic(linear_rec709);
     }
@@ -198,7 +203,7 @@ float4 ps_main(VS_OUT i) : SV_TARGET {
 #[derive(Clone, Copy)]
 struct ConvertParams {
     input_color_space: u32,
-    sdr_white_nits: f32,
+    scrgb_sdr_scale: f32,
     _pad0: f32,
     _pad1: f32,
 }
@@ -243,6 +248,13 @@ pub struct TonemapBlitter {
     target_rtv: ID3D11RenderTargetView,
     /// Dynamic constant buffer; refreshed per-frame.
     constant_buffer: ID3D11Buffer,
+    /// scRGB → SDR-range divisor read from `DisplayConfigGetDeviceInfo`.
+    /// Default 1.0 = "slider at default / unknown / non-HDR display".
+    /// `Pipeline::start` sets it to the queried value before the loop
+    /// begins. Stored as `f32` because that's what gets written to the
+    /// cbuffer; rebuild not needed if it changes at runtime — we just
+    /// rewrite the cbuffer on the next `convert`.
+    scrgb_sdr_scale: std::sync::atomic::AtomicU32,
 }
 
 impl TonemapBlitter {
@@ -355,7 +367,24 @@ impl TonemapBlitter {
             rasterizer,
             target_rtv,
             constant_buffer,
+            scrgb_sdr_scale: std::sync::atomic::AtomicU32::new(1.0_f32.to_bits()),
         })
+    }
+
+    /// Update the user's SDR-content-brightness scale factor (Windows
+    /// HDR settings slider). Cheap, lock-free; the next `convert` call
+    /// will use the new value. Call this once on session start with the
+    /// value from `query_sdr_white_level_scale(&monitor.device_name)`.
+    pub fn set_scrgb_sdr_scale(&self, scale: f32) {
+        self.scrgb_sdr_scale
+            .store(scale.to_bits(), std::sync::atomic::Ordering::Release);
+    }
+
+    fn current_scrgb_sdr_scale(&self) -> f32 {
+        f32::from_bits(
+            self.scrgb_sdr_scale
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
     }
 
     /// Render `dda_frame` into the keepalive RTV with the appropriate
@@ -381,11 +410,7 @@ impl TonemapBlitter {
         // 1. Refresh the constant buffer.
         let params = ConvertParams {
             input_color_space: cs as u32,
-            // 80 nits is the scRGB convention — value 1.0 in scRGB
-            // linear corresponds to 80 nits absolute luminance. Used
-            // by the HDR10 PQ → scRGB normalisation; not used in the
-            // scRGB or sRGB paths.
-            sdr_white_nits: 80.0,
+            scrgb_sdr_scale: self.current_scrgb_sdr_scale(),
             _pad0: 0.0,
             _pad1: 0.0,
         };
@@ -447,7 +472,8 @@ impl TonemapBlitter {
                 .OMSetRenderTargets(Some(&rtv_array), None);
             // No blend state — we want to overwrite the keepalive,
             // not blend on top of it. Default blend = no-op overwrite.
-            ctx.immediate_context.OMSetBlendState(None, None, 0xFFFFFFFF);
+            ctx.immediate_context
+                .OMSetBlendState(None, None, 0xFFFFFFFF);
             ctx.immediate_context.RSSetState(&self.rasterizer);
             ctx.immediate_context
                 .RSSetViewports(Some(std::slice::from_ref(&viewport)));
