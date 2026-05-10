@@ -5,13 +5,14 @@
 //! driven by `InjectSyntheticPointerInput`. Pen path supplies pressure /
 //! tilt / hover / eraser; touch path handles up to 10 simultaneous contacts.
 //!
-//! Why not the WinRT `InputInjector` wrapper anymore: it interposed
-//! undocumented coordinate-space handling between us and the kernel,
-//! producing a position-dependent offset on 3+ monitor virtual desktops
-//! (issue #3). The Win32 path is documented to take virtual-screen pixels
-//! verbatim. The downstream apps (Krita, OneNote, anything Windows
-//! Ink-aware) consume identical pointer messages either way — we just
-//! removed a layer of opaque wrapping.
+//! Why not the WinRT `InputInjector` wrapper anymore: it shared the same
+//! kernel synthetic-pointer pipeline as the Win32 path but added an opaque
+//! C++/WinRT marshalling layer on top. Moving off it didn't fix issue #3
+//! on its own — the actual offset bug is documented in `win_ink.rs`'s
+//! module-level comment (kernel treats `ptPixelLocation` as offset from
+//! the virtual-screen bounding box, not primary-relative — issue #16).
+//! The Win32 path keeps us closer to the real coordinate contract and
+//! makes that translation explicit in code.
 //!
 //! `InjectSyntheticPointerInput` does not have the hard thread-affinity
 //! rule that the older Win32 `InjectTouchInput` did (HANDOFF §2.3 #3), so
