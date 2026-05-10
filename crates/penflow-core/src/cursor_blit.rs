@@ -521,7 +521,11 @@ fn compute_clipped_quad(
     })
 }
 
-fn compile_hlsl(src: &str, entry: &str, target: &str) -> EngineResult<(ID3DBlob, &'static [u8])> {
+pub(crate) fn compile_hlsl(
+    src: &str,
+    entry: &str,
+    target: &str,
+) -> EngineResult<(ID3DBlob, &'static [u8])> {
     let entry_c = CString::new(entry).map_err(|_| EngineError::NotInitialized)?;
     let target_c = CString::new(target).map_err(|_| EngineError::NotInitialized)?;
     let mut blob: Option<ID3DBlob> = None;

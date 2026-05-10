@@ -15,6 +15,7 @@ pub mod capture;
 pub mod color;
 #[cfg(windows)]
 pub mod cursor_blit;
+pub mod tonemap_blit;
 #[cfg(windows)]
 pub mod d3d11;
 #[cfg(windows)]
