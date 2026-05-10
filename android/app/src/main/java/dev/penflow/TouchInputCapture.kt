@@ -1,5 +1,6 @@
 package dev.penflow
 
+import android.graphics.Rect
 import android.util.Log
 import android.view.MotionEvent
 
@@ -27,8 +28,9 @@ import android.view.MotionEvent
  * coordinate as a touch contact on the PC.
  */
 class TouchInputCapture(
-    private val viewWidth: () -> Int,
-    private val viewHeight: () -> Int,
+    /** Same semantics as [PenInputCapture.activeRect] — fingers landing in
+     *  the letterbox bars are excluded from snapshots. */
+    private val activeRect: () -> Rect,
     private val onSnapshot: (TouchSnapshot) -> Unit,
 ) {
     data class TouchSnapshot(
@@ -44,8 +46,12 @@ class TouchInputCapture(
             "STYLUS=${MotionEvent.TOOL_TYPE_STYLUS})")
         if (ev.getToolType(0) != MotionEvent.TOOL_TYPE_FINGER) return false
 
-        val w = viewWidth().coerceAtLeast(1).toFloat()
-        val h = viewHeight().coerceAtLeast(1).toFloat()
+        val rect = activeRect()
+        val rectW = rect.width().coerceAtLeast(1).toFloat()
+        val rectH = rect.height().coerceAtLeast(1).toFloat()
+        val rectL = rect.left.toFloat()
+        val rectT = rect.top.toFloat()
+        val haveRect = rect.width() > 0 && rect.height() > 0
 
         val contacts: List<Protocol.TouchContact> = when (ev.actionMasked) {
             MotionEvent.ACTION_CANCEL -> emptyList()
@@ -65,11 +71,18 @@ class TouchInputCapture(
                     // with fingers in this event so we never inject a
                     // non-finger position as a touch on the PC side.
                     if (ev.getToolType(i) != MotionEvent.TOOL_TYPE_FINGER) continue
+                    val fx = ev.getX(i)
+                    val fy = ev.getY(i)
+                    if (haveRect) {
+                        if (fx < rectL || fx > rectL + rectW
+                            || fy < rectT || fy > rectT + rectH
+                        ) continue
+                    }
                     list.add(
                         Protocol.TouchContact(
                             pointerId = ev.getPointerId(i),
-                            xNorm = (ev.getX(i) / w).coerceIn(0f, 1f),
-                            yNorm = (ev.getY(i) / h).coerceIn(0f, 1f),
+                            xNorm = ((fx - rectL) / rectW).coerceIn(0f, 1f),
+                            yNorm = ((fy - rectT) / rectH).coerceIn(0f, 1f),
                             pressure = ev.getPressure(i).coerceIn(0f, 1f),
                         )
                     )
