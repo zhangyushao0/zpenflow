@@ -737,25 +737,49 @@ impl Session {
             peer_label, android.display_width, android.display_height, android.pen_max_pressure,
         );
 
-        // The configured monitor is the pen's target rect. In Duplicate
-        // topology service.rs sets this to the primary attached output;
-        // pen normalised coords land on that monitor's pixels via the
-        // standard AffineTransform.
-        let monitor = self.cfg.monitor.clone();
-        eprintln!(
-            "[session] screen_off — capture+encode SKIPPED; pen targets {} ({}x{} at {:?})",
-            monitor.device_name, monitor.width, monitor.height, monitor.desktop_coords,
-        );
-
-        // Same injector + binding setup as the streaming path. Touch
-        // events still go through the absolute-touch synthetic-pointer
-        // device; the Android side maps multi-touch onto the primary
-        // monitor like a Wacom Intuos with multi-finger support.
+        // Build the injector FIRST. `InputInjector::new` calls
+        // `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` as a
+        // side-effect — without that, DXGI returns DIPs (not physical
+        // pixels) on a scaled monitor and AffineTransform maps the pen
+        // into a too-small rect. The streaming path side-steps this
+        // because `Engine::start` does the same setup + re-enumerate
+        // dance internally; the screen_off path has no engine, so we
+        // do it here ourselves.
         let injector = Arc::new(Mutex::new(InputInjector::new()?));
         injector
             .lock()
             .await
             .set_pen_profile(self.cfg.pen_profile.clone());
+
+        // Re-enumerate monitors now that DPI awareness is set. The
+        // settings layer enumerated earlier under whatever DPI context
+        // the Tauri host left behind, which on a 150 % scaled display
+        // gave us 2/3 of the physical width — pen normalisation would
+        // then only cover 2/3 of the screen. Match the configured
+        // monitor by adapter LUID + device_name to refresh its dims;
+        // fall back to the cached MonitorInfo if the re-enumerate fails
+        // or the monitor disappeared (e.g. unplug between settings load
+        // and now).
+        let monitor = match Engine::list_monitors() {
+            Ok(mons) => mons
+                .into_iter()
+                .find(|m| {
+                    m.adapter_luid == self.cfg.monitor.adapter_luid
+                        && m.device_name == self.cfg.monitor.device_name
+                })
+                .unwrap_or_else(|| self.cfg.monitor.clone()),
+            Err(e) => {
+                eprintln!(
+                    "[session] screen_off — re-enumerate monitors failed: {e:?}; using cached info"
+                );
+                self.cfg.monitor.clone()
+            }
+        };
+        eprintln!(
+            "[session] screen_off — capture+encode SKIPPED; pen targets {} ({}x{} at {:?})",
+            monitor.device_name, monitor.width, monitor.height, monitor.desktop_coords,
+        );
+
         let rotation_deg: u32 = match monitor.rotation {
             2 => 90,
             3 => 180,

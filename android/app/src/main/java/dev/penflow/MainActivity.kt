@@ -170,13 +170,33 @@ class MainActivity : Activity() {
                 "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
-        // In screen_off mode there's no video, so no letterboxing —
-        // skipping applyContainLayout leaves activeRect empty and pen
-        // capture defaults to "full root view". That's exactly what we
-        // want: every pen sample on the panel maps onto the PC's
-        // primary monitor.
-        if (st is PenflowClient.State.Connected && !screenOff) {
-            applyContainLayout(st.width, st.height)
+        if (st is PenflowClient.State.Connected) {
+            if (screenOff) {
+                // No letterboxing in screen_off mode (there's no video to
+                // fit), but we MUST set activeRect to the full panel —
+                // PenInputCapture's normalisation divides by rect.width
+                // and rect.height, and the default `Rect()` has zero
+                // width/height which `coerceAtLeast(1)` turns into 1px,
+                // collapsing every pen sample to (1.0, 1.0) i.e. the
+                // bottom-right corner of the PC's primary monitor.
+                applyFullPanelRect()
+            } else {
+                applyContainLayout(st.width, st.height)
+            }
+        }
+    }
+
+    /** Set activeRect to the entire root view so pen + touch capture
+     *  cover the whole panel — the screen_off counterpart of
+     *  applyContainLayout's video-fit rect. */
+    private fun applyFullPanelRect() {
+        val root = findViewById<View>(android.R.id.content)
+        root.post {
+            val pw = root.width
+            val ph = root.height
+            if (pw <= 0 || ph <= 0) return@post
+            activeRect = Rect(0, 0, pw, ph)
+            Log.i(TAG, "screen_off — pen captures full panel ${pw}x${ph}")
         }
     }
 

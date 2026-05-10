@@ -334,14 +334,61 @@ fn log_diagnostic(msg: &str) {
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
+    // Duplicate-mode VDD scrub. The MSI installer's devcon step leaves
+    // the VDD device ENABLED at rest (see installer/wxs/vdd-install.wxs:
+    // "comes up enabled by default"). The original Duplicate path just
+    // sets vdd=None so the session never enables a fresh VDD — but it
+    // also never disables a leftover one, leaving Windows with a phantom
+    // virtual monitor that breaks pen targeting (the pen lands on the
+    // dead VDD desktop instead of primary) and shows up as a second
+    // display. Detect that case and disable it before we pick a capture
+    // monitor.
+    if matches!(s.topology, settings::TopologyMode::Duplicate) {
+        let leftover_vdd = Engine::list_monitors()
+            .map(|ms| {
+                ms.into_iter()
+                    .any(|m| m.attached_to_desktop && m.looks_virtual)
+            })
+            .unwrap_or(false);
+        if leftover_vdd {
+            eprintln!(
+                "[service] Duplicate mode — leftover VDD attached, disabling so pen targets a real monitor"
+            );
+            match VddController::detect() {
+                Ok(Some(mut ctrl)) => {
+                    if let Err(e) = ctrl.disable() {
+                        eprintln!("[service] VDD disable failed: {e} (continuing)");
+                    } else {
+                        eprintln!("[service] VDD disabled");
+                    }
+                }
+                Ok(None) => {
+                    eprintln!("[service] no VDD controller found despite virtual monitor present — proceeding anyway");
+                }
+                Err(e) => eprintln!("[service] VDD detect failed: {e} (continuing)"),
+            }
+        }
+    }
+
     // Pick monitor: first attached non-software output, or a stub when
     // VDD is taking over (`Session::run` ignores the field in that case).
+    // In Duplicate mode also exclude virtual monitors — even if the
+    // disable above failed (UAC denied) we'd rather pen-target a real
+    // physical monitor than a phantom VDD desktop.
     let monitors = Engine::list_monitors().unwrap_or_default();
-    let attached = monitors
-        .iter()
-        .find(|m| m.attached_to_desktop && !m.adapter_is_software)
-        .cloned()
-        .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor));
+    let attached = if matches!(s.topology, settings::TopologyMode::Duplicate) {
+        monitors
+            .iter()
+            .find(|m| m.attached_to_desktop && !m.adapter_is_software && !m.looks_virtual)
+            .cloned()
+            .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor))
+    } else {
+        monitors
+            .iter()
+            .find(|m| m.attached_to_desktop && !m.adapter_is_software)
+            .cloned()
+            .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor))
+    };
 
     // Best-effort VDD detection. If it fails or isn't installed, we fall
     // back to capturing whatever physical monitor was selected. Duplicate
