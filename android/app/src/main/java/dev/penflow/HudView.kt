@@ -35,6 +35,17 @@ class HudView @JvmOverloads constructor(
     @Volatile private var serverTelemetry: Protocol.Telemetry? = null
     @Volatile private var timeSyncReady: Boolean = false
 
+    /** Snapshot of TimeSync diagnostics last reported by [recordTimeSyncState].
+     *  Surfaced in the HUD so operators can verify the offset estimator is
+     *  healthy without scraping logcat. `null` until the first sample lands. */
+    @Volatile private var timeSyncState: TimeSyncState? = null
+
+    private data class TimeSyncState(
+        val windowSamples: Int,
+        val bestRttNs: Long,
+        val oldestSampleAgeNs: Long,
+    )
+
     private val frameCallback = object : Choreographer.FrameCallback {
         private var lastTickMs = 0L
         override fun doFrame(frameTimeNanos: Long) {
@@ -110,6 +121,23 @@ class HudView @JvmOverloads constructor(
         serverTelemetry = t
     }
 
+    /**
+     * Record the latest TimeSync window state. Cheap; safe to call on every
+     * frame. Surfaces three values needed to diagnose the long-session drift
+     * bug: window sample count (should saturate around `windowMs / 1 Hz` =
+     * 60), the current window-min RTT (should stay roughly stable, not drift
+     * monotonically), and the age of the oldest in-window sample (should
+     * also saturate near `windowMs`). If `windowSamples` stays low or
+     * `bestRttNs` drifts upward over many minutes, the estimator is sick.
+     */
+    fun recordTimeSyncState(
+        windowSamples: Int,
+        bestRttNs: Long,
+        oldestSampleAgeNs: Long,
+    ) {
+        timeSyncState = TimeSyncState(windowSamples, bestRttNs, oldestSampleAgeNs)
+    }
+
     private data class Snapshot(
         val avgTrueE2eUs: Long,
         val p99TrueE2eUs: Long,
@@ -155,6 +183,13 @@ class HudView @JvmOverloads constructor(
                 append(" drop=").append(st.dropped)
                 append(" enc_p99=").append(formatUs(st.encodeUsP99.toLong()))
                 append(" qd=").append(st.queueDepth)
+            }
+            val ts = timeSyncState
+            if (ts != null) {
+                append('\n')
+                append("ts win=").append(ts.windowSamples)
+                append(" rtt=").append(formatUs(ts.bestRttNs / 1000))
+                append(" age=").append(ts.oldestSampleAgeNs / 1_000_000_000L).append('s')
             }
         }
     }

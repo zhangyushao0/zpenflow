@@ -109,6 +109,11 @@ class PenflowClient(
             s.ptsNs, s.captureUs, s.encodeUs, s.recvNs, decodedNs, displayedNs,
             timeSync.pcMinusAndroidNs, timeSync.isReady(),
         )
+        hud?.recordTimeSyncState(
+            windowSamples = timeSync.windowSampleCount,
+            bestRttNs = timeSync.bestRttNs,
+            oldestSampleAgeNs = timeSync.oldestSampleAgeNs(System.nanoTime()),
+        )
     }
 
     /**
@@ -175,6 +180,13 @@ class PenflowClient(
         out: DataOutputStream,
         deviceCaps: DeviceCaps,
     ) {
+        // Drop any sliding-window state from the previous session. The
+        // PC-side server may be a fresh process with a rebased monotonic
+        // clock, in which case carrying over offsets from before would
+        // make `net` metrics wildly wrong until the old samples aged
+        // out of the window.
+        timeSync.reset()
+
         // 1. send HELLO_ANDROID
                 Protocol.sendMsg(
                     out,
