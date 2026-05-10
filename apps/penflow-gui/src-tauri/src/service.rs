@@ -344,12 +344,19 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         .unwrap_or_else(|| monitors.first().cloned().unwrap_or_else(stub_monitor));
 
     // Best-effort VDD detection. If it fails or isn't installed, we fall
-    // back to capturing whatever physical monitor was selected.
-    let vdd = match VddController::detect() {
-        Ok(opt) => opt,
-        Err(e) => {
-            eprintln!("[service] VDD detection failed: {e}");
-            None
+    // back to capturing whatever physical monitor was selected. Duplicate
+    // mode skips detection so the primary is captured directly (IDDCx
+    // clone is too unreliable to drive the VDD as a mirror).
+    let vdd = if matches!(s.topology, settings::TopologyMode::Duplicate) {
+        eprintln!("[service] Duplicate mode — bypassing VDD");
+        None
+    } else {
+        match VddController::detect() {
+            Ok(opt) => opt,
+            Err(e) => {
+                eprintln!("[service] VDD detection failed: {e}");
+                None
+            }
         }
     };
     if vdd.is_some() {

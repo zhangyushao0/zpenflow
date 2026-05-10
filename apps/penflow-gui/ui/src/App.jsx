@@ -639,6 +639,7 @@ export default function App() {
                                 <Option value="120">120 fps</Option>
                             </Dropdown>
                         </Field>
+                        {(settings.topology ?? "extend") === "extend" && (
                         <Field label="Virtual display" className={styles.resolutionField}>
                             <div className={styles.resolutionControl}>
                                 <Dropdown
@@ -691,6 +692,22 @@ export default function App() {
                                 </div>
                             </div>
                         </Field>
+                        )}
+                        <Field label="Display mode" orientation="horizontal" className={styles.row}>
+                            <Dropdown
+                                value={(settings.topology ?? "extend") === "duplicate" ? "Duplicate" : "Extend"}
+                                selectedOptions={[settings.topology ?? "extend"]}
+                                onOptionSelect={(_, d) => setSettings({ ...settings, topology: d.optionValue })}
+                            >
+                                <Option value="extend">Extend (separate desktop)</Option>
+                                <Option value="duplicate">Duplicate primary</Option>
+                            </Dropdown>
+                        </Field>
+                        {(settings.topology ?? "extend") === "duplicate" && (
+                            <Caption1 className={styles.hint}>
+                                Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
+                            </Caption1>
+                        )}
                         <Field label="Codec" orientation="horizontal" className={styles.row}>
                             <Dropdown
                                 value={settings.codec === "hevc" ? "HEVC" : "H.264"}

@@ -1,13 +1,16 @@
 package dev.penflow
 
 import android.app.Activity
+import android.graphics.Rect
 import android.os.Bundle
 import android.util.Log
+import android.view.Gravity
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
 import android.view.WindowManager
+import android.widget.FrameLayout
 import android.widget.TextView
 
 /**
@@ -25,6 +28,11 @@ class MainActivity : Activity() {
 
     @Volatile
     private var currentSurface: android.view.Surface? = null
+
+    /** Rect (root-view pixels) the SurfaceView covers; smaller than the
+     *  root when source aspect ≠ panel. Recomputed on each Connected. */
+    @Volatile
+    private var activeRect: Rect = Rect()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -65,16 +73,14 @@ class MainActivity : Activity() {
         root.isFocusableInTouchMode = true
 
         penCapture = PenInputCapture(
-            viewWidth = { root.width },
-            viewHeight = { root.height },
+            activeRect = { activeRect },
             onEvent = { sample ->
                 client.sendPenEvent(sample)
             }
         )
 
         touchCapture = TouchInputCapture(
-            viewWidth = { root.width },
-            viewHeight = { root.height },
+            activeRect = { activeRect },
             onSnapshot = { snap ->
                 client.sendTouchSnapshot(snap)
             }
@@ -142,6 +148,39 @@ class MainActivity : Activity() {
             PenflowClient.State.Connecting -> "connecting…"
             is PenflowClient.State.Connected -> "connected ${st.width}x${st.height}@${st.fps}"
             is PenflowClient.State.Error -> "error: ${st.message}"
+        }
+        if (st is PenflowClient.State.Connected) {
+            applyContainLayout(st.width, st.height)
+        }
+    }
+
+    /** Contain-fit the SurfaceView to source dimensions. Posted to root
+     *  so layout has finished — `Connected` can fire before `onLayout`. */
+    private fun applyContainLayout(sourceWidth: Int, sourceHeight: Int) {
+        if (sourceWidth <= 0 || sourceHeight <= 0) return
+        val root = findViewById<View>(android.R.id.content)
+        root.post {
+            val pw = root.width
+            val ph = root.height
+            if (pw <= 0 || ph <= 0) return@post
+
+            // contain: smaller scale fits both axes; other axis = bars.
+            val scale = minOf(pw.toFloat() / sourceWidth, ph.toFloat() / sourceHeight)
+            val rectW = (sourceWidth * scale).toInt().coerceAtLeast(1)
+            val rectH = (sourceHeight * scale).toInt().coerceAtLeast(1)
+            val left = (pw - rectW) / 2
+            val top = (ph - rectH) / 2
+
+            activeRect = Rect(left, top, left + rectW, top + rectH)
+
+            val lp = surfaceView.layoutParams as? FrameLayout.LayoutParams
+                ?: FrameLayout.LayoutParams(rectW, rectH)
+            lp.width = rectW
+            lp.height = rectH
+            lp.gravity = Gravity.CENTER
+            surfaceView.layoutParams = lp
+
+            Log.i(TAG, "contain layout: panel=${pw}x${ph} source=${sourceWidth}x${sourceHeight} active=$activeRect")
         }
     }
 

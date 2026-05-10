@@ -48,6 +48,10 @@ pub struct Settings {
     /// flag is sent during the session's `MSG_CLIENT_CONFIG` handshake.
     #[serde(default = "default_hud_enabled")]
     pub hud_enabled: bool,
+    /// `Extend` (default) uses the VDD as a separate desktop. `Duplicate`
+    /// skips the VDD and captures the primary monitor directly.
+    #[serde(default)]
+    pub topology: TopologyMode,
 }
 
 fn default_hud_enabled() -> bool {
@@ -65,8 +69,18 @@ impl Default for Settings {
             autostart: false,
             run_as_admin: false,
             hud_enabled: default_hud_enabled(),
+            topology: TopologyMode::default(),
         }
     }
+}
+
+/// VDD-on (Extend) vs. VDD-off (Duplicate). See `Settings::topology`.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyMode {
+    #[default]
+    Extend,
+    Duplicate,
 }
 
 fn default_bitrate() -> u32 {

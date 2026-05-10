@@ -1,5 +1,6 @@
 package dev.penflow
 
+import android.graphics.Rect
 import android.view.MotionEvent
 
 /**
@@ -31,8 +32,9 @@ import android.view.MotionEvent
  * touch" behaviour real Wacom tablets do in hardware.
  */
 class PenInputCapture(
-    private val viewWidth: () -> Int,
-    private val viewHeight: () -> Int,
+    /** Rect (root-view pixels) the decoded video covers. Events outside
+     *  the rect are dropped; events inside are normalized against it. */
+    private val activeRect: () -> Rect,
     private val onEvent: (PenSample) -> Unit
 ) {
 
@@ -91,8 +93,20 @@ class PenInputCapture(
             lastUpTimeMs = ev.eventTime
         }
 
-        val w = viewWidth().coerceAtLeast(1).toFloat()
-        val h = viewHeight().coerceAtLeast(1).toFloat()
+        // Drop events in the letterbox bars; normalize against activeRect.
+        // Empty rect = pre-handshake; fall through to root-view bounds.
+        val rect = activeRect()
+        val rectW = rect.width().coerceAtLeast(1).toFloat()
+        val rectH = rect.height().coerceAtLeast(1).toFloat()
+        val rectL = rect.left.toFloat()
+        val rectT = rect.top.toFloat()
+        if (rect.width() > 0 && rect.height() > 0) {
+            if (penX < rectL || penX > rectL + rectW
+                || penY < rectT || penY > rectT + rectH
+            ) {
+                return true  // in a bar — consume but emit nothing
+            }
+        }
 
         // pressure & orientation/tilt are reported per-pointer
         val pressure = ev.getPressure(penIndex).coerceIn(0f, 1f)
@@ -128,15 +142,21 @@ class PenInputCapture(
         )
         lastButtonsRaw = rawButtons
 
-        // emit historical samples first (Android may batch them at high rates)
+        // Emit historical samples first (Android batches at high rates),
+        // each rect-clipped so a brief excursion produces a gap, not a teleport.
         val historySize = ev.historySize
         for (i in 0 until historySize) {
+            val hx = ev.getHistoricalX(penIndex, i)
+            val hy = ev.getHistoricalY(penIndex, i)
+            if (rect.width() > 0 && rect.height() > 0) {
+                if (hx < rectL || hx > rectL + rectW || hy < rectT || hy > rectT + rectH) continue
+            }
             onEvent(
                 PenSample(
                     tsNs = ev.getHistoricalEventTime(i) * 1_000_000L,
                     phase = phase,
-                    xNorm = (ev.getHistoricalX(penIndex, i) / w).coerceIn(0f, 1f),
-                    yNorm = (ev.getHistoricalY(penIndex, i) / h).coerceIn(0f, 1f),
+                    xNorm = ((hx - rectL) / rectW).coerceIn(0f, 1f),
+                    yNorm = ((hy - rectT) / rectH).coerceIn(0f, 1f),
                     pressure = ev.getHistoricalPressure(penIndex, i).coerceIn(0f, 1f),
                     tiltX = tiltX,
                     tiltY = tiltY,
@@ -150,8 +170,8 @@ class PenInputCapture(
             PenSample(
                 tsNs = ev.eventTime * 1_000_000L,
                 phase = phase,
-                xNorm = (penX / w).coerceIn(0f, 1f),
-                yNorm = (penY / h).coerceIn(0f, 1f),
+                xNorm = ((penX - rectL) / rectW).coerceIn(0f, 1f),
+                yNorm = ((penY - rectT) / rectH).coerceIn(0f, 1f),
                 pressure = pressure,
                 tiltX = tiltX,
                 tiltY = tiltY,
