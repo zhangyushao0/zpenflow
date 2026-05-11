@@ -113,6 +113,8 @@ class MainActivity : Activity() {
                     hud.visibility = vis
                     statusView.visibility = vis
 
+                    // Screen-off: hide the video surface and dim the panel
+                    // (no video will arrive). Pen + touch input still flow.
                     screenOff = cfg.screenOff
                     surfaceView.visibility =
                         if (cfg.screenOff) android.view.View.GONE
