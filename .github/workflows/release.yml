@@ -82,6 +82,14 @@ jobs:
         shell: pwsh
         run: ./installer/fetch-adb.ps1
 
+      - name: Stage VMulti virtual HID digitizer driver
+        # The MSI bundles X9VoiD/vmulti-bin v1.0 under [INSTALLDIR]\vmulti\
+        # for the WiX `PenflowInstallVmulti` custom action, which calls
+        # `devcon install vmulti.inf pentablet\hid` at MSI install time.
+        # Real HID digitizer = sub-pixel pen coords (issue #23 fix).
+        shell: pwsh
+        run: ./installer/fetch-vmulti.ps1
+
       - name: Build MSI bundle
         working-directory: apps/penflow-gui
         run: cargo tauri build --bundles msi

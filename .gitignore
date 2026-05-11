@@ -37,6 +37,7 @@ tools/vdd/VirtualDriverControl*
 installer/adb/
 installer/.cache/
 installer/vdd-driver/
+installer/vmulti-driver/
 
 # Stray MSI bundle artifacts that occasionally land at the repo root
 # (e.g. a manual `dark.exe` decompile of an MSI for debugging).

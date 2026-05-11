@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+
+<!--
+  WiX 3 fragment that installs + uninstalls the bundled VMulti virtual
+  HID digitizer (X9VoiD/vmulti-bin v1.0) around the MSI lifecycle.
+  Same shape as vdd-install.wxs — one UAC prompt at MSI install time,
+  none thereafter, including a clean removal on uninstall.
+
+  Loaded by Tauri 2's `bundle.windows.wix.fragmentPaths`. The Component
+  `PenflowVmultiInstallActions` is referenced from
+  `bundle.windows.wix.componentRefs` so the linker doesn't dead-strip
+  the CustomActions inside.
+
+  Why this driver matters (issue #23):
+    The standard Win32 `InjectSyntheticPointerInput` path only carries
+    integer-pixel coordinates, causing visible stair-step jitter when
+    Krita-style apps zoom into strokes drawn at zoomed-out canvas.
+    VMulti registers as a real HID digitizer with logical_max=32767
+    per axis, so sub-pixel precision survives end-to-end. SuperDisplay
+    uses the same approach (their `superdisplay_hid.dll` is VMulti
+    compiled with renamed device IDs).
+
+  Why we don't ship Wintab32.dll yet:
+    The release zip includes a Wintab bridge that maps WT* API calls
+    onto VMulti reports. We deliberately exclude it from the install
+    because dropping a wintab32.dll into System32 collides with other
+    tablet drivers (Wacom, Huion, XP-Pen) the user might have. Users
+    can opt into Wintab manually later if they want Krita's default
+    Wintab mode to work; the Windows Ink path covers our primary
+    target audience for now.
+
+  Install command:
+    `devcon install vmulti.inf pentablet\hid`
+      install      = devcon's "add driver to store + create device node"
+      vmulti.inf   = our INF
+      pentablet\hid = hardware ID declared by the INF
+    No `/r` flag (`reboot if needed`) — UMDF HID drivers come up live
+    without reboot; the only case `/r` would trigger is a stuck reboot
+    flag from a botched prior install, which we shouldn't propagate.
+
+  Remove commands (in order, both required):
+    `devcon remove pentablet\hid`   — destroy the device node
+    `DIFxCmd.exe /u vmulti.inf`     — purge the driver package from
+                                       the Windows driver store
+
+  Return="ignore" on every CustomAction means a devcon failure does
+  NOT abort the MSI — the GUI's runtime probe will surface the missing
+  driver and the user can hit the "Reinstall pen driver" fallback
+  button. A failed remove on uninstall is harmless: the device just
+  remains until manually scrubbed with `devcon remove pentablet\hid`.
+-->
+
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+    <Fragment>
+        <DirectoryRef Id="INSTALLDIR">
+            <Component Id="PenflowVmultiInstallActions"
+                       Guid="{4B9A2D17-3E0F-4C8A-9D1B-7E5F2A6C0D38}"
+                       Win64="yes">
+                <RegistryValue Root="HKLM"
+                               Key="Software\Penflow\VmultiInstaller"
+                               Name="FragmentLinked"
+                               Type="integer"
+                               Value="1"
+                               KeyPath="yes" />
+            </Component>
+        </DirectoryRef>
+
+        <!-- Install: devcon adds the driver to the store AND creates
+             the `pentablet\hid` device node, which makes Windows
+             enumerate our virtual digitizer immediately (no reboot). -->
+        <CustomAction
+            Id="PenflowInstallVmulti"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vmulti\devcon.exe" install "[INSTALLDIR]vmulti\vmulti.inf" "pentablet\hid"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
+        <!-- Uninstall step 1: destroy the device node so no app holds
+             an open HID handle to it (would block driver removal). -->
+        <CustomAction
+            Id="PenflowRemoveVmultiDevice"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vmulti\devcon.exe" remove "pentablet\hid"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
+        <!-- Uninstall step 2: purge driver package from the store so
+             Windows doesn't re-attach the next time the hardware ID
+             surfaces (e.g., if user installs zpenflow again). -->
+        <CustomAction
+            Id="PenflowRemoveVmultiDriver"
+            Directory="INSTALLDIR"
+            ExeCommand='"[INSTALLDIR]vmulti\DIFxCmd.exe" /u "[INSTALLDIR]vmulti\vmulti.inf"'
+            Execute="deferred"
+            Impersonate="no"
+            Return="ignore" />
+
+        <InstallExecuteSequence>
+            <!-- Install side: only on a true install, not uninstall.
+                 After InstallFiles so [INSTALLDIR]\vmulti\ is fully
+                 populated before devcon walks it. -->
+            <Custom Action="PenflowInstallVmulti"       After="InstallFiles">NOT REMOVE~="ALL"</Custom>
+
+            <!-- Uninstall side: only on a true uninstall. Run BEFORE
+                 RemoveFiles so devcon.exe + vmulti.inf are still on
+                 disk when we invoke them. Order matters — remove
+                 device node first, then purge driver package. -->
+            <Custom Action="PenflowRemoveVmultiDevice"  Before="RemoveFiles">REMOVE~="ALL"</Custom>
+            <Custom Action="PenflowRemoveVmultiDriver"  After="PenflowRemoveVmultiDevice">REMOVE~="ALL"</Custom>
+        </InstallExecuteSequence>
+    </Fragment>
+</Wix>

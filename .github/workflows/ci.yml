@@ -57,6 +57,11 @@ jobs:
         shell: pwsh
         run: ./installer/fetch-adb.ps1
 
+      - name: Stage VMulti virtual HID digitizer driver
+        # Same validation rule for vmulti/* resources (issue #23 fix).
+        shell: pwsh
+        run: ./installer/fetch-vmulti.ps1
+
       - name: Install + build frontend
         # tauri::generate_context!() expands at compile time and reads
         # tauri.conf.json, which declares `frontendDist: "../ui/dist"`.

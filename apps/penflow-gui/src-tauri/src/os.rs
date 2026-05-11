@@ -322,6 +322,40 @@ mod imp {
         }
     }
 
+    /// Run an arbitrary executable elevated, wait for completion,
+    /// return its exit code. UAC prompt unless we're already elevated.
+    /// Used by the VMulti fallback-install command (issue #23 follow-up).
+    pub fn run_elevated_wait(exe: &std::path::Path, params: &str) -> std::io::Result<i32> {
+        let exe_w = to_wide(&exe.to_string_lossy());
+        let params_w = to_wide(params);
+        let verb_w = to_wide("runas");
+
+        let mut sei = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            hwnd: HWND::default(),
+            lpVerb: PCWSTR(verb_w.as_ptr()),
+            lpFile: PCWSTR(exe_w.as_ptr()),
+            lpParameters: PCWSTR(params_w.as_ptr()),
+            lpDirectory: PCWSTR::null(),
+            nShow: SW_HIDE.0,
+            ..Default::default()
+        };
+        unsafe { ShellExecuteExW(&mut sei) }
+            .map_err(|e| std::io::Error::other(format!("ShellExecuteExW(runas): {e}")))?;
+        let process = sei.hProcess;
+        if process.is_invalid() {
+            return Err(std::io::Error::other(
+                "ShellExecuteEx returned no process handle (UAC declined?)",
+            ));
+        }
+        let _ = unsafe { WaitForSingleObject(process, INFINITE) };
+        let mut code: u32 = 0;
+        let _ = unsafe { GetExitCodeProcess(process, &mut code) };
+        let _ = unsafe { CloseHandle(process) };
+        Ok(code as i32)
+    }
+
     /// Quote each argv element for the Windows command line. The
     /// rules ShellExecute uses are CommandLineToArgvW-compatible:
     /// wrap in `"` if it has whitespace or quotes; double interior
@@ -375,6 +409,11 @@ mod imp {
     pub fn run_admin_task() -> std::io::Result<()> {
         Err(std::io::Error::other(
             "admin task only implemented on Windows",
+        ))
+    }
+    pub fn run_elevated_wait(_exe: &std::path::Path, _params: &str) -> std::io::Result<i32> {
+        Err(std::io::Error::other(
+            "elevated run only implemented on Windows",
         ))
     }
 }

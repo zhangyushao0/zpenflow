@@ -49,13 +49,21 @@
             "../../../tools/vdd/vdd_settings.xml":       "vdd/vdd_settings.xml",
             "../../../installer/adb/adb.exe":            "adb/adb.exe",
             "../../../installer/adb/AdbWinApi.dll":      "adb/AdbWinApi.dll",
-            "../../../installer/adb/AdbWinUsbApi.dll":   "adb/AdbWinUsbApi.dll"
+            "../../../installer/adb/AdbWinUsbApi.dll":   "adb/AdbWinUsbApi.dll",
+            "../../../installer/vmulti-driver/vmulti.sys":              "vmulti/vmulti.sys",
+            "../../../installer/vmulti-driver/vmulti.inf":              "vmulti/vmulti.inf",
+            "../../../installer/vmulti-driver/pentablethid.cat":        "vmulti/pentablethid.cat",
+            "../../../installer/vmulti-driver/hidkmdf.sys":             "vmulti/hidkmdf.sys",
+            "../../../installer/vmulti-driver/WdfCoInstaller01009.dll": "vmulti/WdfCoInstaller01009.dll",
+            "../../../installer/vmulti-driver/devcon.exe":              "vmulti/devcon.exe",
+            "../../../installer/vmulti-driver/DIFxCmd.exe":             "vmulti/DIFxCmd.exe",
+            "../../../installer/vmulti-driver/DIFxAPI.dll":             "vmulti/DIFxAPI.dll"
         },
         "windows": {
             "wix": {
                 "language": "en-US",
-                "fragmentPaths": ["wix/vdd-install.wxs"],
-                "componentRefs": ["PenflowVddInstallActions"]
+                "fragmentPaths": ["wix/vdd-install.wxs", "wix/vmulti-install.wxs"],
+                "componentRefs": ["PenflowVddInstallActions", "PenflowVmultiInstallActions"]
             }
         }
     }

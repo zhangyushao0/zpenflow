@@ -500,6 +500,9 @@ export default function App() {
     const [vddInstalled, setVddInstalled] = useState(true);
     const [vddInstalling, setVddInstalling] = useState(false);
     const [vddInstallError, setVddInstallError] = useState("");
+    const [vmultiInstalled, setVmultiInstalled] = useState(true);
+    const [vmultiInstalling, setVmultiInstalling] = useState(false);
+    const [vmultiInstallError, setVmultiInstallError] = useState("");
 
     // Initial load.
     useEffect(() => {
@@ -514,6 +517,7 @@ export default function App() {
             try { setElevated(await invoke("is_elevated")); } catch {}
             try { setStatus(await invoke("get_status")); } catch {}
             try { setVddInstalled(await invoke("is_vdd_installed")); } catch {}
+            try { setVmultiInstalled(await invoke("is_vmulti_installed")); } catch {}
         })();
 
         const unlistenP = listen("service-state", (ev) => setStatus(ev.payload));
@@ -530,6 +534,19 @@ export default function App() {
             setVddInstallError(String(e));
         } finally {
             setVddInstalling(false);
+        }
+    }, []);
+
+    const onInstallVmulti = useCallback(async () => {
+        setVmultiInstalling(true);
+        setVmultiInstallError("");
+        try {
+            await invoke("install_vmulti");
+            setVmultiInstalled(await invoke("is_vmulti_installed"));
+        } catch (e) {
+            setVmultiInstallError(String(e));
+        } finally {
+            setVmultiInstalling(false);
         }
     }, []);
 
@@ -605,6 +622,26 @@ export default function App() {
                             ? <Spinner size="tiny" label="Installing…" />
                             : <Button appearance="primary" onClick={onInstallVdd}>
                                 Install VDD
+                              </Button>}
+                    </MessageBarActions>
+                </MessageBar>
+            )}
+
+            {!vmultiInstalled && (
+                <MessageBar intent={vmultiInstallError ? "error" : "warning"}>
+                    <MessageBarBody>
+                        <MessageBarTitle>
+                            {vmultiInstallError ? "Pen driver install failed" : "Pen driver not installed"}
+                        </MessageBarTitle>
+                        {vmultiInstallError
+                            ? vmultiInstallError
+                            : "The bundled VMulti pen driver is missing — pen strokes will fall back to a lower-precision path with visible jitter on zoomed strokes. The MSI installer normally installs it; click Install if that step was skipped or blocked. UAC will prompt once."}
+                    </MessageBarBody>
+                    <MessageBarActions>
+                        {vmultiInstalling
+                            ? <Spinner size="tiny" label="Installing…" />
+                            : <Button appearance="primary" onClick={onInstallVmulti}>
+                                Install Pen Driver
                               </Button>}
                     </MessageBarActions>
                 </MessageBar>

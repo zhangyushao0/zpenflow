@@ -109,6 +109,56 @@ fn is_vdd_installed() -> bool {
     matches!(penflow_server::VddController::detect(), Ok(Some(_)))
 }
 
+/// Whether the X9VoiD/vmulti-bin virtual HID digitizer is currently
+/// installed and reachable. The MSI installer's
+/// `PenflowInstallVmulti` custom action ships this driver at install
+/// time; this probe lets the GUI surface a "driver missing" banner +
+/// "Reinstall" button when that action failed (rare — typically only
+/// if devcon errored or the user blocked UAC).
+#[tauri::command]
+fn is_vmulti_installed() -> bool {
+    #[cfg(windows)]
+    {
+        penflow_core::inject::vmulti::VMultiPen::open().is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Manually (re-)install the bundled VMulti driver via the elevated
+/// `devcon install vmulti.inf pentablet\hid`. Triggers one UAC prompt.
+/// Returns Ok(()) iff devcon exits 0.
+#[tauri::command]
+async fn install_vmulti(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    let resource_dir = app
+        .path()
+        .resource_dir()
+        .map_err(|e| format!("resource_dir: {e}"))?;
+    let devcon = resource_dir.join("vmulti").join("devcon.exe");
+    let inf = resource_dir.join("vmulti").join("vmulti.inf");
+    if !devcon.exists() || !inf.exists() {
+        return Err(format!(
+            "bundled VMulti files not found at {} / {} — was installer/vmulti-driver populated before tauri build (fetch-vmulti.ps1)?",
+            devcon.display(),
+            inf.display()
+        ));
+    }
+    let inf_arg = format!(r#""{}""#, inf.display());
+    let params = format!(r"install {inf_arg} pentablet\hid");
+    let devcon_clone = devcon.clone();
+    let code = tokio::task::spawn_blocking(move || os::run_elevated_wait(&devcon_clone, &params))
+        .await
+        .map_err(|e| format!("join error: {e}"))?
+        .map_err(|e| format!("run_elevated_wait: {e}"))?;
+    if code != 0 {
+        return Err(format!("devcon install exited {code}"));
+    }
+    Ok(())
+}
+
 /// Install the bundled VDD driver via the elevated pnputil helper.
 /// Returns Ok(()) when pnputil completes successfully.
 #[tauri::command]
@@ -345,6 +395,8 @@ fn main() -> std::process::ExitCode {
             relaunch_as_admin,
             is_vdd_installed,
             install_vdd,
+            is_vmulti_installed,
+            install_vmulti,
         ])
         .build(tauri::generate_context!())
         .expect("failed to build Penflow GUI");
