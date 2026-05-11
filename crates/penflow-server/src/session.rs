@@ -145,15 +145,10 @@ pub struct SessionConfig {
     /// Whether the Android HUD overlay should be enabled. Forwarded to
     /// the client via `MSG_CLIENT_CONFIG` immediately after the handshake.
     pub hud_enabled: bool,
-    /// Pen-tablet "screen off" mode. When `true`, the session skips
-    /// `Engine::start`, never sends `MSG_VIDEO_CONFIG` or
-    /// `MSG_VIDEO_FRAME`, and runs only the input dispatch loop. The
-    /// `MSG_CLIENT_CONFIG` flag tells the Android side to drop its
-    /// decoder and blank the panel. Pen + touch still flow as normal so
-    /// the tablet behaves like a Wacom Intuos pointed at the primary
-    /// monitor. Caller (the GUI service layer) is responsible for only
-    /// setting this when `topology == Duplicate` — drawing on a phantom
-    /// VDD monitor with no display is useless.
+    /// Pen-tablet "screen off" mode: skip engine + video frames, run only
+    /// input dispatch. Client sees `CLIENT_CFG_FLAG_SCREEN_OFF` and blanks
+    /// the panel. Only meaningful with `topology == Duplicate`; the GUI
+    /// service layer enforces that gate.
     pub screen_off: bool,
     /// Pen-button bindings to apply on the per-session injector. Default
     /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
@@ -281,10 +276,8 @@ impl Session {
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     ) -> Result<(), SessionError> {
-        // Pen-tablet "screen off" mode is a fundamentally different
-        // shape (no engine, no video pumps, no IDR machinery) — peel it
-        // off the front so the streaming path below stays linear and
-        // untouched.
+        // No engine / no video pumps when in screen_off — peel that path
+        // off the front so the streaming flow below stays linear.
         if self.cfg.screen_off {
             return self.run_screen_off(transport, events).await;
         }
@@ -681,30 +674,18 @@ impl Session {
         read_result
     }
 
-    /// Pen-tablet "screen off" path. Same handshake shape as `run` for
-    /// transport/`HELLO_ANDROID`/`HELLO_PC`/`MSG_CLIENT_CONFIG` so the
-    /// Android client doesn't need a special handshake mode — it just
-    /// reads `CLIENT_CFG_FLAG_SCREEN_OFF` and stops waiting for video.
-    /// Everything below `MSG_CLIENT_CONFIG` (no `MSG_VIDEO_CONFIG`, no
-    /// frame pump, no telemetry pump, no engine) is intentionally
-    /// missing because there is nothing to encode or stream.
-    ///
-    /// Pen + touch input still flow over the wire, mapped through the
-    /// same `AffineTransform` against the configured monitor (which is
-    /// the primary in `Duplicate` topology — service.rs only lets
-    /// `screen_off` take effect there). Net effect: dark glass that
-    /// behaves like a Wacom Intuos pointed at the primary monitor.
+    /// Pen-tablet "screen off" path. Same handshake as `run` through
+    /// `MSG_CLIENT_CONFIG`; no engine / `MSG_VIDEO_CONFIG` / frame /
+    /// telemetry pump afterwards. Pen + touch flow via the same
+    /// `AffineTransform` against the configured monitor (primary, since
+    /// `service.rs` gates `screen_off` on Duplicate topology).
     async fn run_screen_off(
         self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
     ) -> Result<(), SessionError> {
-        // Defensive: the GUI service layer is supposed to only set
-        // `screen_off` when topology=Duplicate (which forces vdd=None),
-        // so the streaming-only VDD lifecycle never fires here. If an
-        // older settings.json arrives somehow, just refuse to enable
-        // VDD rather than spin up a virtual monitor only to never show
-        // anything on it.
+        // service.rs gates screen_off on Duplicate which forces vdd=None;
+        // defensive check so a stale settings.json can't sneak past.
         debug_assert!(
             self.cfg.vdd.is_none(),
             "screen_off + VDD configured — service.rs should have gated this"
@@ -737,29 +718,21 @@ impl Session {
             peer_label, android.display_width, android.display_height, android.pen_max_pressure,
         );
 
-        // Build the injector FIRST. `InputInjector::new` calls
-        // `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` as a
-        // side-effect — without that, DXGI returns DIPs (not physical
-        // pixels) on a scaled monitor and AffineTransform maps the pen
-        // into a too-small rect. The streaming path side-steps this
-        // because `Engine::start` does the same setup + re-enumerate
-        // dance internally; the screen_off path has no engine, so we
-        // do it here ourselves.
+        // Build the injector first — `InputInjector::new` sets process
+        // DPI awareness to PER_MONITOR_AWARE_V2 as a side-effect. The
+        // streaming path inherits this from `Engine::start`; we have no
+        // engine here so we do it via the injector before re-enumerating.
         let injector = Arc::new(Mutex::new(InputInjector::new()?));
         injector
             .lock()
             .await
             .set_pen_profile(self.cfg.pen_profile.clone());
 
-        // Re-enumerate monitors now that DPI awareness is set. The
-        // settings layer enumerated earlier under whatever DPI context
-        // the Tauri host left behind, which on a 150 % scaled display
-        // gave us 2/3 of the physical width — pen normalisation would
-        // then only cover 2/3 of the screen. Match the configured
-        // monitor by adapter LUID + device_name to refresh its dims;
-        // fall back to the cached MonitorInfo if the re-enumerate fails
-        // or the monitor disappeared (e.g. unplug between settings load
-        // and now).
+        // Re-enumerate now that DPI awareness is set: the GUI thread
+        // enumerated under Tauri's DPI context, which can report DIPs
+        // (a 150% display would give 2/3 of the physical width). Match
+        // by adapter LUID + device_name; fall back to cached info on
+        // error or if the monitor was unplugged in between.
         let monitor = match Engine::list_monitors() {
             Ok(mons) => mons
                 .into_iter()
@@ -794,11 +767,8 @@ impl Session {
             rotation_deg,
         );
 
-        // HELLO_PC. width/height come from the chosen monitor so the
-        // Android status line still has something to display
-        // ("connected 1920x1080") even though no video will follow.
-        // codec/bitrate/fps are placeholders the Android side ignores
-        // once it sees the SCREEN_OFF flag.
+        // HELLO_PC width/height keep the Android status line populated;
+        // codec/bitrate/fps are ignored client-side once SCREEN_OFF is seen.
         let codec_wire_id = match self.cfg.codec {
             Codec::H264 => CODEC_H264,
             Codec::Hevc => CODEC_HEVC,
@@ -813,10 +783,9 @@ impl Session {
         };
         write_frame(&mut writer, MSG_HELLO_PC, &hello_pc.encode()).await?;
 
-        // CLIENT_CONFIG carries the SCREEN_OFF bit. Older clients that
-        // don't know the bit fall back to "wait for VIDEO_CONFIG" and
-        // hang — that's fine, the GUI hides the toggle from end users
-        // who haven't updated the Android app.
+        // Old clients without the SCREEN_OFF bit will stall on
+        // "wait for VIDEO_CONFIG"; acceptable since the GUI toggle ships
+        // with the matching client update.
         let mut cfg_flags = CLIENT_CFG_FLAG_SCREEN_OFF;
         if self.cfg.hud_enabled {
             cfg_flags |= CLIENT_CFG_FLAG_HUD;
@@ -836,11 +805,8 @@ impl Session {
         }
 
         let writer = Arc::new(Mutex::new(writer));
-        // read_loop's signature still expects an idr_tx sender — the
-        // streaming path uses it to nudge the engine into emitting an
-        // IDR. With no engine, MSG_REQUEST_IDR from the client is a
-        // harmless no-op; we drop the receiver so the unbounded channel
-        // just buffers (and disappears with the session).
+        // No engine to nudge, but read_loop still expects an idr sender;
+        // drop the receiver so MSG_REQUEST_IDR is a harmless no-op.
         let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let read_result = read_loop(
@@ -855,8 +821,7 @@ impl Session {
         )
         .await;
 
-        // Clean shutdown so the Android side logs a goodbye instead of
-        // an EOF.
+        // GOODBYE so the client logs a clean shutdown instead of EOF.
         {
             let mut w = writer.lock().await;
             let _ = write_frame(&mut *w, MSG_PC_GOODBYE, &[]).await;

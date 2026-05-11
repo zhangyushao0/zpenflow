@@ -334,15 +334,11 @@ fn log_diagnostic(msg: &str) {
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
-    // Duplicate-mode VDD scrub. The MSI installer's devcon step leaves
-    // the VDD device ENABLED at rest (see installer/wxs/vdd-install.wxs:
-    // "comes up enabled by default"). The original Duplicate path just
-    // sets vdd=None so the session never enables a fresh VDD — but it
-    // also never disables a leftover one, leaving Windows with a phantom
-    // virtual monitor that breaks pen targeting (the pen lands on the
-    // dead VDD desktop instead of primary) and shows up as a second
-    // display. Detect that case and disable it before we pick a capture
-    // monitor.
+    // Disable any leftover VDD before picking a capture monitor in
+    // Duplicate mode. The MSI's devcon step enables VDD at install
+    // (see installer/wxs/vdd-install.wxs), and a force-killed Extend
+    // session can also leave it on — the dead virtual monitor would
+    // otherwise steal the pen target.
     if matches!(s.topology, settings::TopologyMode::Duplicate) {
         let leftover_vdd = Engine::list_monitors()
             .map(|ms| {
@@ -370,11 +366,9 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         }
     }
 
-    // Pick monitor: first attached non-software output, or a stub when
-    // VDD is taking over (`Session::run` ignores the field in that case).
-    // In Duplicate mode also exclude virtual monitors — even if the
-    // disable above failed (UAC denied) we'd rather pen-target a real
-    // physical monitor than a phantom VDD desktop.
+    // Pick monitor: first attached non-software output. In Duplicate also
+    // skip virtual ones so the pen still targets a real monitor when the
+    // VDD-disable above failed (e.g. UAC denied).
     let monitors = Engine::list_monitors().unwrap_or_default();
     let attached = if matches!(s.topology, settings::TopologyMode::Duplicate) {
         monitors
@@ -431,12 +425,9 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
-        // "Screen off" only ever takes effect in Duplicate topology — in
-        // Extend mode the panel would be the only display showing the
-        // VDD desktop, so blanking it makes the whole feature pointless.
-        // Enforcing the gate here means an old settings.json with
-        // `screen_off: true` paired with a topology change can't
-        // accidentally light it.
+        // Only honour screen_off in Duplicate — blanking the only display
+        // showing the VDD desktop is pointless, and this gate also stops
+        // a stale `screen_off: true` from lighting after a topology flip.
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }

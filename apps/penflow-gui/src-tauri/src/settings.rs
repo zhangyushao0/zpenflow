@@ -52,13 +52,10 @@ pub struct Settings {
     /// skips the VDD and captures the primary monitor directly.
     #[serde(default)]
     pub topology: TopologyMode,
-    /// Pen-tablet "screen off" mode. When `true` AND `topology` is
-    /// `Duplicate`, the session skips capture / encode / video send
-    /// entirely — the Android panel goes dark and pen + touch still flow
-    /// as input. Saves PC CPU/GPU cycles and tablet battery while still
-    /// letting the user draw on the primary monitor like a Wacom Intuos.
-    /// Ignored in `Extend` topology (the toggle in the GUI is hidden
-    /// there) — drawing on a phantom monitor nobody can see is useless.
+    /// Pen-tablet "screen off" mode: only active when `topology ==
+    /// Duplicate`. Panel goes dark, capture+encode skipped, pen+touch
+    /// still flow as input. Ignored in `Extend` (no point blanking the
+    /// only display showing the VDD desktop); GUI hides the toggle there.
     #[serde(default)]
     pub screen_off: bool,
 }
