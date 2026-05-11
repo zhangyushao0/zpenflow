@@ -59,6 +59,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::error::{EngineError, EngineResult};
 
 use super::binding::{Binding, MouseButtonKind, PenButtonProfile};
+use super::vmulti::{VMultiPen, VMultiPenSample};
 use super::{PenSample, TouchPoint};
 
 /// Multi-touch device capacity. Win32 docs allow up to 256, but the kernel
@@ -89,6 +90,18 @@ pub struct InputInjector {
 
     // --- touch state machine ---
     last_touch_pos: HashMap<u32, (i32, i32)>,
+
+    /// VMulti virtual digitizer (issue #23 follow-up). When `Some`, every
+    /// `inject_pen` writes a VMulti HID report instead of an
+    /// `InjectSyntheticPointerInput` synthetic pen frame — this gives the
+    /// receiver a full HID descriptor with declared logical resolution
+    /// (32767 per axis) so sub-pixel coords survive end-to-end with no
+    /// `ptHimetricLocation` scale guessing. `None` if the user hasn't
+    /// installed VMulti, in which case we keep using the legacy synthetic
+    /// pointer path. Barrel-button bindings (`PenButtonProfile`) keep
+    /// working regardless via the existing `SendInput` path; the choice
+    /// here only affects the position/pressure/tilt sample stream.
+    vmulti: Option<VMultiPen>,
 }
 
 // SAFETY: Win32 synthetic pointer device handles are documented as usable
@@ -128,6 +141,24 @@ impl InputInjector {
             }
         };
 
+        // Probe for VMulti at startup. Not finding it is the common case
+        // for users who haven't installed the driver yet — log clearly
+        // (so HUD / bug reports tell us which path is active) and fall
+        // through to the synthetic-pointer path.
+        let vmulti = match VMultiPen::open() {
+            Ok(v) => {
+                eprintln!("[inject] VMulti HID digitizer found — using VMulti path for pen");
+                Some(v)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[inject] VMulti probe: {e}; falling back to InjectSyntheticPointerInput \
+                     (install X9VoiD/vmulti-bin for higher-fidelity pen)"
+                );
+                None
+            }
+        };
+
         Ok(Self {
             pen_device,
             touch_device,
@@ -138,7 +169,13 @@ impl InputInjector {
             last_pen_buttons: 0,
             pen_eraser_sticky: false,
             last_touch_pos: HashMap::new(),
+            vmulti,
         })
+    }
+
+    /// Whether VMulti was found at startup and is the active pen backend.
+    pub fn using_vmulti(&self) -> bool {
+        self.vmulti.is_some()
     }
 
     /// Replace the active pen-button binding profile. Any keys currently
@@ -179,23 +216,74 @@ impl InputInjector {
     ///
     /// Also dispatches barrel-button transitions through the active
     /// `PenButtonProfile` BEFORE the pen sample lands.
+    ///
+    /// Routes to VMulti when present (issue #23). The synthetic-pointer
+    /// path is the fallback for users who haven't installed the driver.
+    /// Barrel-button bindings keep going through `dispatch_pen_buttons` →
+    /// `SendInput` either way.
     pub fn inject_pen(&mut self, sample: &PenSample) -> EngineResult<()> {
         self.dispatch_pen_buttons(sample.buttons)?;
 
         let effective_eraser = sample.eraser || self.pen_eraser_sticky;
 
-        if effective_eraser != self.last_pen_eraser && self.last_pen_in_range {
-            let mut flush = *sample;
-            flush.in_range = false;
-            flush.in_contact = false;
-            flush.pressure = 0.0;
-            self.write_pen(&flush, self.last_pen_eraser)?;
+        if self.vmulti.is_some() {
+            // VMulti's HID descriptor encodes eraser as a button bit
+            // (`Invert`) that the kernel translates into `PEN_FLAG_INVERTED`
+            // on the receiver side. There's no analog of the synthetic-
+            // pointer "out-of-range flush on eraser transition" hack
+            // needed — the HID class driver handles transitions cleanly
+            // because the report stream is a continuous truth stream
+            // (every report says what the pen is doing now, not a delta).
+            self.write_pen_vmulti(sample, effective_eraser)?;
+        } else {
+            if effective_eraser != self.last_pen_eraser && self.last_pen_in_range {
+                let mut flush = *sample;
+                flush.in_range = false;
+                flush.in_contact = false;
+                flush.pressure = 0.0;
+                self.write_pen(&flush, self.last_pen_eraser)?;
+            }
+            self.write_pen(sample, effective_eraser)?;
         }
-        self.write_pen(sample, effective_eraser)?;
+
         self.last_pen_eraser = effective_eraser;
         self.last_pen_in_range = sample.in_range;
         self.last_pen_in_contact = sample.in_contact;
         Ok(())
+    }
+
+    fn write_pen_vmulti(&mut self, sample: &PenSample, eraser: bool) -> EngineResult<()> {
+        let vmulti = self.vmulti.as_mut().expect("checked by caller");
+        // Pressure: PenSample.pressure is f32 [0, 1]. VMulti extended
+        // accepts [0, 16383]. Map and clamp.
+        let pressure_u16 =
+            (sample.pressure.clamp(0.0, 1.0) * 16383.0).round() as u16;
+        // Tilts: PenSample carries i32 degrees. VMulti wants i8 in
+        // [-127, 127]. Clamp to ±90 first (real digitizers report ±60
+        // typically), then cast.
+        let tilt_x = sample.tilt_x_deg.clamp(-90, 90) as i8;
+        let tilt_y = sample.tilt_y_deg.clamp(-90, 90) as i8;
+
+        let vsample = VMultiPenSample {
+            x: sample.x_logical,
+            y: sample.y_logical,
+            pressure: pressure_u16,
+            tilt_x_deg: tilt_x,
+            tilt_y_deg: tilt_y,
+            tip_down: sample.in_contact,
+            barrel: sample.buttons & 0b001 != 0, // bit 0 = primary barrel
+            eraser,
+            inverted: eraser,
+            in_range: sample.in_range,
+        };
+        vmulti.write_pen(&vsample).map_err(|e| match e {
+            crate::inject::vmulti::VMultiError::Win32(w) => EngineError::Win32(w),
+            crate::inject::vmulti::VMultiError::NotFound => {
+                // Shouldn't happen — handle was opened at startup. Surface
+                // as a Win32 error so callers see something.
+                EngineError::Win32(windows::core::Error::from_thread())
+            }
+        })
     }
 
     /// Edge-triggered binding dispatch for the three barrel buttons.
@@ -656,6 +744,8 @@ mod tests {
         let pen = PenSample {
             x: 1,
             y: 1,
+            x_logical: 1,
+            y_logical: 1,
             pressure: 0.0,
             tilt_x_deg: 0,
             tilt_y_deg: 0,

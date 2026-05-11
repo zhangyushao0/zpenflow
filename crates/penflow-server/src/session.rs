@@ -42,6 +42,11 @@ use penflow_protocol::{
 };
 use penflow_transport::{Transport, TransportStream};
 
+#[cfg(windows)]
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+};
+
 use crate::vdd::{
     force_monitor_mode, snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController,
     VddError,
@@ -813,6 +818,20 @@ async fn read_loop<R: AsyncRead + Unpin>(
     session_start: Instant,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
+    // Virtual-screen dimensions. Used to convert VMulti's normalized
+    // [0,1] tablet coords onto its logical-axis [0, 32767] range scaled
+    // across the full desktop. Captured once per session — monitor
+    // topology changes are rare and would require a session restart for
+    // the rest of the engine anyway.
+    #[cfg(windows)]
+    let (vscreen_w, vscreen_h) = unsafe {
+        (
+            GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32,
+            GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32,
+        )
+    };
+    #[cfg(not(windows))]
+    let (vscreen_w, vscreen_h) = (1u32, 1u32);
     loop {
         let (msg_id, payload) = match read_frame(&mut reader).await {
             Ok(v) => v,
@@ -831,9 +850,16 @@ async fn read_loop<R: AsyncRead + Unpin>(
             MSG_PEN_EVENT => {
                 let pe = PenEvent::decode(&payload)?;
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
+                // VMulti logical coords, scaled across the virtual screen.
+                // The Win32 / WinRT fallback path ignores these; the
+                // VMulti path uses them and ignores the i32 pixels above.
+                let (vx_log, vy_log) =
+                    coords.map_to_vmulti(pe.x_norm, pe.y_norm, vscreen_w, vscreen_h);
                 let sample = PenSample {
                     x,
                     y,
+                    x_logical: vx_log,
+                    y_logical: vy_log,
                     pressure: pe.pressure,
                     tilt_x_deg: pe.tilt_x as i32,
                     tilt_y_deg: pe.tilt_y as i32,

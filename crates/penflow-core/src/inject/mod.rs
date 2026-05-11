@@ -36,10 +36,23 @@ use std::time::Instant;
 
 /// One pen sample after coordinate transform — i.e., already in virtual-screen
 /// pixels and ready for `InjectSyntheticPointerInput`.
+///
+/// Carries two coordinate flavors: `x`/`y` are i32 virtual-screen-bbox-
+/// relative pixels (consumed by the Win32 synthetic-pointer fallback path
+/// and by cursor / overlay code); `x_logical`/`y_logical` are VMulti's
+/// `[0, 32767]` HID logical units (consumed by the VMulti path when a
+/// VMulti driver is installed). The caller computes both from the same
+/// `(x_norm, y_norm)` so the injector can route to whichever backend is
+/// active without re-doing the transform.
 #[derive(Clone, Copy, Debug)]
 pub struct PenSample {
     pub x: i32,
     pub y: i32,
+    /// VMulti logical-axis position, `[0, 32767]`. Same point as `x`/`y`,
+    /// just scaled into VMulti's HID descriptor range.
+    pub x_logical: u16,
+    /// VMulti logical-axis position, `[0, 32767]`.
+    pub y_logical: u16,
     /// `[0, 1]`. Caller should already have applied the per-profile
     /// `tip_threshold`; the injector treats `pressure > 0` as the indicator
     /// for "in contact" unless `force_in_contact` is set.
