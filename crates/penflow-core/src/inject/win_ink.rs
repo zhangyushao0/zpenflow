@@ -29,13 +29,62 @@
 //! and packaged Win32 processes alike, as long as the process is not under
 //! a Service-context isolation that strips access to the active console
 //! session's input subsystem.
+//!
+//! Sub-pixel pen coords (issue #23): `POINTER_INFO.ptPixelLocation` is a
+//! `POINT { x: i32, y: i32 }` — integer pixels, no sub-pixel mantissa.
+//! Receiving apps that want sub-pixel pen position read it from a different
+//! field, `ptHimetricLocation` (units of 0.01 mm). Qt's
+//! `QWindowsPointerHandler::translatePenEvent` is one such reader, but the
+//! mechanism applies to any consumer of `WM_POINTER` / `GetPointerPenInfo`
+//! that wants finer resolution:
+//!
+//! ```text
+//!   hiResX = dRect.left + (himetric_x - pRect.left)
+//!                       / (pRect.right - pRect.left)
+//!                       * (dRect.right - dRect.left)
+//! ```
+//!
+//! where `pRect` (in himetric) and `dRect` (in pixels) come from
+//! `GetPointerDeviceRects(device, &pRect, &dRect)` — the device handle the
+//! kernel attaches to our injected events.
+//!
+//! Empirical probe (see `examples/himetric_probe.rs`) confirmed:
+//!   1. Synthetic pen devices created via `CreateSyntheticPointerDevice(PT_PEN, …)`
+//!      DO appear in `GetPointerDevices` enumeration (with a product name
+//!      like `\\??\\Microsoft HID RID\\000D_0002\\<slot>`).
+//!   2. `GetPointerDeviceRects` accepts that handle and returns the rects
+//!      the kernel assigned for our device — typically `dRect == virtual
+//!      screen size`, `pRect == virtual_screen_size × (1/96 × 25.4 × DPI_assumption)`,
+//!      observed ratio ≈ 17.64 himetric/pixel on a ~144 DPI test rig.
+//!   3. The receiver uses THESE rects in the formula above, so we must
+//!      produce himetric values that round-trip through that formula to
+//!      our intended sub-pixel pixel coordinate.
+//!
+//! Inverse formula we apply per pen sample:
+//!
+//! ```text
+//!   himetric_x = pRect.left + (subpixel_x - dRect.left)
+//!                           * (pRect.right - pRect.left)
+//!                           / (dRect.right - dRect.left)
+//! ```
+//!
+//! Probed once at `InputInjector::new()` and cached. If the system rejects
+//! probing (e.g. a future Windows build removes synthetic-device
+//! enumeration), we fall back to `ptHimetricLocation = ptPixelLocation`
+//! (the Weylus / remote-stylus pattern — empirically safe but no sub-pixel).
+//!
+//! Caveat for users: synthetic pointer events arrive on the WinInk channel,
+//! not on Wintab. Krita 5 defaults to **Wintab** mode — users must switch
+//! to "Windows 8+ Pointer Input (Windows Ink)" under
+//! `Settings → Configure Krita → Tablet Settings` for the sub-pixel
+//! precision to reach them. Documented in `docs/HANDOFF.md`.
 
 use std::collections::{HashMap, HashSet};
 
-use windows::Win32::Foundation::POINT;
+use windows::Win32::Foundation::{HANDLE, POINT, RECT};
 use windows::Win32::UI::Controls::{
     CreateSyntheticPointerDevice, DestroySyntheticPointerDevice, HSYNTHETICPOINTERDEVICE,
-    POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
+    POINTER_DEVICE_INFO, POINTER_FEEDBACK_DEFAULT, POINTER_TYPE_INFO, POINTER_TYPE_INFO_0,
 };
 use windows::Win32::UI::HiDpi::{
     SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
@@ -47,9 +96,10 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
-    InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
-    POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE, POINTER_FLAG_NEW, POINTER_FLAG_PRIMARY,
-    POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO, POINTER_PEN_INFO, POINTER_TOUCH_INFO,
+    GetPointerDeviceRects, GetPointerDevices, InjectSyntheticPointerInput, POINTER_FLAGS,
+    POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON, POINTER_FLAG_INCONTACT, POINTER_FLAG_INRANGE,
+    POINTER_FLAG_NEW, POINTER_FLAG_PRIMARY, POINTER_FLAG_UP, POINTER_FLAG_UPDATE, POINTER_INFO,
+    POINTER_PEN_INFO, POINTER_TOUCH_INFO,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
@@ -66,6 +116,51 @@ use super::{PenSample, TouchPoint};
 /// (HANDOFF §1.5) and is plenty for the MovinkPad's 10-finger panel.
 const MAX_TOUCH_CONTACTS: u32 = 10;
 
+/// Cached `GetPointerDeviceRects` output for our synthetic pen device.
+/// Both rectangles are anchored at (0, 0) on all observed builds, but we
+/// store them verbatim in case a future Windows version moves the origin.
+///
+/// Apply the receiver-side formula to convert a sub-pixel virtual-screen-
+/// pixel position to himetric units that round-trip back to the same
+/// sub-pixel pixel when the receiver runs Qt's `hiResGlobalPos` math:
+///
+/// ```text
+///   himetric_x = pRect.left + (subpixel_x - dRect.left)
+///                           * (pRect.right - pRect.left)
+///                           / (dRect.right - dRect.left)
+/// ```
+#[derive(Clone, Copy, Debug)]
+struct HimetricMapping {
+    p_rect: RECT,
+    d_rect: RECT,
+}
+
+impl HimetricMapping {
+    /// Inverse of Qt's `hiResGlobalPos` formula. Maps a sub-pixel
+    /// virtual-screen-bbox-relative pixel coord to the himetric value that
+    /// the receiver's formula will turn back into the same sub-pixel pixel.
+    /// Returns `(hx, hy)` as i32 himetric (the API field type).
+    fn pixel_to_himetric(&self, sx: f32, sy: f32) -> (i32, i32) {
+        let p = self.p_rect;
+        let d = self.d_rect;
+        let pw = (p.right - p.left) as f32;
+        let dw = (d.right - d.left) as f32;
+        let ph = (p.bottom - p.top) as f32;
+        let dh = (d.bottom - d.top) as f32;
+        let hx = if dw > 0.0 {
+            p.left as f32 + (sx - d.left as f32) * pw / dw
+        } else {
+            sx
+        };
+        let hy = if dh > 0.0 {
+            p.top as f32 + (sy - d.top as f32) * ph / dh
+        } else {
+            sy
+        };
+        (hx.round() as i32, hy.round() as i32)
+    }
+}
+
 /// Unified pen + touch injector backed by Win32 synthetic pointer devices.
 pub struct InputInjector {
     /// `CreateSyntheticPointerDevice(PT_PEN, 1, …)` handle. Must outlive
@@ -73,6 +168,12 @@ pub struct InputInjector {
     pen_device: HSYNTHETICPOINTERDEVICE,
     /// `CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, …)`.
     touch_device: HSYNTHETICPOINTERDEVICE,
+
+    /// Kernel-assigned pRect/dRect for our pen device. `None` if the probe
+    /// failed (e.g. future Windows build that hides synthetic devices from
+    /// enumeration) — in that case `write_pen` aliases himetric=pixel as a
+    /// safe fallback. Issue #23.
+    pen_himetric: Option<HimetricMapping>,
 
     // --- pen flip-then-flush state (HANDOFF §1.5) ---
     last_pen_eraser: bool,
@@ -113,10 +214,35 @@ impl InputInjector {
         let _ =
             unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 
+        // Issue #23 probe: snapshot the pointer-device list BEFORE creating
+        // our synthetic pen, so we can diff AFTER and identify the kernel-
+        // visible HANDLE for our device, then query its pRect/dRect for
+        // accurate himetric scaling. See module-level comment.
+        let before = enumerate_pointer_devices_safe();
+
         let pen_device = unsafe {
             CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_DEFAULT)
                 .map_err(EngineError::from)?
         };
+        let pen_himetric = match enumerate_pointer_devices_safe() {
+            Some(after) => find_new_device_rects(&before.unwrap_or_default(), &after),
+            None => None,
+        };
+        // Diagnostic: print probe result once at startup so users / bug
+        // reports can confirm sub-pixel path is active (issue #23).
+        match pen_himetric {
+            Some(m) => eprintln!(
+                "[inject] pen himetric probe OK: pRect=({},{},{},{}) dRect=({},{},{},{}) ratio={:.4}",
+                m.p_rect.left, m.p_rect.top, m.p_rect.right, m.p_rect.bottom,
+                m.d_rect.left, m.d_rect.top, m.d_rect.right, m.d_rect.bottom,
+                (m.p_rect.right - m.p_rect.left) as f64
+                    / (m.d_rect.right - m.d_rect.left).max(1) as f64,
+            ),
+            None => eprintln!(
+                "[inject] pen himetric probe FAILED — falling back to himetric=pixel; \
+                 sub-pixel precision (issue #23) will NOT be active"
+            ),
+        }
         let touch_device = match unsafe {
             CreateSyntheticPointerDevice(PT_TOUCH, MAX_TOUCH_CONTACTS, POINTER_FEEDBACK_DEFAULT)
         } {
@@ -131,6 +257,7 @@ impl InputInjector {
         Ok(Self {
             pen_device,
             touch_device,
+            pen_himetric,
             last_pen_eraser: false,
             last_pen_in_range: false,
             last_pen_in_contact: false,
@@ -286,6 +413,17 @@ impl InputInjector {
         let tilt_y = sample.tilt_y_deg.clamp(-90, 90);
 
         let (vx, vy) = virtual_screen_origin();
+        // Sub-pixel position in the SAME virtual-screen-bbox-relative pixel
+        // space as ptPixelLocation, then mapped to himetric using the
+        // kernel-assigned pRect/dRect for our synthetic device (issue #23).
+        // If the startup probe failed, alias himetric=pixel — the
+        // empirically safe fallback observed in Weylus / remote-stylus.
+        let sub_x = sample.x_subpixel - vx as f32;
+        let sub_y = sample.y_subpixel - vy as f32;
+        let (hx, hy) = match self.pen_himetric {
+            Some(m) => m.pixel_to_himetric(sub_x, sub_y),
+            None => (sub_x.round() as i32, sub_y.round() as i32),
+        };
         let pen_info = POINTER_PEN_INFO {
             pointerInfo: POINTER_INFO {
                 pointerType: PT_PEN,
@@ -295,6 +433,7 @@ impl InputInjector {
                     x: sample.x - vx,
                     y: sample.y - vy,
                 },
+                ptHimetricLocation: POINT { x: hx, y: hy },
                 ..Default::default()
             },
             penFlags: pen_flags,
@@ -504,6 +643,64 @@ fn make_touch_info(id: u32, x: i32, y: i32, flags: POINTER_FLAGS) -> POINTER_TYP
     }
 }
 
+/// Enumerate pointer devices via `GetPointerDevices`. Returns `None` on
+/// failure (we treat that as "probe not supported" and fall back). Issue #23.
+fn enumerate_pointer_devices_safe() -> Option<Vec<POINTER_DEVICE_INFO>> {
+    let mut count: u32 = 0;
+    if unsafe { GetPointerDevices(&mut count, None) }.is_err() {
+        return None;
+    }
+    if count == 0 {
+        return Some(Vec::new());
+    }
+    let mut buf = vec![POINTER_DEVICE_INFO::default(); count as usize];
+    if unsafe { GetPointerDevices(&mut count, Some(buf.as_mut_ptr())) }.is_err() {
+        return None;
+    }
+    buf.truncate(count as usize);
+    Some(buf)
+}
+
+/// Diff before/after `CreateSyntheticPointerDevice` snapshots, find the new
+/// HANDLE, query its rects. Returns `None` if no new device appeared or the
+/// rect query failed — caller treats that as "fall back to himetric=pixel".
+fn find_new_device_rects(
+    before: &[POINTER_DEVICE_INFO],
+    after: &[POINTER_DEVICE_INFO],
+) -> Option<HimetricMapping> {
+    let new_handle = after.iter().find_map(|a| {
+        if before.iter().any(|b| handle_eq(b.device, a.device)) {
+            None
+        } else {
+            Some(a.device)
+        }
+    })?;
+    rects_for(new_handle)
+}
+
+fn handle_eq(a: HANDLE, b: HANDLE) -> bool {
+    a.0 == b.0
+}
+
+fn rects_for(device: HANDLE) -> Option<HimetricMapping> {
+    let mut p_rect = RECT::default();
+    let mut d_rect = RECT::default();
+    if unsafe { GetPointerDeviceRects(device, &mut p_rect, &mut d_rect) }.is_err() {
+        return None;
+    }
+    // Sanity: both rects must be non-degenerate. Sub-pixel math divides
+    // by (dRect.right - dRect.left) — a zero-width dRect would NaN every
+    // sample. Empty pRect would clamp every himetric to zero. In either
+    // pathological case, fall through to himetric=pixel aliasing.
+    if d_rect.right <= d_rect.left || d_rect.bottom <= d_rect.top {
+        return None;
+    }
+    if p_rect.right <= p_rect.left || p_rect.bottom <= p_rect.top {
+        return None;
+    }
+    Some(HimetricMapping { p_rect, d_rect })
+}
+
 /// One `SendInput` keyboard event. `down=true` is keydown, `false` is keyup.
 /// We use `SendInput` rather than the synthetic pointer path because
 /// pen-button modifier keys must look like a real keyboard to apps like
@@ -573,6 +770,77 @@ fn send_mouse_button(kind: MouseButtonKind, down: bool) -> EngineResult<()> {
 mod tests {
     use super::super::TouchState;
     use super::*;
+
+    /// Real numbers observed from `examples/himetric_probe.rs` on a 3840×2160
+    /// virtual screen with ~144 DPI assumption baked into the kernel:
+    ///   pRect = (0, 0, 67733, 38100)  ratio ≈ 17.6388 himetric/px
+    /// Reader-side Qt formula:
+    ///   hiResX = dRect.left + (himetric_x - pRect.left) / pw * dw
+    /// Our inverse should round-trip a sub-pixel value to ~0.01 px precision
+    /// (limited by i32 himetric quantization). Issue #23.
+    #[test]
+    fn himetric_round_trip_matches_qt_formula() {
+        let m = HimetricMapping {
+            p_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 67733,
+                bottom: 38100,
+            },
+            d_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 3840,
+                bottom: 2160,
+            },
+        };
+        // Pick a value the integer-pixel path would NOT preserve: 100.7
+        let (hx, hy) = m.pixel_to_himetric(100.7, 540.3);
+        // Reader-side reconstruction (Qt's formula in f64 to mimic qreal).
+        let pw = (m.p_rect.right - m.p_rect.left) as f64;
+        let dw = (m.d_rect.right - m.d_rect.left) as f64;
+        let ph = (m.p_rect.bottom - m.p_rect.top) as f64;
+        let dh = (m.d_rect.bottom - m.d_rect.top) as f64;
+        let reconstructed_x =
+            m.d_rect.left as f64 + (hx as f64 - m.p_rect.left as f64) / pw * dw;
+        let reconstructed_y =
+            m.d_rect.top as f64 + (hy as f64 - m.p_rect.top as f64) / ph * dh;
+        // Tolerance: one himetric step is 1/17.6 px ≈ 0.057 px on this rig.
+        assert!(
+            (reconstructed_x - 100.7).abs() < 0.06,
+            "x round-trip drift: got {reconstructed_x}, want 100.7 (himetric={hx})"
+        );
+        assert!(
+            (reconstructed_y - 540.3).abs() < 0.06,
+            "y round-trip drift: got {reconstructed_y}, want 540.3 (himetric={hy})"
+        );
+        // And: the integer-pixel path would have rounded to 101.0 — we beat
+        // that by a wide margin. (Without this fix, jaggies at zoom-in.)
+        assert!((reconstructed_x - 101.0).abs() > 0.1);
+    }
+
+    /// Edge case: dRect collapsed to zero width must not panic and must not
+    /// produce NaN. Falls through to identity (sub-pixel as himetric).
+    #[test]
+    fn himetric_handles_degenerate_d_rect() {
+        let m = HimetricMapping {
+            p_rect: RECT {
+                left: 0,
+                top: 0,
+                right: 100,
+                bottom: 100,
+            },
+            d_rect: RECT {
+                left: 5,
+                top: 5,
+                right: 5,
+                bottom: 5,
+            },
+        };
+        let (hx, hy) = m.pixel_to_himetric(42.0, 99.0);
+        assert_eq!(hx, 42);
+        assert_eq!(hy, 99);
+    }
 
     #[test]
     fn pen_flags_hover_arrival() {
@@ -656,6 +924,8 @@ mod tests {
         let pen = PenSample {
             x: 1,
             y: 1,
+            x_subpixel: 1.0,
+            y_subpixel: 1.0,
             pressure: 0.0,
             tilt_x_deg: 0,
             tilt_y_deg: 0,

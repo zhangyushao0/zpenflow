@@ -205,6 +205,20 @@ These are not in `design.md`. **Do not let them recur.**
 
 6. **NVENC `nvEncRegisterResource` cache miss per frame**: if you pass a different `ID3D11Texture2D*` each call, NVENC re-registers (~0.5 ms). Pipeline copies fresh DXGI frame into a **stable** keepalive texture (same pointer for the engine's lifetime), so register fires once. This is *also* what enables the keepalive optimization (§2.3 #2). Two birds, one texture.
 
+7. **Sub-pixel pen jitter on zoomed-out strokes** (issue #23). Symptom: draw a stroke with the canvas zoomed out, zoom back in, see visible stair-step jitter. Same gesture on the same hardware in native Android Krita is perfectly smooth. Root cause: `POINTER_INFO.ptPixelLocation` is `POINT { x: i32, y: i32 }` — integer pixels, no sub-pixel mantissa. Receiving apps that want sub-pixel pen position (Qt's `QWindowsPointerHandler::translatePenEvent` is one of them) read `ptHimetricLocation` (units of 0.01 mm) and apply the formula `hiResX = dRect.left + (himetric_x - pRect.left) / pw * dw`, where `pRect`/`dRect` come from `GetPointerDeviceRects` for the source device handle. We were leaving himetric at `..Default::default() = (0, 0)` and the receiver fell back to integer `ptPixelLocation`.
+
+   **Initial wrong fix**: hard-code `HIMETRIC_PER_PIXEL = 100` and multiply pixel → himetric. This visibly helped jitter (Qt's `hiResGlobalPos` started computing non-zero positions) but was empirically wrong: on a 3840×2160 / 144 DPI rig, the kernel-assigned `pRect` for our synthetic device was `(0, 0, 67733, 38100)` (≈ 17.6388 himetric/px). A pen at pixel 1920 with our 100× scale produced himetric 192000, which Qt's formula then mapped to `1920 × (100/17.64) = 10882` — way off screen — so the receiver fell back to `ptPixelLocation` after all. The "improvement" was dither at the fallback boundary, not real sub-pixel.
+
+   **Correct fix**: `examples/himetric_probe.rs` snapshots `GetPointerDevices` before+after `CreateSyntheticPointerDevice`, identifies our device by diff, and calls `GetPointerDeviceRects` on the resulting `HANDLE` — synthetic pen devices DO appear in the enumeration (product name `\\??\\Microsoft HID RID\\000D_0002\\<slot>`). The probe runs once at `InputInjector::new()`; the resulting `(pRect, dRect)` is cached on the injector and used per-sample to invert Qt's formula:
+
+   ```
+   himetric_x = pRect.left + (subpixel_x - dRect.left) * pw / dw
+   ```
+
+   This gives a himetric value that round-trips back to the original sub-pixel pixel position on the receiver side. Unit test `himetric_round_trip_matches_qt_formula` in `win_ink.rs` verifies the round-trip stays within one himetric step (~0.057 px on a 144 DPI rig). Fallback path when the probe fails (future Windows builds may hide synthetic devices): alias `ptHimetricLocation = ptPixelLocation` — the Weylus / remote-stylus pattern, empirically safe but no sub-pixel.
+
+   **User-facing requirement**: only works when the consumer app is on **Windows Ink / `WM_POINTER`** path. Krita 5 defaults to Wintab; users must switch under Settings → Configure Krita → Tablet Settings → "Windows 8+ Pointer Input (Windows Ink)". Our synthetic pointer injection does NOT appear on the Wintab channel — that's the Wacom driver's API surface. Any WinInk-aware app (CSP, Photoshop, Rebelle, OneNote, Designer, etc.) benefits; the fix is not Qt/Krita-specific.
+
 ### 2.4 Things that *should* work but were never validated end-to-end
 
 - AMD GPU. We have no AMD machine. The Media Foundation path *should* dispatch to AMD's HEVC encoder MFT; needs verification.

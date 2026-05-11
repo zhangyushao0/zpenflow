@@ -111,6 +111,17 @@ impl AffineTransform {
         let (fx, fy) = self.map(x, y);
         (fx.round() as i32, fy.round() as i32)
     }
+
+    /// Apply WITHOUT snapping. Returns sub-pixel virtual-screen-pixel
+    /// coordinates, same space as `map_to_pixel` but unrounded. Used to
+    /// populate `POINTER_INFO.ptHimetricLocation` so Qt's
+    /// `QWindowsPointerHandler::translatePenEvent` can synthesize a
+    /// sub-pixel `QTabletEvent::globalPosF()` for Krita (issue #23 —
+    /// `ptPixelLocation` is i32-only, drops the sub-pixel mantissa, and
+    /// shows up as visible jitter when canvas is zoomed in).
+    pub fn map_to_subpixel(&self, x: f32, y: f32) -> (f32, f32) {
+        self.map(x, y)
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +146,22 @@ mod tests {
         assert_eq!(t.map_to_pixel(0.0, 1.0), (100, 1280));
         assert_eq!(t.map_to_pixel(1.0, 1.0), (2020, 1280));
         assert_eq!(t.map_to_pixel(0.5, 0.5), (1060, 740));
+    }
+
+    #[test]
+    fn map_to_subpixel_preserves_fraction() {
+        // 0.5 across a 1920-wide output rect should land at the exact pixel
+        // midpoint 960.0 — not rounded to 960 or 959. This is the precision
+        // that map_to_pixel deliberately destroys and map_to_subpixel keeps,
+        // and it's what feeds ptHimetricLocation for issue #23.
+        let t = AffineTransform::from_normalized_to_rect(0, 0, 1920, 1080, 0);
+        let (fx, fy) = t.map_to_subpixel(0.5, 0.5);
+        assert!((fx - 960.0).abs() < 1e-4);
+        assert!((fy - 540.0).abs() < 1e-4);
+
+        // A normalized coord that lands between pixels stays between pixels.
+        let (fx, _) = t.map_to_subpixel(0.500_001, 0.5);
+        assert!(fx > 960.0 && fx < 961.0, "expected sub-pixel, got {fx}");
     }
 
     #[test]

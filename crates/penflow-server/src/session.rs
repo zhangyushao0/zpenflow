@@ -831,9 +831,16 @@ async fn read_loop<R: AsyncRead + Unpin>(
             MSG_PEN_EVENT => {
                 let pe = PenEvent::decode(&payload)?;
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
+                // Issue #23: keep the unrounded virtual-screen-pixel value
+                // alongside the i32 one so win_ink::write_pen can populate
+                // ptHimetricLocation. Same affine transform, same space —
+                // map_to_subpixel just skips the final .round() step.
+                let (xf, yf) = coords.map_to_subpixel(pe.x_norm, pe.y_norm);
                 let sample = PenSample {
                     x,
                     y,
+                    x_subpixel: xf,
+                    y_subpixel: yf,
                     pressure: pe.pressure,
                     tilt_x_deg: pe.tilt_x as i32,
                     tilt_y_deg: pe.tilt_y as i32,

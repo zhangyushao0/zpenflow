@@ -33,10 +33,25 @@ use std::time::Instant;
 
 /// One pen sample after coordinate transform — i.e., already in virtual-screen
 /// pixels and ready for `InjectSyntheticPointerInput`.
+///
+/// **x/y vs x_subpixel/y_subpixel** (issue #23): `x` and `y` are i32 pixels
+/// for the `ptPixelLocation` field (Win32 API takes `POINT { x: i32, y: i32 }`
+/// only — cursor / overlay alignment use this). `x_subpixel` and `y_subpixel`
+/// are the same coordinate in the same virtual-screen-pixel space but
+/// **unrounded** — they get scaled into `ptHimetricLocation` so Qt's
+/// `QWindowsPointerHandler::translatePenEvent` can recover sub-pixel
+/// precision for `QTabletEvent::globalPosF()`. Without the sub-pixel path,
+/// Krita on Windows Ink mode sees integer-pixel pen positions and
+/// renders visibly jaggy strokes when the canvas was drawn zoomed-out
+/// and is later inspected zoomed-in.
 #[derive(Clone, Copy, Debug)]
 pub struct PenSample {
     pub x: i32,
     pub y: i32,
+    /// Sub-pixel virtual-screen-pixel X. Same space as `x`, unrounded.
+    pub x_subpixel: f32,
+    /// Sub-pixel virtual-screen-pixel Y. Same space as `y`, unrounded.
+    pub y_subpixel: f32,
     /// `[0, 1]`. Caller should already have applied the per-profile
     /// `tip_threshold`; the injector treats `pressure > 0` as the indicator
     /// for "in contact" unless `force_in_contact` is set.
