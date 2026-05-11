@@ -124,13 +124,7 @@ impl AffineTransform {
     /// digitizer that should land only on a specific monitor (e.g. the
     /// VDD), callers can pass that monitor's pixel size and additionally
     /// shift the output via the affine's translation.
-    pub fn map_to_vmulti(
-        &self,
-        x: f32,
-        y: f32,
-        target_w_px: u32,
-        target_h_px: u32,
-    ) -> (u16, u16) {
+    pub fn map_to_vmulti(&self, x: f32, y: f32, target_w_px: u32, target_h_px: u32) -> (u16, u16) {
         let (fx, fy) = self.map(x, y);
         let tw = target_w_px.max(1) as f32;
         let th = target_h_px.max(1) as f32;

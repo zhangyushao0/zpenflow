@@ -256,8 +256,7 @@ impl InputInjector {
         let vmulti = self.vmulti.as_mut().expect("checked by caller");
         // Pressure: PenSample.pressure is f32 [0, 1]. VMulti extended
         // accepts [0, 16383]. Map and clamp.
-        let pressure_u16 =
-            (sample.pressure.clamp(0.0, 1.0) * 16383.0).round() as u16;
+        let pressure_u16 = (sample.pressure.clamp(0.0, 1.0) * 16383.0).round() as u16;
         // Tilts: PenSample carries i32 degrees. VMulti wants i8 in
         // [-127, 127]. Clamp to ±90 first (real digitizers report ±60
         // typically), then cast.

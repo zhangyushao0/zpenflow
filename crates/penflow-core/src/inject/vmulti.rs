@@ -144,8 +144,11 @@ pub enum VMultiError {
     /// No HID device matched VMulti's VID/PID + 65-byte control endpoint.
     /// Driver is not installed, or the binary we ship is incompatible
     /// with this Windows build.
-    #[error("VMulti HID device not found (VID=0x{:04X} PID=0x{:04X}); install X9VoiD/vmulti-bin",
-        VMULTI_VID, VMULTI_PID)]
+    #[error(
+        "VMulti HID device not found (VID=0x{:04X} PID=0x{:04X}); install X9VoiD/vmulti-bin",
+        VMULTI_VID,
+        VMULTI_PID
+    )]
     NotFound,
     /// Win32 surface error during enumeration or I/O.
     #[error("Win32: {0}")]
@@ -321,12 +324,7 @@ impl VMultiPen {
 
         let mut written = 0u32;
         unsafe {
-            WriteFile(
-                self.handle,
-                Some(&self.buf),
-                Some(&mut written),
-                None,
-            )?;
+            WriteFile(self.handle, Some(&self.buf), Some(&mut written), None)?;
         }
         Ok(())
     }

@@ -818,6 +818,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     session_start: Instant,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
+
     // Virtual-screen dimensions. Used to convert VMulti's normalized
     // [0,1] tablet coords onto its logical-axis [0, 32767] range scaled
     // across the full desktop. Captured once per session — monitor
