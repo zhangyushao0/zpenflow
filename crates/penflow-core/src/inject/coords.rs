@@ -111,6 +111,33 @@ impl AffineTransform {
         let (fx, fy) = self.map(x, y);
         (fx.round() as i32, fy.round() as i32)
     }
+
+    /// Map normalized pen coords `[0,1]²` to VMulti's logical units
+    /// `[0, 32767]²`, scaled across `(target_w_px, target_h_px)`.
+    ///
+    /// VMulti's HID descriptor declares `logical_min/max = 0..32767` per
+    /// axis. The receiver-side mapping from those logical units onto
+    /// screen pixels happens inside the Windows kernel, using the
+    /// digitizer's physical-axis declaration plus the monitor it's
+    /// associated with. For a digitizer that spans the full virtual
+    /// screen, callers pass `vscreen_w / vscreen_h` here. For a
+    /// digitizer that should land only on a specific monitor (e.g. the
+    /// VDD), callers can pass that monitor's pixel size and additionally
+    /// shift the output via the affine's translation.
+    pub fn map_to_vmulti(
+        &self,
+        x: f32,
+        y: f32,
+        target_w_px: u32,
+        target_h_px: u32,
+    ) -> (u16, u16) {
+        let (fx, fy) = self.map(x, y);
+        let tw = target_w_px.max(1) as f32;
+        let th = target_h_px.max(1) as f32;
+        let ux = ((fx / tw) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        let uy = ((fy / th) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        (ux, uy)
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +162,33 @@ mod tests {
         assert_eq!(t.map_to_pixel(0.0, 1.0), (100, 1280));
         assert_eq!(t.map_to_pixel(1.0, 1.0), (2020, 1280));
         assert_eq!(t.map_to_pixel(0.5, 0.5), (1060, 740));
+    }
+
+    #[test]
+    fn map_to_vmulti_spans_full_logical_range() {
+        // VDD at origin, 3840x2160; tablet norm [0,1] → VDD pixel [0..3840, 0..2160]
+        // → VMulti logical [0..32767].
+        let t = AffineTransform::from_normalized_to_rect(0, 0, 3840, 2160, 0);
+        assert_eq!(t.map_to_vmulti(0.0, 0.0, 3840, 2160), (0, 0));
+        assert_eq!(t.map_to_vmulti(1.0, 1.0, 3840, 2160), (32767, 32767));
+        let (mx, my) = t.map_to_vmulti(0.5, 0.5, 3840, 2160);
+        assert!(mx.abs_diff(16383) <= 1 && my.abs_diff(16383) <= 1);
+    }
+
+    #[test]
+    fn map_to_vmulti_offset_rect_lands_proportionally() {
+        // VDD at (1920, 0), 1920x1080; on a virtual screen 3840x1080, this
+        // covers the right half. Tablet (0,0) → VDD top-left → virtual
+        // pixel (1920, 0) → VMulti logical (16383, 0).
+        let t = AffineTransform::from_normalized_to_rect(1920, 0, 1920, 1080, 0);
+        let (mx, my) = t.map_to_vmulti(0.0, 0.0, 3840, 1080);
+        assert!(mx.abs_diff(16383) <= 1, "got {mx}");
+        assert_eq!(my, 0);
+        // Tablet (1,1) → VDD bottom-right pixel (3840, 1080) → VMulti
+        // logical (32767, 32767).
+        let (mx, my) = t.map_to_vmulti(1.0, 1.0, 3840, 1080);
+        assert_eq!(mx, 32767);
+        assert_eq!(my, 32767);
     }
 
     #[test]

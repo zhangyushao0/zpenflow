@@ -29,6 +29,9 @@ pub mod coords;
 #[cfg(windows)]
 pub mod win_ink;
 
+#[cfg(windows)]
+pub mod vmulti;
+
 use std::time::Instant;
 
 /// One pen sample after coordinate transform — i.e., already in virtual-screen
