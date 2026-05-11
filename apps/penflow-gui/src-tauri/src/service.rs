@@ -334,9 +334,13 @@ fn log_diagnostic(msg: &str) {
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     let s = settings.read().expect("settings poisoned").clone();
 
-    // MSI install enables VDD by default (installer/wxs/vdd-install.wxs);
-    // a force-killed Extend session can also leave it on. In Duplicate
-    // disable it so the leftover virtual monitor doesn't steal the pen.
+    // Duplicate captures the user's primary monitor directly, so the
+    // bundled VDD virtual display should not be attached. Disable it if
+    // a previous Extend session (or the MSI installer, which enables it
+    // by default — see installer/wxs/vdd-install.wxs) left it on.
+    // Without this, the user sees a phantom second monitor AND the
+    // `attached` selection below could pick the VDD as the capture
+    // target instead of the real primary.
     if matches!(s.topology, settings::TopologyMode::Duplicate) {
         let leftover_vdd = Engine::list_monitors()
             .map(|ms| {
@@ -364,8 +368,9 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         }
     }
 
-    // In Duplicate also skip virtual monitors (belt + suspenders for the
-    // VDD-disable above; if UAC was denied we still pen-target a real one).
+    // In Duplicate, exclude virtual monitors from selection. Normally
+    // redundant after the disable above, but kept as a fallback for
+    // when that failed (UAC denied, no controller found).
     let monitors = Engine::list_monitors().unwrap_or_default();
     let attached = if matches!(s.topology, settings::TopologyMode::Duplicate) {
         monitors
@@ -422,7 +427,8 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         vdd,
         vdd_target_resolution,
         hud_enabled: s.hud_enabled,
-        // Screen-off only makes sense in Duplicate.
+        // Screen-off requires Duplicate — blanking the tablet in Extend
+        // mode would leave the user with no view of the VDD desktop.
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }
