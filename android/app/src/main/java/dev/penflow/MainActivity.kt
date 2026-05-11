@@ -164,14 +164,11 @@ class MainActivity : Activity() {
             is PenflowClient.State.Error -> "error: ${st.message}"
         }
         if (st is PenflowClient.State.Connected) {
-            if (screenOff) {
-                // Must set activeRect to a non-empty rect; PenInputCapture
-                // divides by rect.width/height and the default empty Rect
-                // collapses every sample to (1.0, 1.0).
-                applyFullPanelRect()
-            } else {
-                applyContainLayout(st.width, st.height)
-            }
+            // Run the contain layout in both modes so activeRect preserves
+            // the target monitor's aspect ratio — otherwise pen strokes
+            // would be stretched in screen_off when panel and monitor
+            // aspects differ. SurfaceView resize is a no-op when GONE.
+            applyContainLayout(st.width, st.height)
         }
     }
 
@@ -187,18 +184,6 @@ class MainActivity : Activity() {
             lp.screenBrightness = target
             window.attributes = lp
             Log.i(TAG, "screen_off=$dim — brightness override = $target")
-        }
-    }
-
-    /** activeRect = whole panel. Screen_off counterpart of applyContainLayout. */
-    private fun applyFullPanelRect() {
-        val root = findViewById<View>(android.R.id.content)
-        root.post {
-            val pw = root.width
-            val ph = root.height
-            if (pw <= 0 || ph <= 0) return@post
-            activeRect = Rect(0, 0, pw, ph)
-            Log.i(TAG, "screen_off — pen captures full panel ${pw}x${ph}")
         }
     }
 
