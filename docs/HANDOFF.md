@@ -205,6 +205,11 @@ These are not in `design.md`. **Do not let them recur.**
 
 6. **NVENC `nvEncRegisterResource` cache miss per frame**: if you pass a different `ID3D11Texture2D*` each call, NVENC re-registers (~0.5 ms). Pipeline copies fresh DXGI frame into a **stable** keepalive texture (same pointer for the engine's lifetime), so register fires once. This is *also* what enables the keepalive optimization (§2.3 #2). Two birds, one texture.
 
+7. **Pen-stroke jitter via `InjectSyntheticPointerInput`** (issue #23): synthetic pointer injection takes `ptPixelLocation` as `POINT { x: i32, y: i32 }` — integer-pixel only. Visible as stair-step jitter when zooming in on strokes drawn at zoomed-out canvas. Investigation:
+   - The `ptHimetricLocation` field is a documented sub-pixel channel on the receive side, but its scale for synthetic devices is undocumented; an empirical kernel-pRect probe on a 144-DPI rig showed ~17.6 himetric/pixel, which improves jitter ~17× but doesn't eliminate it.
+   - SuperDisplay's drivers (`C:\Program Files\SuperDisplay\drivers\`) revealed the actual production answer: they ship a **VMulti** HID virtual digitizer (`superdisplay_hid.dll` contains the `VMulti*` symbol set verbatim). The kernel sees a real HID digitizer with declared `logical_max=32767` per axis → genuine sub-pixel coords flow into `POINTER_INFO` automatically, no scale guessing.
+   - **Fix in `feat/vmulti-hid-injection`**: ship the [X9VoiD/vmulti-bin](https://github.com/X9VoiD/vmulti-bin) community fork (signed, MIT, 16384-pressure extended pen) as an optional driver. `InputInjector::new()` probes for it (VID `0x00FF` / PID `0xBACC` + 65-byte output report) and uses it when present; falls back to `InjectSyntheticPointerInput` otherwise. Report wire format: 12-byte extended digitizer report (REPORTID 0x06), little-endian, ported verbatim from `research/VoiDPlugins/src/VoiDPlugins.Library/VMulti/Device/` (the OpenTabletDriver WindowsInk plugin — the canonical open-source VMulti consumer). User-side install: download `VMulti.Driver.zip` from the vmulti-bin release page, run `install_hiddriver.bat` as admin. Bundled installer UX is a separate task.
+
 ### 2.4 Things that *should* work but were never validated end-to-end
 
 - AMD GPU. We have no AMD machine. The Media Foundation path *should* dispatch to AMD's HEVC encoder MFT; needs verification.
