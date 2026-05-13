@@ -232,6 +232,15 @@ fn relaunch_as_admin(app: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// True if any virtual-display-driver monitor is currently attached
+/// to the desktop. Used at GUI startup to detect a leaked VDD from a
+/// prior abnormally-terminated Penflow process or a fresh MSI install.
+fn vdd_currently_attached() -> bool {
+    penflow_core::Engine::list_monitors()
+        .map(|ms| ms.iter().any(|m| m.attached_to_desktop && m.looks_virtual))
+        .unwrap_or(false)
+}
+
 fn main() -> std::process::ExitCode {
     // VDD helper sub-mode: when `VddController::enable()` re-launches us
     // elevated via `ShellExecuteW("runas", current_exe, "--vdd-helper
@@ -287,6 +296,30 @@ fn main() -> std::process::ExitCode {
         }
         if handed_off {
             std::process::exit(0);
+        }
+    }
+
+    // Crash-recovery: if a previous Penflow instance died abnormally
+    // (Task Manager kill, BSOD, panic before Drop ran) or the MSI
+    // installer left VDD in its install-time enabled state, the device
+    // is currently attached to the desktop without anything in user-
+    // space holding it. The session-end disable never ran, the
+    // persistent CONFIGFLAG_DISABLED was never written, and Windows
+    // re-enumerated VDD enabled at boot — issue #22. Catch it here
+    // before the GUI even renders, so the first session starts from a
+    // clean off-state. Costs one UAC if leftover is real; silent
+    // otherwise (no VDD installed, or already disabled).
+    if let Ok(Some(mut ctrl)) = penflow_server::VddController::detect() {
+        if vdd_currently_attached() {
+            eprintln!(
+                "[gui] startup: VDD attached without Penflow holding it; disabling for clean state"
+            );
+            match ctrl.disable() {
+                Ok(()) => eprintln!("[gui] startup VDD disable OK"),
+                Err(e) => {
+                    eprintln!("[gui] startup VDD disable failed: {e} (continuing)");
+                }
+            }
         }
     }
 
