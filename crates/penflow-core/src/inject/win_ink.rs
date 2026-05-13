@@ -519,13 +519,22 @@ fn pen_pointer_flags(
     in_range: bool,
     in_contact: bool,
 ) -> POINTER_FLAGS {
+    // PRIMARY is what tells the OS to promote this pointer to legacy mouse
+    // messages and drive the system cursor. We only register one synthetic
+    // pen device with `maxCount=1`, so every frame from it is unambiguously
+    // the primary pointer. Without this flag, WM_POINTER-aware apps still
+    // get the pen frames at the right coords, but legacy-mouse apps (and
+    // GetCursorPos) never see the position update — Chrome's pen→right-click
+    // path reads the cursor at WM_CONTEXTMENU time and opens the menu at the
+    // stale mouse position instead of the pen tip.
     if !in_range {
         // Leaving proximity (or already gone). UP is the documented terminal
-        // transition; INRANGE is intentionally cleared.
-        return POINTER_FLAG_UP;
+        // transition; INRANGE is intentionally cleared. PRIMARY persists so
+        // the final lift also promotes to a mouse event.
+        return POINTER_FLAG_UP | POINTER_FLAG_PRIMARY;
     }
 
-    let mut flags = POINTER_FLAG_INRANGE;
+    let mut flags = POINTER_FLAG_INRANGE | POINTER_FLAG_PRIMARY;
     if !was_in_range {
         flags |= POINTER_FLAG_NEW;
     }
@@ -711,6 +720,31 @@ mod tests {
         let f = pen_pointer_flags(true, false, false, false);
         assert!(f & POINTER_FLAG_UP != POINTER_FLAGS(0));
         assert!(f & POINTER_FLAG_INRANGE == POINTER_FLAGS(0));
+    }
+
+    /// PRIMARY must be set on every emitted frame — including the final UP
+    /// that takes the pen out of range — so the kernel pointer router
+    /// promotes the position to a legacy mouse event and `GetCursorPos`
+    /// stays in sync. Without this, Chrome's pen→right-click opens its
+    /// context menu at the stale cursor position.
+    #[test]
+    fn pen_flags_always_primary() {
+        let cases = [
+            (false, false, true, false), // hover arrival
+            (false, false, true, true),  // direct contact
+            (true, false, true, true),   // hover → contact
+            (true, true, true, true),    // contact continuing
+            (true, true, true, false),   // contact → hover
+            (true, false, false, false), // leave proximity
+            (true, true, false, false),  // contact → out-of-range
+        ];
+        for (wr, wc, r, c) in cases {
+            let f = pen_pointer_flags(wr, wc, r, c);
+            assert!(
+                f & POINTER_FLAG_PRIMARY != POINTER_FLAGS(0),
+                "missing PRIMARY for (was_range={wr}, was_contact={wc}, range={r}, contact={c})"
+            );
+        }
     }
 
     /// Smoke: build the unified injector. The only failure modes here are
