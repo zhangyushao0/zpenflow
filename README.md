@@ -48,7 +48,7 @@ The encoder uses Windows Media Foundation's hardware-MFT path and selects the ma
 |---|---|---|
 | **NVIDIA** | NVENC | ✅ Daily-driver-tested (RTX 5070) |
 | Intel | Quick Sync (QSV) | 🟡 Code path exists; **not yet validated** on real hardware |
-| AMD | AMF | 🟡 Code path exists; **not yet validated** on real hardware |
+| AMD | AMF | ✅ Daily-driver-tested (RX 6600) |
 
 If you run Penflow on Intel Arc / iGPU or Radeon and it works (or doesn't), please file an issue with `dxdiag` output — that's how we close out the matrix.
 
