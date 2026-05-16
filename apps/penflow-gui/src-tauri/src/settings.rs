@@ -56,6 +56,11 @@ pub struct Settings {
     /// capture+encode skipped; pen + touch still flow.
     #[serde(default)]
     pub screen_off: bool,
+    /// Drop incoming touch/hand-gesture events server-side (Duplicate
+    /// topology only). Lets users palm-rest on the tablet without the OS
+    /// interpreting fingers as taps. Pen samples are unaffected.
+    #[serde(default)]
+    pub disable_touch: bool,
 }
 
 fn default_hud_enabled() -> bool {
@@ -75,6 +80,7 @@ impl Default for Settings {
             hud_enabled: default_hud_enabled(),
             topology: TopologyMode::default(),
             screen_off: false,
+            disable_touch: false,
         }
     }
 }
