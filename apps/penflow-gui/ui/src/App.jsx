@@ -241,25 +241,24 @@ const useStyles = makeStyles({
         marginTop: "-4px",
         marginBottom: "8px",
     },
-    // Primary-button green variant for the header Reconnect button when a
-    // peer is actually connected. Uses Fluent's success-status tokens so it
-    // tracks the active theme; brightness filter handles hover/pressed
-    // since the green palette doesn't ship explicit hover variants.
+    // Connected-state Pause button: white background with dark text so it
+    // reads as a calm "currently up" indicator rather than a primary-blue
+    // call-to-action. Colors are hardcoded (rather than tokens) because
+    // we want literal white regardless of theme — Fluent's neutral
+    // tokens go dark on the dark theme this app uses.
     connectBtnConnected: {
-        backgroundColor: tokens.colorStatusSuccessBackground3,
-        ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
-        color: tokens.colorNeutralForegroundOnBrand,
+        backgroundColor: "#ffffff",
+        ...shorthands.borderColor("#ffffff"),
+        color: "#1f1f1f",
         ":hover": {
-            backgroundColor: tokens.colorStatusSuccessBackground3,
-            ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
-            color: tokens.colorNeutralForegroundOnBrand,
-            filter: "brightness(1.08)",
+            backgroundColor: "#f3f3f3",
+            ...shorthands.borderColor("#f3f3f3"),
+            color: "#1f1f1f",
         },
         ":hover:active": {
-            backgroundColor: tokens.colorStatusSuccessBackground3,
-            ...shorthands.borderColor(tokens.colorStatusSuccessBorderActive),
-            color: tokens.colorNeutralForegroundOnBrand,
-            filter: "brightness(0.92)",
+            backgroundColor: "#e6e6e6",
+            ...shorthands.borderColor("#e6e6e6"),
+            color: "#1f1f1f",
         },
     },
     // Icon-only Reconnect button next to the status button. Fixed-square
