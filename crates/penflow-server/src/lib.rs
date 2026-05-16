@@ -7,7 +7,6 @@
 
 #![deny(missing_docs)]
 
-pub mod diag;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]

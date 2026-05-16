@@ -49,7 +49,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
 };
 
-use crate::diag::log as dlog;
 use crate::vdd::{
     force_monitor_mode, snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController,
     VddError,
@@ -348,19 +347,8 @@ impl Session {
                 vdd.friendly_name(),
                 vdd.instance_id()
             );
-            dlog(&format!(
-                "[session] enabling VDD '{}' instance_id={}",
-                vdd.friendly_name(),
-                vdd.instance_id(),
-            ));
             let baseline_attached = snapshot_attached_monitor_keys()?;
-            match vdd.enable() {
-                Ok(()) => dlog("[session] VDD enable() returned Ok"),
-                Err(e) => {
-                    dlog(&format!("[session] VDD enable() FAILED: {e}"));
-                    return Err(e.into());
-                }
-            }
+            vdd.enable()?;
             // Windows + the VDD driver itself can take a couple of seconds
             // to publish the new monitor through DXGI on a cold start (it
             // re-reads vdd_settings.xml, calls IddCxMonitorArrival, and
@@ -368,25 +356,12 @@ impl Session {
             // generous; if we hit this we genuinely have a driver/topology
             // problem.
             let instance_id = vdd.instance_id().to_string();
-            let mut virt = match wait_for_virtual_monitor(
+            let mut virt = wait_for_virtual_monitor(
                 Duration::from_secs(15),
                 Some(&instance_id),
                 Some(&baseline_attached),
             )
-            .await
-            {
-                Ok(v) => {
-                    dlog(&format!(
-                        "[session] wait_for_virtual_monitor OK — {} {}x{}",
-                        v.device_name, v.width, v.height
-                    ));
-                    v
-                }
-                Err(e) => {
-                    dlog(&format!("[session] wait_for_virtual_monitor FAILED: {e}"));
-                    return Err(e.into());
-                }
-            };
+            .await?;
             eprintln!(
                 "[session] virtual monitor up: {} {}x{} on {} (adapter LUID 0x{:016x})",
                 virt.device_name, virt.width, virt.height, virt.adapter_name, virt.adapter_luid

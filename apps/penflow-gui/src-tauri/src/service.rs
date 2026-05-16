@@ -20,7 +20,6 @@ use tokio::task::JoinHandle;
 
 use penflow_core::inject::binding::{Binding as CoreBinding, MouseButtonKind, PenButtonProfile};
 use penflow_core::Engine;
-use penflow_server::diag::log as dlog;
 use penflow_server::{Session, SessionConfig, SessionEvent, VddController};
 use penflow_transport::adb::AdbLocalAbstractTransport;
 use penflow_transport::Transport;
@@ -113,10 +112,8 @@ impl Service {
     pub async fn start(self: &Arc<Self>) {
         let mut inner = self.inner.lock().await;
         if inner.task.is_some() {
-            dlog("[service] start() ignored — accept loop already running");
             return;
         }
-        dlog("[service] start() spawning accept loop");
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let me = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -128,7 +125,6 @@ impl Service {
 
     /// Stop the accept-loop. Cancels any in-flight session as well.
     pub async fn stop(&self) {
-        dlog("[service] stop() requested");
         let mut inner = self.inner.lock().await;
         if let Some(c) = inner.cancel.take() {
             let _ = c.send(());
@@ -140,27 +136,18 @@ impl Service {
         }
         inner.last_state = ServiceState::Stopped;
         let _ = self.events.send(ServiceState::Stopped);
-        // Snapshot monitor list AFTER stop — Issue 1 diagnosis. If VDD's
-        // virtual monitor is still attached here, Drop on VddController
-        // didn't fire (or its disable failed silently), and reconnect
-        // will see a "leftover VDD" and try to clean it up the long way.
-        log_monitor_snapshot("after stop()");
     }
 
     async fn emit(&self, s: ServiceState) {
-        dlog(&format!("[service] emit state: {s:?}"));
         self.inner.lock().await.last_state = s.clone();
         let _ = self.events.send(s);
     }
 
     async fn run_accept_loop(self: Arc<Self>, mut cancel: tokio::sync::oneshot::Receiver<()>) {
         eprintln!("[service] accept loop started");
-        dlog("[service] accept loop started");
-        log_monitor_snapshot("accept loop entry");
         loop {
             if cancel.try_recv().is_ok() {
                 eprintln!("[service] cancel received, exiting");
-                dlog("[service] cancel received, accept loop exiting");
                 return;
             }
 
@@ -363,32 +350,31 @@ fn bundled_or_path_adb() -> String {
     "adb".to_string()
 }
 
-/// Legacy alias for the shared file logger. Kept so existing call sites
-/// in the error paths above don't need to change. New code should call
-/// [`dlog`] directly.
+/// Append a diagnostic line to %APPDATA%/Penflow/debug.log. Best-effort —
+/// failures here are silently dropped (we don't want logging itself to be
+/// the thing that hangs a service-startup error path).
 fn log_diagnostic(msg: &str) {
-    dlog(msg);
-}
-
-/// One-line summary of every monitor `Engine::list_monitors` returns, so
-/// the debug.log captures the desktop topology at each transition.
-/// Critical for Issue 1 (does VDD's virtual monitor come back after
-/// reconnect?) and Issue 2 (is there a screen to the right of primary
-/// when the user reports their pen leaking there?).
-fn log_monitor_snapshot(tag: &str) {
-    match Engine::list_monitors() {
-        Ok(ms) => {
-            dlog(&format!("[service] monitor snapshot ({tag}): {} entries", ms.len()));
-            for (i, m) in ms.iter().enumerate() {
-                dlog(&format!(
-                    "[service]   [{i}] {}x{} attached={} virtual={} software={} name={:?}",
-                    m.width, m.height, m.attached_to_desktop, m.looks_virtual,
-                    m.adapter_is_software, m.device_name,
-                ));
-            }
-        }
-        Err(e) => dlog(&format!("[service] monitor snapshot ({tag}): list_monitors failed: {e}")),
+    use std::io::Write;
+    let Some(base) = std::env::var_os("APPDATA").map(std::path::PathBuf::from) else {
+        return;
+    };
+    let dir = base.join("Penflow");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
     }
+    let path = dir.join("debug.log");
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{now}] {msg}");
 }
 
 fn build_session_config(settings: &SharedSettings) -> SessionConfig {
@@ -452,25 +438,12 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
     // clone is too unreliable to drive the VDD as a mirror).
     let vdd = if matches!(s.topology, settings::TopologyMode::Duplicate) {
         eprintln!("[service] Duplicate mode — bypassing VDD");
-        dlog("[service] build_session_config: Duplicate mode, VDD bypassed");
         None
     } else {
         match VddController::detect() {
-            Ok(Some(ctrl)) => {
-                dlog(&format!(
-                    "[service] build_session_config: VDD detected — instance_id={} friendly={}",
-                    ctrl.instance_id(),
-                    ctrl.friendly_name(),
-                ));
-                Some(ctrl)
-            }
-            Ok(None) => {
-                dlog("[service] build_session_config: VDD detect returned None (not installed?)");
-                None
-            }
+            Ok(opt) => opt,
             Err(e) => {
                 eprintln!("[service] VDD detection failed: {e}");
-                dlog(&format!("[service] build_session_config: VDD detect failed: {e}"));
                 None
             }
         }

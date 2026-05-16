@@ -47,8 +47,6 @@ use std::time::{Duration, Instant};
 
 use thiserror::Error;
 use windows::core::PCWSTR;
-
-use crate::diag::log as dlog;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, CM_Locate_DevNodeW,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
@@ -361,26 +359,14 @@ impl VddController {
     /// Disable the device. If a resident helper is alive, signal it (no
     /// UAC). Otherwise fall back to spawning a one-shot elevated helper.
     pub fn disable(&mut self) -> Result<(), VddError> {
-        dlog(&format!(
-            "[vdd] disable() instance_id={} enabled_flag={} resident_helper={}",
-            self.instance_id,
-            self.enabled,
-            self.resident.is_some(),
-        ));
-        let result = if let Some(mut helper) = self.resident.take() {
+        if let Some(mut helper) = self.resident.take() {
             helper.shutdown();
             // helper drops here, closing handles.
-            Ok(())
         } else if is_process_elevated() {
-            cm_disable(&self.instance_id)
+            cm_disable(&self.instance_id)?;
         } else {
-            run_helper_elevated("disable", &self.instance_id)
-        };
-        match &result {
-            Ok(()) => dlog("[vdd] disable() succeeded"),
-            Err(e) => dlog(&format!("[vdd] disable() FAILED: {e}")),
+            run_helper_elevated("disable", &self.instance_id)?;
         }
-        result?;
         self.enabled = false;
         Ok(())
     }
@@ -389,10 +375,7 @@ impl VddController {
 impl Drop for VddController {
     fn drop(&mut self) {
         if self.enabled {
-            dlog("[vdd] Drop called with enabled=true; running disable()");
             let _ = self.disable();
-        } else {
-            dlog("[vdd] Drop called with enabled=false; skipping disable");
         }
     }
 }
