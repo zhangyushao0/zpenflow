@@ -684,38 +684,38 @@ export default function App() {
     // (primary blue), state-name disabled for everything transitional.
     // The Reconnect icon button to its left is the explicit
     // "save + stop + start" gesture and is owned separately.
-    let topLabel;
-    let topClass;
-    let topDisabled = false;
+    let statusActionLabel;
+    let statusActionClass;
+    let statusActionDisabled = false;
     switch (status.state) {
         case "connected":
-            topLabel = "Pause";
-            topClass = styles.connectBtnConnected;
+            statusActionLabel = "Pause";
+            statusActionClass = styles.connectBtnConnected;
             break;
         case "listening":
         case "disconnected":
-            topLabel = "Waiting for tablet…";
-            topDisabled = true;
+            statusActionLabel = "Waiting for tablet…";
+            statusActionDisabled = true;
             break;
         case "preparing":
-            topLabel = "Preparing…";
-            topDisabled = true;
+            statusActionLabel = "Preparing…";
+            statusActionDisabled = true;
             break;
         case "connecting":
-            topLabel = "Connecting…";
-            topDisabled = true;
+            statusActionLabel = "Connecting…";
+            statusActionDisabled = true;
             break;
         case "error":
-            topLabel = "Error";
-            topClass = styles.connectBtnError;
-            topDisabled = true;
+            statusActionLabel = "Error";
+            statusActionClass = styles.connectBtnError;
+            statusActionDisabled = true;
             break;
         case "stopped":
-            topLabel = "Resume";
+            statusActionLabel = "Resume";
             break;
         default:
-            topLabel = status.state ?? "—";
-            topDisabled = true;
+            statusActionLabel = status.state ?? "—";
+            statusActionDisabled = true;
             break;
     }
     // Reconnect icon button next to the status button: enabled whenever
@@ -754,10 +754,10 @@ export default function App() {
                 <Button
                     appearance="primary"
                     onClick={onToggle}
-                    disabled={topDisabled}
-                    className={topClass}
+                    disabled={statusActionDisabled}
+                    className={statusActionClass}
                 >
-                    {topLabel}
+                    {statusActionLabel}
                 </Button>
             </header>
 
