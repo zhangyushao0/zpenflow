@@ -719,12 +719,11 @@ export default function App() {
             break;
     }
     // Reconnect icon button: only surfaces when the status button reads
-    // "Resume" (i.e., state === "stopped"). Everywhere else the action is
-    // either meaningless (transitional/error states) or already covered
-    // by the status button — when connected, the Pause click + auto-save
-    // means any pending changes get flushed on the next Resume, so a
-    // separate Reconnect would just duplicate that path.
-    const reconnectVisible = status.state === "stopped";
+    // "Pause" (i.e., state === "connected"). That's the case where a
+    // user might want to apply pending settings changes without going
+    // through a full Pause → Resume cycle. Everywhere else the action
+    // is meaningless (transitional/error) or already covered by Resume.
+    const reconnectVisible = status.state === "connected";
     const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
     const selectedResolution = resolutionKey(vddResolution);
     const setVddResolution = (next) => {
