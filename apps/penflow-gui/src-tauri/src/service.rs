@@ -220,10 +220,10 @@ impl Service {
             });
 
             eprintln!("[service] running session (waiting for android client)");
-            // Channel for forwarding the outer `cancel` into the session
-            // as `finish_on`. Needed because `adb reverse` doesn't
-            // propagate FIN — without it Android stays stuck on a dead
-            // socket after stop().
+            // Channel for forwarding this loop's `cancel` parameter into
+            // the session as `finish`. Needed because `adb reverse`
+            // doesn't propagate FIN — without it Android stays stuck on
+            // a dead socket after stop().
             let (session_finish_tx, session_finish_rx) = tokio::sync::oneshot::channel::<()>();
             // Scope so dropping `session_run` cancels any in-flight
             // accept() — otherwise transport.shutdown() below would
