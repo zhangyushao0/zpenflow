@@ -15,6 +15,7 @@ import {
     MessageBarTitle,
     MessageBarActions,
     Spinner,
+    Tooltip,
     makeStyles,
     tokens,
     shorthands,
@@ -261,6 +262,15 @@ const useStyles = makeStyles({
             filter: "brightness(0.92)",
         },
     },
+    // Icon-only Reconnect button next to the status button. Fixed-square
+    // so the icon centers cleanly; default Fluent button paddings would
+    // make it noticeably wider than tall.
+    reconnectIconBtn: {
+        minWidth: "32px",
+        width: "32px",
+        height: "32px",
+        ...shorthands.padding(0),
+    },
     // Red disabled variant for the "Error" state. The :disabled override is
     // needed because Fluent's default disabled rule otherwise paints the
     // button neutral gray and would hide the danger signal.
@@ -275,6 +285,19 @@ const useStyles = makeStyles({
         },
     },
 });
+
+/** Inline refresh / sync icon used by the header reconnect button.
+ *  Inlined as SVG so we don't pull in @fluentui/react-icons (~10 MB) for
+ *  a single 16×16 glyph. `currentColor` so the icon tracks Fluent's
+ *  button foreground tokens (including the disabled state). */
+const ReconnectIcon = () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+        <path
+            fill="currentColor"
+            d="M8 2.5a5.5 5.5 0 0 1 4.95 3.094l.66-.66a.5.5 0 1 1 .707.707l-1.5 1.5a.5.5 0 0 1-.707 0l-1.5-1.5a.5.5 0 0 1 .707-.707l.598.598A4.5 4.5 0 0 0 3.5 8a.5.5 0 0 1-1 0A5.5 5.5 0 0 1 8 2.5zm5 5a.5.5 0 0 1 .5.5 5.5 5.5 0 0 1-10.45 2.406l-.66.66a.5.5 0 0 1-.707-.707l1.5-1.5a.5.5 0 0 1 .707 0l1.5 1.5a.5.5 0 0 1-.707.707l-.598-.598A4.5 4.5 0 0 0 12.5 8a.5.5 0 0 1 .5-.5z"
+        />
+    </svg>
+);
 
 const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Win"];
 const DEFAULT_RESOLUTION = { width: 2880, height: 1800 };
@@ -623,11 +646,18 @@ export default function App() {
         }
     }, [saveMsg]);
 
+    // Pause / Resume toggle for the header primary button. Resume flushes
+    // any pending debounced save before starting so a setting changed in
+    // the last <400 ms gets picked up by the new session.
     const onToggle = useCallback(async () => {
         const cur = await invoke("get_status");
-        if (cur.state === "stopped") await invoke("start_service");
-        else                          await invoke("stop_service");
-    }, []);
+        if (cur.state === "stopped") {
+            await persistSettings();
+            await invoke("start_service");
+        } else {
+            await invoke("stop_service");
+        }
+    }, [persistSettings]);
 
     // Save first (so the service comes back up with the latest settings),
     // then start (if stopped) or stop+start (to re-apply settings while
@@ -649,56 +679,53 @@ export default function App() {
         );
     }
 
-    const isPaused = status.state === "stopped";
-    // Per-state shape of the header Connect/Reconnect button. The button
-    // doubles as a status indicator — only `connected` and the two
-    // listener-idle states ({listening, disconnected}) are clickable;
-    // everything else is rendered disabled with a state-specific label so
-    // the user knows why they can't reconnect right now.
-    let connectLabel;
-    let connectClass; // optional makeStyles class for green/red variants
-    let connectDisabled = false;
+    // Per-state shape of the header primary button. The button doubles as
+    // a status indicator: Pause when running (green), Resume when paused
+    // (primary blue), state-name disabled for everything transitional.
+    // The Reconnect icon button to its left is the explicit
+    // "save + stop + start" gesture and is owned separately.
+    let topLabel;
+    let topClass;
+    let topDisabled = false;
     switch (status.state) {
         case "connected":
-            connectLabel = "Reconnect";
-            connectClass = styles.connectBtnConnected;
+            topLabel = "Pause";
+            topClass = styles.connectBtnConnected;
             break;
         case "listening":
         case "disconnected":
-            // Auto-connect handles tablet attach for us, so there's nothing
-            // for the user to do here — show the wait state and keep the
-            // button disabled. Reconnect only becomes a meaningful action
-            // once a peer is actually connected (or to bust a wedged
-            // listener after USB cycle, which is rare — Pause/Resume
-            // covers that case explicitly).
-            connectLabel = "Waiting for tablet…";
-            connectDisabled = true;
+            topLabel = "Waiting for tablet…";
+            topDisabled = true;
             break;
         case "preparing":
-            connectLabel = "Preparing…";
-            connectDisabled = true;
+            topLabel = "Preparing…";
+            topDisabled = true;
             break;
         case "connecting":
-            connectLabel = "Connecting…";
-            connectDisabled = true;
+            topLabel = "Connecting…";
+            topDisabled = true;
             break;
         case "error":
-            connectLabel = "Error";
-            connectClass = styles.connectBtnError;
-            connectDisabled = true;
+            topLabel = "Error";
+            topClass = styles.connectBtnError;
+            topDisabled = true;
             break;
         case "stopped":
-            // Paused via the Pause button. Surface Connect here so the
-            // header button doubles as a one-click start — saves settings
-            // and brings the service up. Resume in the footer does the
-            // same minus the settings flush.
-            connectLabel = "Connect";
+            topLabel = "Resume";
             break;
         default:
-            connectLabel = status.state ?? "—";
-            connectDisabled = true;
+            topLabel = status.state ?? "—";
+            topDisabled = true;
             break;
     }
+    // Reconnect icon button next to the status button: enabled whenever
+    // the service is in a stable state where "save + restart" is
+    // meaningful. Transitional/error states block it so we don't pile up
+    // half-completed transitions.
+    const reconnectDisabled =
+        status.state === "preparing"
+        || status.state === "connecting"
+        || status.state === "error";
     const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
     const selectedResolution = resolutionKey(vddResolution);
     const setVddResolution = (next) => {
@@ -710,13 +737,27 @@ export default function App() {
             <header className={styles.header}>
                 <Title3 className={styles.title}>Penflow</Title3>
                 <span className={styles.statusDetail}>{statusDescription(status)}</span>
+                <Tooltip
+                    content="Reconnect — save settings and restart the session"
+                    relationship="description"
+                    withArrow
+                >
+                    <Button
+                        appearance="subtle"
+                        icon={<ReconnectIcon />}
+                        onClick={onConnect}
+                        disabled={reconnectDisabled}
+                        className={styles.reconnectIconBtn}
+                        aria-label="Reconnect"
+                    />
+                </Tooltip>
                 <Button
                     appearance="primary"
-                    onClick={onConnect}
-                    disabled={connectDisabled}
-                    className={connectClass}
+                    onClick={onToggle}
+                    disabled={topDisabled}
+                    className={topClass}
                 >
-                    {connectLabel}
+                    {topLabel}
                 </Button>
             </header>
 
@@ -949,7 +990,6 @@ export default function App() {
 
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>
-                <Button onClick={onToggle}>{isPaused ? "Resume" : "Pause"}</Button>
             </footer>
         </div>
     );
