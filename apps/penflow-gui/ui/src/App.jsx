@@ -67,13 +67,14 @@ const useStyles = makeStyles({
         letterSpacing: "0.05em",
         color: tokens.colorNeutralForeground3,
     },
-    rowGroup: {
-        display: "grid",
-        gridTemplateColumns: "minmax(0, 1fr) minmax(0, 1fr)",
-        gap: "20px",
-    },
-    column: {
-        minWidth: 0,
+    subCardTitle: {
+        marginTop: "24px",
+        marginBottom: "12px",
+        paddingTop: "16px",
+        textTransform: "uppercase",
+        letterSpacing: "0.05em",
+        color: tokens.colorNeutralForeground3,
+        ...shorthands.borderTop("1px", "solid", tokens.colorNeutralStroke3),
     },
     row: {
         display: "flex",
@@ -598,6 +599,11 @@ export default function App() {
     const setVddResolution = (next) => {
         setSettings({ ...settings, vdd_resolution: next });
     };
+    const topology = settings.topology ?? "extend";
+    const isExtend = topology === "extend";
+    const isDuplicate = topology === "duplicate";
+    const screenOff = settings.screen_off === true;
+    const showEncoder = !(isDuplicate && screenOff);
 
     return (
         <div className={styles.root}>
@@ -648,9 +654,109 @@ export default function App() {
             )}
 
             <section className={styles.card}>
-                <div className={styles.rowGroup}>
-                    <div className={styles.column}>
-                        <Subtitle2 className={styles.cardTitle}>Encoder</Subtitle2>
+                <Subtitle2 className={styles.cardTitle}>Display config</Subtitle2>
+                <Field label="Display mode" orientation="horizontal" className={styles.row}>
+                    <Dropdown
+                        value={isDuplicate ? "Duplicate" : "Extend"}
+                        selectedOptions={[topology]}
+                        onOptionSelect={(_, d) => setSettings({ ...settings, topology: d.optionValue })}
+                    >
+                        <Option value="extend">Extend (separate desktop)</Option>
+                        <Option value="duplicate">Duplicate primary</Option>
+                    </Dropdown>
+                </Field>
+                {isExtend && (
+                    <Field label="Virtual display" className={styles.resolutionField}>
+                        <div className={styles.resolutionControl}>
+                            <Dropdown
+                                className={styles.resolutionDropdown}
+                                value={resolutionLabel(vddResolution)}
+                                selectedOptions={[selectedResolution]}
+                                onOptionSelect={(_, d) => {
+                                    if (d.optionValue === "custom") return;
+                                    const preset = RESOLUTION_PRESETS.find((p) => p.key === d.optionValue);
+                                    if (preset) {
+                                        setVddResolution({ width: preset.width, height: preset.height });
+                                    }
+                                }}
+                            >
+                                {RESOLUTION_PRESETS.map((p) => (
+                                    <Option key={p.key} value={p.key}>{p.label}</Option>
+                                ))}
+                                <Option value="custom">Custom</Option>
+                            </Dropdown>
+                            <div className={styles.resolutionInputs}>
+                                <SpinButton
+                                    aria-label="Virtual display width"
+                                    className={styles.resolutionSpin}
+                                    value={vddResolution.width}
+                                    min={640}
+                                    max={7680}
+                                    step={2}
+                                    onChange={(_, d) => {
+                                        const value = numericSpinValue(d);
+                                        if (value !== null) {
+                                            setVddResolution({ ...vddResolution, width: value });
+                                        }
+                                    }}
+                                />
+                                <Caption1 className={styles.resolutionSeparator}>×</Caption1>
+                                <SpinButton
+                                    aria-label="Virtual display height"
+                                    className={styles.resolutionSpin}
+                                    value={vddResolution.height}
+                                    min={480}
+                                    max={4320}
+                                    step={2}
+                                    onChange={(_, d) => {
+                                        const value = numericSpinValue(d);
+                                        if (value !== null) {
+                                            setVddResolution({ ...vddResolution, height: value });
+                                        }
+                                    }}
+                                />
+                            </div>
+                        </div>
+                    </Field>
+                )}
+                {isDuplicate && (
+                    <>
+                        <Caption1 className={styles.hint}>
+                            Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
+                        </Caption1>
+                        <div className={styles.row}>
+                            <span className={styles.rowLabel} title="Pen-tablet mode: tablet panel goes dark, capture/encode is skipped on the PC, and pen + touch still draw on your primary monitor like a Wacom Intuos. Saves CPU/GPU and tablet battery. Takes effect after the next reconnect.">
+                                Screen off (pen tablet only)
+                            </span>
+                            <Switch
+                                checked={screenOff}
+                                onChange={(_, d) => setSettings({ ...settings, screen_off: d.checked })}
+                            />
+                        </div>
+                        {screenOff && (
+                            <Caption1 className={styles.hint}>
+                                No video is sent — the encoder and capture pipeline are stopped. Pen and touch still work; the tablet behaves like an input-only Wacom Intuos.
+                            </Caption1>
+                        )}
+                        <div className={styles.row}>
+                            <span className={styles.rowLabel} title="Drop all hand-gesture / touch contacts server-side so palm-resting on the tablet doesn't trigger taps or scrolls on the PC. Pen input is unaffected. Takes effect after the next reconnect.">
+                                Disable hand gestures
+                            </span>
+                            <Switch
+                                checked={settings.disable_touch === true}
+                                onChange={(_, d) => setSettings({ ...settings, disable_touch: d.checked })}
+                            />
+                        </div>
+                        {settings.disable_touch === true && (
+                            <Caption1 className={styles.hint}>
+                                Touch and multi-finger gestures from the tablet are ignored by the PC. Only pen input drives the cursor.
+                            </Caption1>
+                        )}
+                    </>
+                )}
+                {showEncoder && (
+                    <>
+                        <Subtitle2 className={styles.subCardTitle}>Encoder</Subtitle2>
                         <Field label="Bitrate (Mbps)" orientation="horizontal" className={styles.row}>
                             <SpinButton
                                 value={Math.round(settings.bitrate_bps / 1_000_000)}
@@ -676,107 +782,6 @@ export default function App() {
                                 <Option value="120">120 fps</Option>
                             </Dropdown>
                         </Field>
-                        {(settings.topology ?? "extend") === "extend" && (
-                        <Field label="Virtual display" className={styles.resolutionField}>
-                            <div className={styles.resolutionControl}>
-                                <Dropdown
-                                    className={styles.resolutionDropdown}
-                                    value={resolutionLabel(vddResolution)}
-                                    selectedOptions={[selectedResolution]}
-                                    onOptionSelect={(_, d) => {
-                                        if (d.optionValue === "custom") return;
-                                        const preset = RESOLUTION_PRESETS.find((p) => p.key === d.optionValue);
-                                        if (preset) {
-                                            setVddResolution({ width: preset.width, height: preset.height });
-                                        }
-                                    }}
-                                >
-                                    {RESOLUTION_PRESETS.map((p) => (
-                                        <Option key={p.key} value={p.key}>{p.label}</Option>
-                                    ))}
-                                    <Option value="custom">Custom</Option>
-                                </Dropdown>
-                                <div className={styles.resolutionInputs}>
-                                    <SpinButton
-                                        aria-label="Virtual display width"
-                                        className={styles.resolutionSpin}
-                                        value={vddResolution.width}
-                                        min={640}
-                                        max={7680}
-                                        step={2}
-                                        onChange={(_, d) => {
-                                            const value = numericSpinValue(d);
-                                            if (value !== null) {
-                                                setVddResolution({ ...vddResolution, width: value });
-                                            }
-                                        }}
-                                    />
-                                    <Caption1 className={styles.resolutionSeparator}>×</Caption1>
-                                    <SpinButton
-                                        aria-label="Virtual display height"
-                                        className={styles.resolutionSpin}
-                                        value={vddResolution.height}
-                                        min={480}
-                                        max={4320}
-                                        step={2}
-                                        onChange={(_, d) => {
-                                            const value = numericSpinValue(d);
-                                            if (value !== null) {
-                                                setVddResolution({ ...vddResolution, height: value });
-                                            }
-                                        }}
-                                    />
-                                </div>
-                            </div>
-                        </Field>
-                        )}
-                        <Field label="Display mode" orientation="horizontal" className={styles.row}>
-                            <Dropdown
-                                value={(settings.topology ?? "extend") === "duplicate" ? "Duplicate" : "Extend"}
-                                selectedOptions={[settings.topology ?? "extend"]}
-                                onOptionSelect={(_, d) => setSettings({ ...settings, topology: d.optionValue })}
-                            >
-                                <Option value="extend">Extend (separate desktop)</Option>
-                                <Option value="duplicate">Duplicate primary</Option>
-                            </Dropdown>
-                        </Field>
-                        {(settings.topology ?? "extend") === "duplicate" && (
-                            <Caption1 className={styles.hint}>
-                                Streaming your primary monitor directly. The virtual-display driver and resolution settings are bypassed in this mode.
-                            </Caption1>
-                        )}
-                        {(settings.topology ?? "extend") === "duplicate" && (
-                            <>
-                                <div className={styles.row}>
-                                    <span className={styles.rowLabel} title="Pen-tablet mode: tablet panel goes dark, capture/encode is skipped on the PC, and pen + touch still draw on your primary monitor like a Wacom Intuos. Saves CPU/GPU and tablet battery. Takes effect after the next reconnect.">
-                                        Screen off (pen tablet only)
-                                    </span>
-                                    <Switch
-                                        checked={settings.screen_off === true}
-                                        onChange={(_, d) => setSettings({ ...settings, screen_off: d.checked })}
-                                    />
-                                </div>
-                                {settings.screen_off === true && (
-                                    <Caption1 className={styles.hint}>
-                                        No video is sent — the encoder and capture pipeline are stopped. Pen and touch still work; the tablet behaves like an input-only Wacom Intuos.
-                                    </Caption1>
-                                )}
-                                <div className={styles.row}>
-                                    <span className={styles.rowLabel} title="Drop all hand-gesture / touch contacts server-side so palm-resting on the tablet doesn't trigger taps or scrolls on the PC. Pen input is unaffected. Takes effect after the next reconnect.">
-                                        Disable hand gestures
-                                    </span>
-                                    <Switch
-                                        checked={settings.disable_touch === true}
-                                        onChange={(_, d) => setSettings({ ...settings, disable_touch: d.checked })}
-                                    />
-                                </div>
-                                {settings.disable_touch === true && (
-                                    <Caption1 className={styles.hint}>
-                                        Touch and multi-finger gestures from the tablet are ignored by the PC. Only pen input drives the cursor.
-                                    </Caption1>
-                                )}
-                            </>
-                        )}
                         <Field label="Codec" orientation="horizontal" className={styles.row}>
                             <Dropdown
                                 value={settings.codec === "hevc" ? "HEVC" : "H.264"}
@@ -787,41 +792,42 @@ export default function App() {
                                 <Option value="h264">H.264</Option>
                             </Dropdown>
                         </Field>
-                    </div>
-                    <div className={styles.column}>
-                        <Subtitle2 className={styles.cardTitle}>System</Subtitle2>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Add Penflow to your Windows logon">
-                                Start with Windows
-                            </span>
-                            <Switch
-                                checked={settings.autostart}
-                                onChange={(_, d) => setSettings({ ...settings, autostart: d.checked })}
-                            />
-                        </div>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Required for injecting input into elevated apps">
-                                Run as administrator
-                            </span>
-                            <Switch
-                                checked={settings.run_as_admin}
-                                onChange={(_, d) => setSettings({ ...settings, run_as_admin: d.checked })}
-                            />
-                        </div>
-                        <div className={styles.row}>
-                            <span className={styles.rowLabel} title="Show the latency HUD overlay on the tablet. Takes effect after the next reconnect.">
-                                Show tablet HUD overlay
-                            </span>
-                            <Switch
-                                checked={settings.hud_enabled !== false}
-                                onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
-                            />
-                        </div>
-                        <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
-                            {elevated ? "Currently running as administrator" : "Currently running unelevated"}
-                        </Caption1>
-                    </div>
+                    </>
+                )}
+            </section>
+
+            <section className={styles.card}>
+                <Subtitle2 className={styles.cardTitle}>System</Subtitle2>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Add Penflow to your Windows logon">
+                        Start with Windows
+                    </span>
+                    <Switch
+                        checked={settings.autostart}
+                        onChange={(_, d) => setSettings({ ...settings, autostart: d.checked })}
+                    />
                 </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Required for injecting input into elevated apps">
+                        Run as administrator
+                    </span>
+                    <Switch
+                        checked={settings.run_as_admin}
+                        onChange={(_, d) => setSettings({ ...settings, run_as_admin: d.checked })}
+                    />
+                </div>
+                <div className={styles.row}>
+                    <span className={styles.rowLabel} title="Show the latency HUD overlay on the tablet. Takes effect after the next reconnect.">
+                        Show tablet HUD overlay
+                    </span>
+                    <Switch
+                        checked={settings.hud_enabled !== false}
+                        onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
+                    />
+                </div>
+                <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
+                    {elevated ? "Currently running as administrator" : "Currently running unelevated"}
+                </Caption1>
             </section>
 
             <section className={styles.card}>
