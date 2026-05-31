@@ -212,7 +212,9 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
     // Ctrl-C handler. tokio::signal::ctrl_c is async; race against the
     // session.
     let session = Session::new(cfg);
-    let session_run = session.run(transport.clone(), Some(tx));
+    // 3rd arg = `finish`. None → session runs until Android
+    // disconnects.
+    let session_run = session.run(transport.clone(), Some(tx), None);
     tokio::select! {
         r = session_run => match r {
             Ok(()) => println!("[run_session] session ended cleanly"),

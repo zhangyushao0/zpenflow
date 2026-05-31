@@ -225,30 +225,67 @@ impl Service {
             });
 
             eprintln!("[service] running session (waiting for android client)");
-            let session = Session::new(cfg);
-            let session_run = session.run(Arc::clone(&transport), Some(tx));
-            tokio::select! {
-                r = session_run => match r {
-                    Ok(()) => {
-                        eprintln!("[service] session ended cleanly (Disconnected)");
-                        self.emit(ServiceState::Disconnected).await;
+            // Channel for forwarding this loop's `cancel` parameter into
+            // the session as `finish`. Needed because `adb reverse`
+            // doesn't propagate FIN — without it Android stays stuck on
+            // a dead socket after stop().
+            let (session_finish_tx, session_finish_rx) = tokio::sync::oneshot::channel::<()>();
+            // Scope so dropping `session_run` cancels any in-flight
+            // accept() — otherwise transport.shutdown() below would
+            // deadlock waiting for the listener mutex.
+            let cancelled = {
+                let session = Session::new(cfg);
+                let session_run =
+                    session.run(Arc::clone(&transport), Some(tx), Some(session_finish_rx));
+                tokio::pin!(session_run);
+                // Phase 1: either the session ends on its own (Android
+                // disconnects → read loop EOF → cleanup) or the user
+                // clicks Pause (cancel fires). Whichever happens first
+                // wins; on Pause we signal the session to wrap up and
+                // Phase 2 below awaits its goodbye + cleanup.
+                let cancelled = tokio::select! {
+                    r = &mut session_run => {
+                        match r {
+                            Ok(()) => {
+                                eprintln!("[service] session ended cleanly (Disconnected)");
+                                self.emit(ServiceState::Disconnected).await;
+                            }
+                            Err(e) => {
+                                let msg = format!("session: {e}");
+                                eprintln!("[service] {msg}");
+                                log_diagnostic(&msg);
+                                self.emit(ServiceState::Error { message: msg }).await;
+                            }
+                        }
+                        false
                     }
-                    Err(e) => {
-                        let msg = format!("session: {e}");
-                        eprintln!("[service] {msg}");
-                        log_diagnostic(&msg);
-                        self.emit(ServiceState::Error { message: msg }).await;
+                    _ = &mut cancel => {
+                        eprintln!("[service] cancel requested — signaling session to finish");
+                        let _ = session_finish_tx.send(());
+                        true
                     }
-                },
-                _ = &mut cancel => {
-                    let _ = tokio::time::timeout(
-                        Duration::from_secs(2),
-                        transport.shutdown(),
-                    )
-                    .await;
-                    event_pump.abort();
-                    return;
+                };
+                // Phase 2: bounded wait for the session to finish its
+                // goodbye write + cleanup. If the session was pre-handshake
+                // (stuck on accept), this just times out and the drop on
+                // scope exit handles teardown.
+                if cancelled {
+                    match tokio::time::timeout(Duration::from_secs(3), &mut session_run).await {
+                        Ok(_) => eprintln!("[service] session honored finish signal"),
+                        Err(_) => {
+                            eprintln!(
+                                "[service] session finish timed out — proceeding to teardown"
+                            );
+                            log_diagnostic("[service] session finish timed out");
+                        }
+                    }
                 }
+                cancelled
+            };
+            if cancelled {
+                let _ = tokio::time::timeout(Duration::from_secs(2), transport.shutdown()).await;
+                event_pump.abort();
+                return;
             }
 
             // Drain the event pump and tear down the transport before

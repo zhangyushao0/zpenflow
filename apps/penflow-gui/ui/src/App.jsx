@@ -10,12 +10,12 @@ import {
     Title3,
     Subtitle2,
     Caption1,
-    Badge,
     MessageBar,
     MessageBarBody,
     MessageBarTitle,
     MessageBarActions,
     Spinner,
+    Tooltip,
     makeStyles,
     tokens,
     shorthands,
@@ -242,7 +242,63 @@ const useStyles = makeStyles({
         marginTop: "-4px",
         marginBottom: "8px",
     },
+    // Connected-state Pause button: white background with dark text so it
+    // reads as a calm "currently up" indicator rather than a primary-blue
+    // call-to-action. Colors are hardcoded (rather than tokens) because
+    // we want literal white regardless of theme — Fluent's neutral
+    // tokens go dark on the dark theme this app uses.
+    connectBtnConnected: {
+        backgroundColor: "#ffffff",
+        ...shorthands.borderColor("#ffffff"),
+        color: "#1f1f1f",
+        ":hover": {
+            backgroundColor: "#f3f3f3",
+            ...shorthands.borderColor("#f3f3f3"),
+            color: "#1f1f1f",
+        },
+        ":hover:active": {
+            backgroundColor: "#e6e6e6",
+            ...shorthands.borderColor("#e6e6e6"),
+            color: "#1f1f1f",
+        },
+    },
+    // Icon-only Reconnect button next to the status button. Fixed-square
+    // so the icon centers cleanly; default Fluent button paddings would
+    // make it noticeably wider than tall.
+    reconnectIconBtn: {
+        minWidth: "32px",
+        width: "32px",
+        height: "32px",
+        ...shorthands.padding(0),
+    },
+    // Red disabled variant for the "Error" state. The :disabled override is
+    // needed because Fluent's default disabled rule otherwise paints the
+    // button neutral gray and would hide the danger signal.
+    connectBtnError: {
+        backgroundColor: tokens.colorStatusDangerBackground3,
+        ...shorthands.borderColor(tokens.colorStatusDangerBorderActive),
+        color: tokens.colorNeutralForegroundOnBrand,
+        ":disabled": {
+            backgroundColor: tokens.colorStatusDangerBackground3,
+            ...shorthands.borderColor(tokens.colorStatusDangerBorderActive),
+            color: tokens.colorNeutralForegroundOnBrand,
+        },
+    },
 });
+
+/** Inline refresh icon used by the header reconnect button.
+ *  Fluent-ArrowClockwise-style — single 270° arc with an arrowhead.
+ *  Inlined as SVG so we don't pull in @fluentui/react-icons (~10 MB)
+ *  for a single 16×16 glyph. `currentColor` so the icon tracks Fluent's
+ *  button foreground tokens (including the disabled state). */
+const ReconnectIcon = () => (
+    <svg width="16" height="16" viewBox="0 0 16 16" aria-hidden="true">
+        <path
+            fill="currentColor"
+            d="M8 2.75a5.25 5.25 0 1 0 5.21 5.84.5.5 0 0 1 .99.12A6.25 6.25 0 1 1 8 1.75v-.5a.5.5 0 0 1 .85-.36l1.5 1.5a.5.5 0 0 1 0 .71l-1.5 1.5A.5.5 0 0 1 8 4.25v-1.5z"
+        />
+    </svg>
+);
 
 const MOD_ORDER = ["Ctrl", "Alt", "Shift", "Win"];
 const DEFAULT_RESOLUTION = { width: 2880, height: 1800 };
@@ -269,27 +325,6 @@ function numericSpinValue(data) {
     const raw = data.value ?? data.displayValue;
     const value = typeof raw === "number" ? raw : Number(raw);
     return Number.isFinite(value) ? Math.round(value) : null;
-}
-
-function statusBadge(state) {
-    switch (state.state) {
-        case "stopped":
-            return { color: "warning", text: "paused" };
-        case "preparing":
-            return { color: "informative", text: "starting" };
-        case "listening":
-            return { color: "informative", text: "ready" };
-        case "connecting":
-            return { color: "informative", text: "connecting" };
-        case "connected":
-            return { color: "success", text: "connected" };
-        case "disconnected":
-            return { color: "informative", text: "ready" };
-        case "error":
-            return { color: "danger", text: "error" };
-        default:
-            return { color: "subtle", text: state.state ?? "—" };
-    }
 }
 
 function statusDescription(state) {
@@ -504,11 +539,18 @@ export default function App() {
     const [vmultiInstalled, setVmultiInstalled] = useState(true);
     const [vmultiInstalling, setVmultiInstalling] = useState(false);
     const [vmultiInstallError, setVmultiInstallError] = useState("");
+    // Skip the first auto-save pass so loading settings from disk doesn't
+    // immediately round-trip them back.
+    const skipNextAutoSaveRef = useRef(true);
+    // Tracks the last persisted value of run_as_admin so we only trigger the
+    // UAC relaunch on the off→on transition, not on every later save.
+    const prevRunAsAdminRef = useRef(false);
 
     // Initial load.
     useEffect(() => {
         (async () => {
             const s = await invoke("get_settings");
+            prevRunAsAdminRef.current = !!s.run_as_admin;
             setSettings(s);
             setSlots([
                 bindingToState(s.bindings.button_0),
@@ -551,7 +593,10 @@ export default function App() {
         }
     }, []);
 
-    const onSave = useCallback(async () => {
+    // Persist the current settings + button bindings. Used both by the
+    // debounced auto-save effect below and by the Connect/Reconnect button to
+    // flush any in-flight changes before the service restarts.
+    const persistSettings = useCallback(async () => {
         if (!settings) return;
         const next = {
             ...settings,
@@ -565,7 +610,9 @@ export default function App() {
         try {
             await invoke("save_settings", { new: next });
             setSaveMsg("saved");
-            if (next.run_as_admin) {
+            const wasOn = prevRunAsAdminRef.current;
+            prevRunAsAdminRef.current = !!next.run_as_admin;
+            if (next.run_as_admin && !wasOn) {
                 const e = await invoke("is_elevated");
                 if (!e) {
                     setSaveMsg("relaunching as administrator…");
@@ -575,14 +622,55 @@ export default function App() {
         } catch (e) {
             setSaveMsg("error: " + e);
         }
-        setTimeout(() => setSaveMsg(""), 3000);
     }, [settings, slots]);
 
+    // Auto-save: persist any change to settings or button bindings after a
+    // short debounce. The first pass after initial load is skipped via
+    // skipNextAutoSaveRef so we don't immediately round-trip the loaded value.
+    useEffect(() => {
+        if (!settings) return;
+        if (skipNextAutoSaveRef.current) {
+            skipNextAutoSaveRef.current = false;
+            return;
+        }
+        const timer = setTimeout(persistSettings, 400);
+        return () => clearTimeout(timer);
+    }, [persistSettings, settings]);
+
+    // Clear transient "saved" / "error" messages after a few seconds. "saving…"
+    // and "relaunching…" are left alone — they get replaced by the next save's
+    // own status.
+    useEffect(() => {
+        if (saveMsg === "saved" || saveMsg.startsWith("error")) {
+            const t = setTimeout(() => setSaveMsg(""), 3000);
+            return () => clearTimeout(t);
+        }
+    }, [saveMsg]);
+
+    // Pause / Resume toggle for the header primary button. Resume flushes
+    // any pending debounced save before starting so a setting changed in
+    // the last <400 ms gets picked up by the new session.
     const onToggle = useCallback(async () => {
         const cur = await invoke("get_status");
-        if (cur.state === "stopped") await invoke("start_service");
-        else                          await invoke("stop_service");
-    }, []);
+        if (cur.state === "stopped") {
+            await persistSettings();
+            await invoke("start_service");
+        } else {
+            await invoke("stop_service");
+        }
+    }, [persistSettings]);
+
+    // Save first (so the service comes back up with the latest settings),
+    // then start (if stopped) or stop+start (to re-apply settings while
+    // already running).
+    const onConnect = useCallback(async () => {
+        await persistSettings();
+        const cur = await invoke("get_status");
+        if (cur.state !== "stopped") {
+            await invoke("stop_service");
+        }
+        await invoke("start_service");
+    }, [persistSettings]);
 
     if (!settings) {
         return (
@@ -592,8 +680,51 @@ export default function App() {
         );
     }
 
-    const badge = statusBadge(status);
-    const isPaused = status.state === "stopped";
+    // Per-state shape of the header primary button. The button doubles as
+    // a status indicator: Pause when running (green), Resume when paused
+    // (primary blue), state-name disabled for everything transitional.
+    // The Reconnect icon button to its left is the explicit
+    // "save + stop + start" gesture and is owned separately.
+    let statusActionLabel;
+    let statusActionClass;
+    let statusActionDisabled = false;
+    switch (status.state) {
+        case "connected":
+            statusActionLabel = "Pause";
+            statusActionClass = styles.connectBtnConnected;
+            break;
+        case "listening":
+        case "disconnected":
+            statusActionLabel = "Waiting for tablet…";
+            statusActionDisabled = true;
+            break;
+        case "preparing":
+            statusActionLabel = "Preparing…";
+            statusActionDisabled = true;
+            break;
+        case "connecting":
+            statusActionLabel = "Connecting…";
+            statusActionDisabled = true;
+            break;
+        case "error":
+            statusActionLabel = "Error";
+            statusActionClass = styles.connectBtnError;
+            statusActionDisabled = true;
+            break;
+        case "stopped":
+            statusActionLabel = "Resume";
+            break;
+        default:
+            statusActionLabel = status.state ?? "—";
+            statusActionDisabled = true;
+            break;
+    }
+    // Reconnect icon button: only surfaces when the status button reads
+    // "Pause" (i.e., state === "connected"). That's the case where a
+    // user might want to apply pending settings changes without going
+    // through a full Pause → Resume cycle. Everywhere else the action
+    // is meaningless (transitional/error) or already covered by Resume.
+    const reconnectVisible = status.state === "connected";
     const vddResolution = settings.vdd_resolution ?? DEFAULT_RESOLUTION;
     const selectedResolution = resolutionKey(vddResolution);
     const setVddResolution = (next) => {
@@ -610,7 +741,29 @@ export default function App() {
             <header className={styles.header}>
                 <Title3 className={styles.title}>Penflow</Title3>
                 <span className={styles.statusDetail}>{statusDescription(status)}</span>
-                <Badge appearance="filled" color={badge.color}>{badge.text}</Badge>
+                {reconnectVisible && (
+                    <Tooltip
+                        content="Reconnect — save settings and restart the session"
+                        relationship="description"
+                        withArrow
+                    >
+                        <Button
+                            appearance="subtle"
+                            icon={<ReconnectIcon />}
+                            onClick={onConnect}
+                            className={styles.reconnectIconBtn}
+                            aria-label="Reconnect"
+                        />
+                    </Tooltip>
+                )}
+                <Button
+                    appearance="primary"
+                    onClick={onToggle}
+                    disabled={statusActionDisabled}
+                    className={statusActionClass}
+                >
+                    {statusActionLabel}
+                </Button>
             </header>
 
             {!vddInstalled && (
@@ -856,8 +1009,6 @@ export default function App() {
 
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>
-                <Button onClick={onToggle}>{isPaused ? "Resume" : "Pause"}</Button>
-                <Button appearance="primary" onClick={onSave}>Save</Button>
             </footer>
         </div>
     );

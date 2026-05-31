@@ -18,6 +18,8 @@
 //!    down cleanly.
 
 use std::collections::VecDeque;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
@@ -278,13 +280,19 @@ impl Session {
     ///
     /// `events` (optional) receives lifecycle notifications. The function
     /// returns after the connection ends or `stop` flag is set.
+    ///
+    /// `finish` (optional) — when the caller sends on the matching
+    /// `Sender`, the session wraps up cleanly (read loop aborts,
+    /// [`MSG_PC_GOODBYE`] written). `finish = None` means the session
+    /// runs until Android disconnects.
     pub async fn run(
         mut self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
+        finish: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         if self.cfg.screen_off {
-            return self.run_screen_off(transport, events).await;
+            return self.run_screen_off(transport, events, finish).await;
         }
 
         let session_start = Instant::now();
@@ -630,7 +638,17 @@ impl Session {
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
+        // The optional `finish` arm lets the caller request a clean
+        // wrap-up (used by GUI Pause) — we abort the read task and fall
+        // through to the cleanup path below so MSG_PC_GOODBYE still
+        // goes out.
         let mut dispatch = dispatch;
+        let mut finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
+            Some(rx) => Box::pin(async move {
+                let _ = rx.await;
+            }),
+            None => Box::pin(std::future::pending()),
+        };
         let read_result: Result<(), SessionError> = loop {
             tokio::select! {
                 r = &mut dispatch => match r {
@@ -643,6 +661,11 @@ impl Session {
                 },
                 Some(()) = idr_rx.recv() => {
                     engine.request_idr();
+                }
+                _ = &mut finish_fut => {
+                    eprintln!("[session] finish signal — aborting read loop, sending MSG_PC_GOODBYE");
+                    dispatch.abort();
+                    break Ok(());
                 }
             }
         };
@@ -687,6 +710,7 @@ impl Session {
         self,
         transport: Arc<dyn Transport>,
         events: Option<tokio::sync::mpsc::Sender<SessionEvent>>,
+        finish: Option<tokio::sync::oneshot::Receiver<()>>,
     ) -> Result<(), SessionError> {
         debug_assert!(
             self.cfg.vdd.is_none(),
@@ -801,7 +825,12 @@ impl Session {
         // read_loop wants an idr sender; with no engine we just drop the rx.
         let (idr_tx, _idr_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
-        let read_result = read_loop(
+        // `select!` between the read loop and `finish`: whichever
+        // completes first wins, the other is dropped. Both paths fall
+        // through to the MSG_PC_GOODBYE write below. Routing `finish`
+        // through here (instead of letting the caller drop the whole
+        // future on Pause) is what keeps that write reachable.
+        let read_future = read_loop(
             reader,
             writer.clone(),
             injector,
@@ -811,8 +840,20 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
-        )
-        .await;
+        );
+        let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
+            Some(rx) => Box::pin(async move {
+                let _ = rx.await;
+            }),
+            None => Box::pin(std::future::pending()),
+        };
+        let read_result = tokio::select! {
+            r = read_future => r,
+            _ = finish_fut => {
+                eprintln!("[session] finish signal (screen_off) — sending MSG_PC_GOODBYE");
+                Ok(())
+            }
+        };
 
         {
             let mut w = writer.lock().await;
