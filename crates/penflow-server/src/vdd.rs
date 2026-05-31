@@ -6,18 +6,20 @@
 //!   Manager. The server enables it after the Android handshake and
 //!   disables it on disconnect, so the idle PC desktop has no extra
 //!   monitor.
-//! - **No PowerShell.** All device-control calls go through the native
-//!   Win32 Configuration Manager API (`CM_Enable_DevNode` /
-//!   `CM_Disable_DevNode` / `CM_Locate_DevNodeW` / `CM_Get_DevNode_Status`)
-//!   and SetupAPI (`SetupDiGetClassDevs` for enumeration). No external
-//!   process spawn for the actual enable/disable.
-//! - **Just-in-time UAC.** `CM_Enable_DevNode` requires Administrator. The
-//!   server runs as a regular user; when it actually needs to flip the
-//!   device, it invokes itself via `ShellExecuteW` with the `runas` verb
-//!   in `--vdd-helper enable <instance>` / `--vdd-helper disable
-//!   <instance>` mode. Windows shows the UAC prompt; the user clicks Yes
-//!   once per enable and once per disable. The helper does the CM call
-//!   and exits with status 0 / non-zero, no IPC complexity.
+//! - **No PowerShell.** Device enumeration + status uses native Win32
+//!   (`CM_Locate_DevNodeW`, `CM_Get_DevNode_Status`, SetupAPI's
+//!   `SetupDiGetClassDevs`). The actual enable/disable mutation goes
+//!   through the bundled `devcon.exe` because devcon writes a
+//!   registry-persistent `CONFIGFLAG_DISABLED` flag whereas
+//!   `devcon disable` is runtime-only — the latter let VDD
+//!   silently re-enable on every reboot (issue #22).
+//! - **Just-in-time UAC.** devcon requires Administrator. The server
+//!   runs as a regular user; when it needs to flip the device it
+//!   invokes itself via `ShellExecuteW` with the `runas` verb in
+//!   `--vdd-helper resident <instance> <event-base> <parent-pid>`
+//!   mode. Windows shows the UAC prompt; the user clicks Yes once per
+//!   session. The helper does the devcon call and exits with status 0
+//!   / non-zero, no IPC complexity.
 //!
 //! ## Why a sub-process for elevation
 //!
@@ -29,7 +31,7 @@
 //!
 //! ## Diagnostics
 //!
-//! - On enable, after we call `CM_Enable_DevNode`, we re-read
+//! - On enable, after devcon completes, we re-read
 //!   `CM_Get_DevNode_Status` so we can tell the difference between "Enable
 //!   succeeded → driver is starting up" and "Enable returned OK but the
 //!   driver immediately failed" (HANDOFF §2.1 `mttvdd.dll
@@ -48,10 +50,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use windows::core::PCWSTR;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    CM_Disable_DevNode, CM_Enable_DevNode, CM_Get_DevNode_Status, CM_Locate_DevNodeW,
-    SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
-    SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW, CM_DEVNODE_STATUS_FLAGS,
-    CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CM_PROB_DISABLED, CONFIGRET, CR_ACCESS_DENIED,
+    CM_Get_DevNode_Status, CM_Locate_DevNodeW, SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo,
+    SetupDiGetClassDevsW, SetupDiGetDeviceInstanceIdW, SetupDiGetDeviceRegistryPropertyW,
+    CM_DEVNODE_STATUS_FLAGS, CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CM_PROB_DISABLED, CONFIGRET,
     CR_NO_SUCH_DEVNODE, CR_SUCCESS, DIGCF_PRESENT, DN_HAS_PROBLEM, GUID_DEVCLASS_DISPLAY, HDEVINFO,
     SETUP_DI_REGISTRY_PROPERTY, SPDRP_DEVICEDESC, SPDRP_FRIENDLYNAME, SP_DEVINFO_DATA,
 };
@@ -99,9 +100,9 @@ pub enum VddError {
     #[error("device '{0}' not found by Configuration Manager")]
     DevNodeNotFound(String),
 
-    /// `CM_Enable_DevNode` / `CM_Disable_DevNode` returned `CR_ACCESS_DENIED`
-    /// (we're not running elevated and this code path bypassed the helper —
-    /// shouldn't happen in normal operation).
+    /// A Configuration Manager call returned `CR_ACCESS_DENIED` (we're
+    /// not running elevated and this code path bypassed the elevated
+    /// helper — shouldn't happen in normal operation).
     #[error("Configuration Manager refused: access denied (need Administrator)")]
     AccessDenied,
 
@@ -137,7 +138,7 @@ pub enum VddError {
     },
 
     /// Enable returned success but the device is still in the
-    /// `CM_PROB_DISABLED` state. Typically means `CM_Enable_DevNode`
+    /// `CM_PROB_DISABLED` state. Typically means `devcon enable`
     /// silently no-op'd because the calling process wasn't elevated, or
     /// the helper sub-process didn't actually run elevated.
     #[error(
@@ -147,6 +148,20 @@ pub enum VddError {
          for the helper trace."
     )]
     EnableHadNoEffect,
+
+    /// Disable returned success but Configuration Manager still reports
+    /// the device as started/healthy.
+    #[error(
+        "Disable reported success but the device is still enabled. \
+         status=0x{status:08x} problem=0x{problem:08x}. \
+         Check %TEMP%\\penflow-vdd-helper.log for the helper trace."
+    )]
+    DisableHadNoEffect {
+        /// Raw `ulStatus` from CM_Get_DevNode_Status.
+        status: u32,
+        /// Raw `ulProblemNumber` from CM_Get_DevNode_Status.
+        problem: u32,
+    },
 
     /// `ShellExecuteExW` itself failed (code path that runs in the
     /// non-elevated parent). Usually means the user clicked No on the
@@ -200,10 +215,13 @@ pub struct VddController {
     friendly_name: String,
     enabled: bool,
     /// In unelevated mode: a long-lived elevated helper that did the
-    /// initial `CM_Enable_DevNode` and now sleeps on a named event. We
-    /// signal the event on `disable()` / `Drop` so the helper does the
-    /// matching `CM_Disable_DevNode` and exits — costing only ONE UAC
-    /// prompt (at first enable) instead of one each for enable+disable.
+    /// initial `devcon enable` and now waits on a named event OR the
+    /// parent's process handle. We signal the event on
+    /// `disable()` / `Drop` so the helper does the matching
+    /// `devcon disable` and exits — costing only ONE UAC prompt (at
+    /// first enable) instead of one each for enable+disable. Parent-
+    /// handle watch is the crash-recovery path: parent dies → helper
+    /// still runs the persistent disable.
     resident: Option<ResidentHelper>,
 }
 
@@ -212,7 +230,7 @@ pub struct VddController {
 struct ResidentHelper {
     /// Elevated child process handle. Used to wait-for-exit on shutdown.
     process: HANDLE,
-    /// Helper signals this after `CM_Enable_DevNode` completes. We hold
+    /// Helper signals this after `devcon enable` completes. We hold
     /// it so we can re-wait on it if needed (and to keep its name reserved).
     done_event: HANDLE,
     /// We signal this to ask the helper to disable + exit.
@@ -232,22 +250,55 @@ impl std::fmt::Debug for ResidentHelper {
 unsafe impl Send for ResidentHelper {}
 unsafe impl Sync for ResidentHelper {}
 
+/// What happened when we asked the resident helper to wind down.
+/// Drives the fallback decision in `VddController::disable`. The exit
+/// code in `NonZero` is surfaced through `Debug` only (eprintln in
+/// `disable`) — `#[allow(dead_code)]` silences the dead-field warning
+/// rustc raises because `Debug` reads aren't counted as use.
+#[derive(Debug)]
+enum ShutdownOutcome {
+    /// Helper exited 0 — devcon disable inside the helper succeeded.
+    Clean,
+    /// Helper didn't exit within the 5 s window. Probably hung in
+    /// devcon or its own cleanup; treat the disable as not done.
+    Timeout,
+    /// Helper exited but with non-zero status (or we couldn't read it).
+    NonZero(#[allow(dead_code)] u32),
+}
+
 impl ResidentHelper {
     /// Signal the stop event, wait briefly for the helper to exit
-    /// (so `CM_Disable_DevNode` actually completes before we tear down),
-    /// then close handles.
-    fn shutdown(&mut self) {
+    /// (so `devcon disable` actually completes before we tear down),
+    /// then close handles. Caller looks at the returned outcome to
+    /// decide whether to run a direct fallback disable.
+    fn shutdown(&mut self) -> ShutdownOutcome {
+        use windows::Win32::Foundation::WAIT_OBJECT_0;
+        use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
         unsafe {
             let _ = SetEvent(self.stop_event);
-            use windows::Win32::System::Threading::WaitForSingleObject;
-            let _ = WaitForSingleObject(self.process, 5000);
+        }
+        let wait = unsafe { WaitForSingleObject(self.process, 5000) };
+        if wait != WAIT_OBJECT_0 {
+            return ShutdownOutcome::Timeout;
+        }
+        let mut code: u32 = 0;
+        if unsafe { GetExitCodeProcess(self.process, &mut code) }.is_err() {
+            return ShutdownOutcome::NonZero(code);
+        }
+        if code == 0 {
+            ShutdownOutcome::Clean
+        } else {
+            ShutdownOutcome::NonZero(code)
         }
     }
 }
 
 impl Drop for ResidentHelper {
     fn drop(&mut self) {
-        self.shutdown();
+        // If we get here without `disable()` having taken us out of the
+        // option, run shutdown for cleanliness. The outcome is the
+        // caller's worry — Drop just makes sure the handle isn't leaked.
+        let _ = self.shutdown();
         unsafe {
             let _ = CloseHandle(self.process);
             let _ = CloseHandle(self.done_event);
@@ -330,20 +381,20 @@ impl VddController {
     }
 
     /// Enable the device. If the current process is elevated, just calls
-    /// `CM_Enable_DevNode` directly. Otherwise, spawns a long-lived
+    /// `devcon enable` directly. Otherwise, spawns a long-lived
     /// elevated helper (`--vdd-helper-resident <event-name> <instance>`)
     /// that does the enable AND will do the matching disable when we
     /// later signal it on `Drop`/`disable()` — keeping us at one UAC
     /// prompt total instead of one for enable + one for disable.
     pub fn enable(&mut self) -> Result<(), VddError> {
         if is_process_elevated() {
-            cm_enable(&self.instance_id)?;
+            devcon_action("enable", &self.instance_id)?;
             verify_devnode_started(&self.instance_id)?;
         } else if self.resident.is_none() {
             self.resident = Some(spawn_resident_helper(&self.instance_id)?);
-            // The helper does CM_Enable_DevNode in its own elevated
-            // context. Caller (session.rs) follows up with
-            // wait_for_virtual_monitor() which DXGI-polls until the
+            // The helper does devcon enable in its own elevated context.
+            // Caller (session.rs) follows up with
+            // `wait_for_virtual_monitor()` which DXGI-polls until the
             // virtual monitor actually appears, so we don't need a
             // separate "enable done" signal.
         } else {
@@ -357,15 +408,39 @@ impl VddController {
     }
 
     /// Disable the device. If a resident helper is alive, signal it (no
-    /// UAC). Otherwise fall back to spawning a one-shot elevated helper.
+    /// UAC). Otherwise fall back to a direct devcon call (if elevated)
+    /// or a one-shot elevated helper.
+    ///
+    /// If the resident helper is alive but doesn't acknowledge the stop
+    /// signal cleanly (timed out, crashed, or exited non-zero), fall
+    /// through to the direct/one-shot path so VDD doesn't get stranded
+    /// in the enabled state.
     pub fn disable(&mut self) -> Result<(), VddError> {
-        if let Some(mut helper) = self.resident.take() {
-            helper.shutdown();
+        let needs_fallback = if let Some(mut helper) = self.resident.take() {
+            match helper.shutdown() {
+                ShutdownOutcome::Clean => false,
+                other => {
+                    eprintln!(
+                        "[vdd] resident helper shutdown unclean ({other:?}); falling back to direct disable"
+                    );
+                    true
+                }
+            }
             // helper drops here, closing handles.
-        } else if is_process_elevated() {
-            cm_disable(&self.instance_id)?;
         } else {
-            run_helper_elevated("disable", &self.instance_id)?;
+            true
+        };
+        if needs_fallback {
+            if is_process_elevated() {
+                devcon_action("disable", &self.instance_id)?;
+                verify_devnode_disabled(&self.instance_id)?;
+            } else {
+                // Best-effort: spawning another helper costs an extra
+                // UAC prompt mid-disconnect, but leaving VDD attached
+                // is worse — and the next-launch leftover detect in
+                // main.rs is the safety net if the user dismisses UAC.
+                run_helper_elevated("disable", &self.instance_id)?;
+            }
         }
         self.enabled = false;
         Ok(())
@@ -601,15 +676,20 @@ pub fn helper_main(args: &[String]) -> ExitCode {
     let instance_id = args[2].as_str();
 
     // Resident sub-mode: helper does enable now, then waits on the named
-    // event for the parent to ask us to disable+exit. The event name is
-    // passed as the 4th arg.
+    // event OR the parent process handle for shutdown. Parent PID lets
+    // us recover when the parent dies abnormally (kill, BSOD, panic
+    // before Drop) — without it the helper would block forever and
+    // leak the VDD enabled.
     if action == "resident" {
-        if args.len() < 4 {
-            log.append("usage error: resident mode needs `<instance_id> <event_name>`");
+        if args.len() < 5 {
+            log.append(
+                "usage error: resident mode needs `<instance_id> <event_name> <parent_pid>`",
+            );
             return ExitCode::from(2);
         }
         let event_name = args[3].as_str();
-        return resident_helper_main(&log, instance_id, event_name);
+        let parent_pid: u32 = args[4].parse().unwrap_or(0);
+        return resident_helper_main(&log, instance_id, event_name, parent_pid);
     }
 
     // Snapshot device status BEFORE the action so we can compare.
@@ -685,15 +765,23 @@ pub fn helper_main(args: &[String]) -> ExitCode {
         };
     }
 
+    // devcon (vs CM_*_DevNode) writes registry-persistent CONFIGFLAG_
+    // DISABLED on disable and clears it on enable, so the off-state
+    // survives reboot — without that, root-enumerated devices come
+    // back up on every boot and Penflow looks like it leaked VDD
+    // (issue #22).
     let result = match action {
-        "enable" => cm_enable(instance_id).and_then(|_| {
-            log.append("CM_Enable_DevNode returned CR_SUCCESS");
+        "enable" => devcon_action("enable", instance_id).and_then(|()| {
+            log.append("devcon enable OK");
             verify_devnode_started(instance_id).inspect(|_| {
                 log.append("verify_devnode_started: device is healthy after enable");
             })
         }),
-        "disable" => cm_disable(instance_id).inspect(|_| {
-            log.append("CM_Disable_DevNode returned CR_SUCCESS");
+        "disable" => devcon_action("disable", instance_id).and_then(|()| {
+            log.append("devcon disable returned OK; verifying disabled state");
+            verify_devnode_disabled(instance_id).inspect(|()| {
+                log.append("verify_devnode_disabled: device is disabled");
+            })
         }),
         other => {
             log.append(&format!("unknown action: {other}"));
@@ -726,19 +814,24 @@ pub fn helper_main(args: &[String]) -> ExitCode {
 /// Resident-mode helper. Two named events bracket the lifetime:
 ///
 /// - `<base>-done`: the helper signals this AFTER it finishes the
-///   initial `CM_Enable_DevNode` + verify. The parent waits on it so
+///   initial `devcon enable` + verify. The parent waits on it so
 ///   `enable()` is effectively synchronous (matches old `WaitForSingleObject`
 ///   semantics) and only returns once the device is actually started.
 /// - `<base>-stop`: the parent signals this when it wants the helper to
-///   tear down. The helper then runs `CM_Disable_DevNode` and exits.
+///   tear down. The helper then runs `devcon disable` and exits.
 ///
 /// Two events instead of one (or one with manual reset + race-prone
 /// handshake) keeps the protocol stupid-obvious.
-fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) -> ExitCode {
+fn resident_helper_main(
+    log: &HelperLog,
+    instance_id: &str,
+    event_base: &str,
+    parent_pid: u32,
+) -> ExitCode {
     let done_name = format!("{event_base}-done");
     let stop_name = format!("{event_base}-stop");
     log.append(&format!(
-        "resident: enabling {instance_id}; events done={done_name} stop={stop_name}"
+        "resident: enabling {instance_id}; events done={done_name} stop={stop_name} parent_pid={parent_pid}"
     ));
 
     let done_w = wide_z(&done_name);
@@ -764,8 +857,8 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
         };
 
     // Initial enable.
-    if let Err(e) = cm_enable(instance_id) {
-        log.append(&format!("CM_Enable_DevNode failed: {e}"));
+    if let Err(e) = devcon_action("enable", instance_id) {
+        log.append(&format!("devcon enable failed: {e}"));
         unsafe {
             let _ = SetEvent(done_evt); // unblock parent so it can fail fast
             let _ = CloseHandle(done_evt);
@@ -773,7 +866,7 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
         };
         return ExitCode::from(1);
     }
-    log.append("CM_Enable_DevNode returned CR_SUCCESS");
+    log.append("devcon enable OK");
     match verify_devnode_started(instance_id) {
         Ok(()) => log.append("verify_devnode_started: device is healthy after enable"),
         Err(e) => log.append(&format!("verify_devnode_started failed: {e}")),
@@ -786,19 +879,91 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
         let _ = SetEvent(done_evt);
     }
 
-    // Sleep until the parent signals stop.
-    use windows::Win32::System::Threading::{WaitForSingleObject, INFINITE};
-    let _ = unsafe { WaitForSingleObject(stop_evt, INFINITE) };
-    log.append("stop event signaled; tearing down");
-
-    // Final disable.
-    let exit_code = match cm_disable(instance_id) {
-        Ok(()) => {
-            log.append("CM_Disable_DevNode returned CR_SUCCESS; exiting 0");
-            ExitCode::SUCCESS
+    // Wait for stop signal OR parent process exit. Parent-watch is the
+    // crash-recovery path: if the parent gets killed (Task Manager,
+    // BSOD, panic with `panic = "abort"`, or just exits before its
+    // Drop chain runs to completion) we still get to the persistent
+    // `devcon disable` below — otherwise the VDD stays attached
+    // forever and re-enables on every reboot (issue #22).
+    use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, WaitForMultipleObjects, INFINITE,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
+    };
+    let parent_access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let parent_handle = unsafe { OpenProcess(parent_access, false, parent_pid) };
+    let trigger = match parent_handle {
+        Ok(h) if !h.is_invalid() => {
+            let mut last_exit_code: u32 = STILL_ACTIVE.0 as u32;
+            let trigger = loop {
+                let waitables = [stop_evt, h];
+                let r = unsafe { WaitForMultipleObjects(&waitables, false, 1000) };
+                if r == WAIT_OBJECT_0 {
+                    break 0;
+                }
+                if r.0 == WAIT_OBJECT_0.0 + 1 {
+                    break 1;
+                }
+                if r == WAIT_TIMEOUT {
+                    match unsafe { GetExitCodeProcess(h, &mut last_exit_code) } {
+                        Ok(()) if last_exit_code != STILL_ACTIVE.0 as u32 => {
+                            log.append(&format!(
+                                "parent exit code observed by watchdog: {last_exit_code}"
+                            ));
+                            break 1;
+                        }
+                        Ok(()) => continue,
+                        Err(e) => {
+                            log.append(&format!(
+                                "GetExitCodeProcess({parent_pid}) failed: {e}; tearing down"
+                            ));
+                            break 2;
+                        }
+                    }
+                }
+                if r == WAIT_FAILED {
+                    log.append("WaitForMultipleObjects failed; tearing down");
+                    break 2;
+                }
+                break r.0.wrapping_sub(WAIT_OBJECT_0.0);
+            };
+            unsafe {
+                let _ = CloseHandle(h);
+            };
+            trigger
         }
+        _ => {
+            log.append(&format!(
+                "OpenProcess({parent_pid}) failed; waiting on stop event only"
+            ));
+            use windows::Win32::System::Threading::WaitForSingleObject;
+            let _ = unsafe { WaitForSingleObject(stop_evt, INFINITE) };
+            0
+        }
+    };
+    match trigger {
+        0 => log.append("stop event signaled; tearing down"),
+        1 => log.append("parent died; tearing down (orphan recovery)"),
+        other => log.append(&format!(
+            "wait returned unexpected index {other}; tearing down anyway"
+        )),
+    }
+
+    // Final disable. Persistent flag — survives reboot so the device
+    // doesn't auto-re-enable on next boot enumeration.
+    let exit_code = match devcon_action("disable", instance_id) {
+        Ok(()) => match verify_devnode_disabled(instance_id) {
+            Ok(()) => {
+                log.append("devcon disable OK; verified disabled; exiting 0");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                log.append(&format!("devcon disable did not disable device: {e}"));
+                ExitCode::from(1)
+            }
+        },
         Err(e) => {
-            log.append(&format!("CM_Disable_DevNode failed: {e}"));
+            log.append(&format!("devcon disable failed: {e}"));
             ExitCode::from(1)
         }
     };
@@ -812,7 +977,7 @@ fn resident_helper_main(log: &HelperLog, instance_id: &str, event_base: &str) ->
 
 /// Spawn the elevated resident helper that owns this VDD device's
 /// enable/disable cycle for the lifetime of our process. Blocks until
-/// the helper signals completion of the initial `CM_Enable_DevNode`,
+/// the helper signals completion of the initial `devcon enable`,
 /// matching the synchronous semantics of the legacy non-resident path.
 fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> {
     use windows::Win32::Foundation::WAIT_OBJECT_0;
@@ -853,9 +1018,13 @@ fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> 
         }
     };
 
-    // Spawn helper elevated (UAC prompt).
+    // Spawn helper elevated (UAC prompt). Pass our PID so the helper
+    // can `OpenProcess(PROCESS_SYNCHRONIZE, ...)` and detect parent
+    // death — without it, abnormal exit (kill, BSOD) leaks the VDD
+    // enabled until next reboot.
     let exe_w = wide_z(exe.as_os_str());
-    let params = format!("--vdd-helper resident \"{instance_id}\" \"{event_base}\"");
+    let parent_pid = pid;
+    let params = format!("--vdd-helper resident \"{instance_id}\" \"{event_base}\" {parent_pid}");
     let params_w = wide_z(&params);
     let verb_w = wide_z("runas");
     let mut sei = SHELLEXECUTEINFOW {
@@ -887,14 +1056,14 @@ fn spawn_resident_helper(instance_id: &str) -> Result<ResidentHelper, VddError> 
         ));
     }
 
-    // Block until helper finishes initial CM_Enable_DevNode (or process
-    // dies, whichever comes first). We use 30 s — generous; cm_enable +
+    // Block until helper finishes initial devcon enable (or process
+    // dies, whichever comes first). We use 30 s — generous; devcon enable +
     // verify_devnode_started typically completes in < 2 s.
     let waitables = [done_evt, process];
     use windows::Win32::System::Threading::WaitForMultipleObjects;
     let r = unsafe { WaitForMultipleObjects(&waitables, false, 30_000) };
     if r == WAIT_OBJECT_0 {
-        // done_evt fired: helper finished cm_enable.
+        // done_evt fired: helper finished devcon enable.
         Ok(ResidentHelper {
             process,
             done_event: done_evt,
@@ -1111,24 +1280,59 @@ fn locate_devnode(instance_id: &str) -> Result<u32, VddError> {
     }
 }
 
-fn cm_enable(instance_id: &str) -> Result<(), VddError> {
-    let devinst = locate_devnode(instance_id)?;
-    let r = unsafe { CM_Enable_DevNode(devinst, 0) };
-    match r {
-        CR_SUCCESS => Ok(()),
-        CR_ACCESS_DENIED => Err(VddError::AccessDenied),
-        other => Err(VddError::ConfigManager(other.0)),
+/// Run the bundled `devcon.exe <action> @<instance_id>` against the
+/// current Penflow process's adjacent `vdd/` resource dir. `action` is
+/// `"enable"` or `"disable"`. Caller must already be elevated — devcon
+/// requires admin to mutate device state.
+///
+/// Returns Ok on devcon exit 0 (success) or 1 (success + "reboot
+/// recommended"; IDDCx targets attach without reboot so this is fine
+/// for our purposes). Anything else is an error.
+fn devcon_action(action: &str, instance_id: &str) -> Result<(), VddError> {
+    let devcon = bundled_devcon_path().ok_or_else(|| {
+        VddError::ShellExecute(
+            "devcon.exe not found at <exe-dir>/vdd/devcon.exe — broken install?".into(),
+        )
+    })?;
+    // `@<instance_id>` targets the specific PnP node we detected, so
+    // multiple matching VDDs (if a third-party VDD is also installed)
+    // don't get caught in the crossfire.
+    let target = format!("@{instance_id}");
+    let mut cmd = std::process::Command::new(&devcon);
+    cmd.args([action, &target]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    match cmd.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let transcript = format!("{stdout}\n{stderr}");
+            let no_match = transcript
+                .to_ascii_lowercase()
+                .contains("no matching devices found");
+            if output.status.success() || (output.status.code() == Some(1) && !no_match) {
+                Ok(())
+            } else {
+                Err(VddError::ShellExecute(format!(
+                    "devcon {action} {target} exit={:?}; stdout={stdout:?}; stderr={stderr:?}",
+                    output.status
+                )))
+            }
+        }
+        Err(e) => Err(VddError::ShellExecute(format!(
+            "devcon {action} spawn failed: {e}"
+        ))),
     }
 }
 
-fn cm_disable(instance_id: &str) -> Result<(), VddError> {
-    let devinst = locate_devnode(instance_id)?;
-    let r = unsafe { CM_Disable_DevNode(devinst, 0) };
-    match r {
-        CR_SUCCESS => Ok(()),
-        CR_ACCESS_DENIED => Err(VddError::AccessDenied),
-        other => Err(VddError::ConfigManager(other.0)),
-    }
+fn bundled_devcon_path() -> Option<std::path::PathBuf> {
+    let exe = env::current_exe().ok()?;
+    let candidate = exe.parent()?.join("vdd").join("devcon.exe");
+    candidate.is_file().then_some(candidate)
 }
 
 fn devnode_is_disabled(instance_id: &str) -> Result<bool, VddError> {
@@ -1143,13 +1347,33 @@ fn devnode_is_disabled(instance_id: &str) -> Result<bool, VddError> {
     Ok(has_problem && problem.0 == CM_PROB_DISABLED.0)
 }
 
+/// After Disable, re-read CM_Get_DevNode_Status. `devcon` can return
+/// exit code 1 for both "reboot recommended" and real misses, so the
+/// status query is the source of truth.
+fn verify_devnode_disabled(instance_id: &str) -> Result<(), VddError> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if devnode_is_disabled(instance_id)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let (status, problem) = snapshot_devnode_status(instance_id)?;
+            return Err(VddError::DisableHadNoEffect {
+                status: status.0,
+                problem: problem.0,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
 /// After Enable, re-read CM_Get_DevNode_Status. If the driver came up
 /// fine the node has no problem flag. If the user-mode driver host
 /// crashed (HANDOFF §2.1 mttvdd.dll case), `DN_HAS_PROBLEM` is set with a
 /// problem code other than `CM_PROB_DISABLED`.
 fn verify_devnode_started(instance_id: &str) -> Result<(), VddError> {
     // Wait briefly — Windows reports the result asynchronously after
-    // CM_Enable_DevNode returns.
+    // devcon enable returns.
     std::thread::sleep(Duration::from_millis(300));
     let devinst = locate_devnode(instance_id)?;
     let mut status = CM_DEVNODE_STATUS_FLAGS(0);

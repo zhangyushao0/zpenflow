@@ -130,9 +130,14 @@ impl Service {
             let _ = c.send(());
         }
         if let Some(t) = inner.task.take() {
-            // Give the loop a moment to finish naturally; abort if it
-            // ignores the cancel signal.
-            let _ = tokio::time::timeout(Duration::from_secs(2), t).await;
+            // Give the loop time to finish naturally — `VddController`'s
+            // Drop spawns the helper-shutdown sequence (5 s wait for the
+            // helper to acknowledge stop + actually run devcon disable),
+            // and `transport.shutdown` adds another 2 s. 10 s leaves
+            // some slack so the persistent `devcon disable` writes
+            // before the process exits (issue #22 — short timeout would
+            // race the cleanup and leak VDD enabled).
+            let _ = tokio::time::timeout(Duration::from_secs(10), t).await;
         }
         inner.last_state = ServiceState::Stopped;
         let _ = self.events.send(ServiceState::Stopped);
