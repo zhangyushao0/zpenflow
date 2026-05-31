@@ -260,10 +260,6 @@ fn run_one(
         }
     }
 
-    let avg_us = if encode_us_n > 0 {
-        (encode_us_sum / encode_us_n) as u32
-    } else {
-        0
-    };
+    let avg_us = encode_us_sum.checked_div(encode_us_n).unwrap_or(0) as u32;
     Ok((packets, keyframes, first_kf_ms, avg_us))
 }
