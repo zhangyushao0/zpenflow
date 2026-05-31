@@ -149,6 +149,20 @@ pub enum VddError {
     )]
     EnableHadNoEffect,
 
+    /// Disable returned success but Configuration Manager still reports
+    /// the device as started/healthy.
+    #[error(
+        "Disable reported success but the device is still enabled. \
+         status=0x{status:08x} problem=0x{problem:08x}. \
+         Check %TEMP%\\penflow-vdd-helper.log for the helper trace."
+    )]
+    DisableHadNoEffect {
+        /// Raw `ulStatus` from CM_Get_DevNode_Status.
+        status: u32,
+        /// Raw `ulProblemNumber` from CM_Get_DevNode_Status.
+        problem: u32,
+    },
+
     /// `ShellExecuteExW` itself failed (code path that runs in the
     /// non-elevated parent). Usually means the user clicked No on the
     /// UAC prompt — Windows reports `ERROR_CANCELLED` (1223).
@@ -419,6 +433,7 @@ impl VddController {
         if needs_fallback {
             if is_process_elevated() {
                 devcon_action("disable", &self.instance_id)?;
+                verify_devnode_disabled(&self.instance_id)?;
             } else {
                 // Best-effort: spawning another helper costs an extra
                 // UAC prompt mid-disconnect, but leaving VDD attached
@@ -762,8 +777,11 @@ pub fn helper_main(args: &[String]) -> ExitCode {
                 log.append("verify_devnode_started: device is healthy after enable");
             })
         }),
-        "disable" => devcon_action("disable", instance_id).inspect(|()| {
-            log.append("devcon disable OK (persistent CONFIGFLAG_DISABLED)");
+        "disable" => devcon_action("disable", instance_id).and_then(|()| {
+            log.append("devcon disable returned OK; verifying disabled state");
+            verify_devnode_disabled(instance_id).inspect(|()| {
+                log.append("verify_devnode_disabled: device is disabled");
+            })
         }),
         other => {
             log.append(&format!("unknown action: {other}"));
@@ -867,20 +885,52 @@ fn resident_helper_main(
     // Drop chain runs to completion) we still get to the persistent
     // `devcon disable` below — otherwise the VDD stays attached
     // forever and re-enables on every reboot (issue #22).
-    use windows::Win32::Foundation::WAIT_OBJECT_0;
+    use windows::Win32::Foundation::{STILL_ACTIVE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT};
     use windows::Win32::System::Threading::{
-        OpenProcess, WaitForMultipleObjects, INFINITE, PROCESS_SYNCHRONIZE,
+        GetExitCodeProcess, OpenProcess, WaitForMultipleObjects, INFINITE,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE,
     };
-    let parent_handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, parent_pid) };
+    let parent_access = PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION;
+    let parent_handle = unsafe { OpenProcess(parent_access, false, parent_pid) };
     let trigger = match parent_handle {
         Ok(h) if !h.is_invalid() => {
-            let waitables = [stop_evt, h];
-            let r = unsafe { WaitForMultipleObjects(&waitables, false, INFINITE) };
+            let mut last_exit_code: u32 = STILL_ACTIVE.0 as u32;
+            let trigger = loop {
+                let waitables = [stop_evt, h];
+                let r = unsafe { WaitForMultipleObjects(&waitables, false, 1000) };
+                if r == WAIT_OBJECT_0 {
+                    break 0;
+                }
+                if r.0 == WAIT_OBJECT_0.0 + 1 {
+                    break 1;
+                }
+                if r == WAIT_TIMEOUT {
+                    match unsafe { GetExitCodeProcess(h, &mut last_exit_code) } {
+                        Ok(()) if last_exit_code != STILL_ACTIVE.0 as u32 => {
+                            log.append(&format!(
+                                "parent exit code observed by watchdog: {last_exit_code}"
+                            ));
+                            break 1;
+                        }
+                        Ok(()) => continue,
+                        Err(e) => {
+                            log.append(&format!(
+                                "GetExitCodeProcess({parent_pid}) failed: {e}; tearing down"
+                            ));
+                            break 2;
+                        }
+                    }
+                }
+                if r == WAIT_FAILED {
+                    log.append("WaitForMultipleObjects failed; tearing down");
+                    break 2;
+                }
+                break r.0.wrapping_sub(WAIT_OBJECT_0.0);
+            };
             unsafe {
                 let _ = CloseHandle(h);
             };
-            // Index of the signaled object: 0 = stop_evt, 1 = parent died.
-            r.0.wrapping_sub(WAIT_OBJECT_0.0)
+            trigger
         }
         _ => {
             log.append(&format!(
@@ -902,10 +952,16 @@ fn resident_helper_main(
     // Final disable. Persistent flag — survives reboot so the device
     // doesn't auto-re-enable on next boot enumeration.
     let exit_code = match devcon_action("disable", instance_id) {
-        Ok(()) => {
-            log.append("devcon disable OK; exiting 0");
-            ExitCode::SUCCESS
-        }
+        Ok(()) => match verify_devnode_disabled(instance_id) {
+            Ok(()) => {
+                log.append("devcon disable OK; verified disabled; exiting 0");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                log.append(&format!("devcon disable did not disable device: {e}"));
+                ExitCode::from(1)
+            }
+        },
         Err(e) => {
             log.append(&format!("devcon disable failed: {e}"));
             ExitCode::from(1)
@@ -1250,12 +1306,23 @@ fn devcon_action(action: &str, instance_id: &str) -> Result<(), VddError> {
         const CREATE_NO_WINDOW: u32 = 0x08000000;
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
-    match cmd.status() {
-        Ok(s) if s.success() => Ok(()),
-        Ok(s) if s.code() == Some(1) => Ok(()),
-        Ok(s) => Err(VddError::ShellExecute(format!(
-            "devcon {action} {target} exit={s:?}"
-        ))),
+    match cmd.output() {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let transcript = format!("{stdout}\n{stderr}");
+            let no_match = transcript
+                .to_ascii_lowercase()
+                .contains("no matching devices found");
+            if output.status.success() || (output.status.code() == Some(1) && !no_match) {
+                Ok(())
+            } else {
+                Err(VddError::ShellExecute(format!(
+                    "devcon {action} {target} exit={:?}; stdout={stdout:?}; stderr={stderr:?}",
+                    output.status
+                )))
+            }
+        }
         Err(e) => Err(VddError::ShellExecute(format!(
             "devcon {action} spawn failed: {e}"
         ))),
@@ -1278,6 +1345,26 @@ fn devnode_is_disabled(instance_id: &str) -> Result<bool, VddError> {
     }
     let has_problem = (status.0 & DN_HAS_PROBLEM.0) != 0;
     Ok(has_problem && problem.0 == CM_PROB_DISABLED.0)
+}
+
+/// After Disable, re-read CM_Get_DevNode_Status. `devcon` can return
+/// exit code 1 for both "reboot recommended" and real misses, so the
+/// status query is the source of truth.
+fn verify_devnode_disabled(instance_id: &str) -> Result<(), VddError> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        if devnode_is_disabled(instance_id)? {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            let (status, problem) = snapshot_devnode_status(instance_id)?;
+            return Err(VddError::DisableHadNoEffect {
+                status: status.0,
+                problem: problem.0,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
 }
 
 /// After Enable, re-read CM_Get_DevNode_Status. If the driver came up
