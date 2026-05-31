@@ -42,9 +42,9 @@ use windows::Win32::UI::HiDpi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MIDDLEDOWN,
-    MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEINPUT,
-    MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
+    KEYEVENTF_KEYUP, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP,
+    MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN,
+    MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK, MOUSEINPUT, MOUSE_EVENT_FLAGS, VIRTUAL_KEY,
 };
 use windows::Win32::UI::Input::Pointer::{
     InjectSyntheticPointerInput, POINTER_FLAGS, POINTER_FLAG_DOWN, POINTER_FLAG_FIRSTBUTTON,
@@ -53,7 +53,8 @@ use windows::Win32::UI::Input::Pointer::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GetSystemMetrics, PEN_FLAG_INVERTED, PEN_MASK_PRESSURE, PEN_MASK_TILT_X, PEN_MASK_TILT_Y,
-    PT_PEN, PT_TOUCH, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN, TOUCH_MASK_NONE,
+    PT_PEN, PT_TOUCH, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
+    TOUCH_MASK_NONE,
 };
 
 use crate::error::{EngineError, EngineResult};
@@ -215,14 +216,16 @@ impl InputInjector {
     /// OLD eraser state so the driver sees a clean `Inverted` transition.
     ///
     /// Also dispatches barrel-button transitions through the active
-    /// `PenButtonProfile` BEFORE the pen sample lands.
+    /// `PenButtonProfile` BEFORE the pen sample lands. Mouse-button bindings
+    /// first sync the legacy mouse cursor to this sample's pen tip so apps
+    /// that position context menus from `GetCursorPos` see the pen location.
     ///
     /// Routes to VMulti when present (issue #23). The synthetic-pointer
     /// path is the fallback for users who haven't installed the driver.
     /// Barrel-button bindings keep going through `dispatch_pen_buttons` →
     /// `SendInput` either way.
     pub fn inject_pen(&mut self, sample: &PenSample) -> EngineResult<()> {
-        self.dispatch_pen_buttons(sample.buttons)?;
+        self.dispatch_pen_buttons(sample)?;
 
         let effective_eraser = sample.eraser || self.pen_eraser_sticky;
 
@@ -286,10 +289,30 @@ impl InputInjector {
     }
 
     /// Edge-triggered binding dispatch for the three barrel buttons.
-    fn dispatch_pen_buttons(&mut self, now_bits: u8) -> EngineResult<()> {
+    fn dispatch_pen_buttons(&mut self, sample: &PenSample) -> EngineResult<()> {
+        let now_bits = sample.buttons;
         let prev = self.last_pen_buttons;
         let pressed_now = !prev & now_bits;
         let released_now = prev & !now_bits;
+
+        let mut sync_mouse_to_pen = false;
+        for slot in 0u8..3 {
+            let mask = 1u8 << slot;
+            let binding = match slot {
+                0 => &self.pen_profile.barrel_1,
+                1 => &self.pen_profile.barrel_2,
+                _ => &self.pen_profile.tertiary,
+            };
+            if matches!(binding, Binding::MouseButton(_))
+                && (now_bits & mask != 0 || released_now & mask != 0)
+            {
+                sync_mouse_to_pen = true;
+                break;
+            }
+        }
+        if sync_mouse_to_pen {
+            send_mouse_move_to(sample.x, sample.y)?;
+        }
 
         for slot in 0u8..3 {
             let mask = 1u8 << slot;
@@ -509,6 +532,17 @@ fn virtual_screen_origin() -> (i32, i32) {
     }
 }
 
+fn virtual_screen_rect() -> (i32, i32, i32, i32) {
+    unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    }
+}
+
 /// Compose the per-frame pointer-flag set for a pen sample given the
 /// previous and current `(in_range, in_contact)` states. Pure function so
 /// the transition matrix is unit-testable without spinning up a real
@@ -665,6 +699,43 @@ fn send_mouse_button(kind: MouseButtonKind, down: bool) -> EngineResult<()> {
     Ok(())
 }
 
+/// Move the legacy mouse cursor to a pen-tip pixel before/while a synthetic
+/// mouse button is held. This keeps `SendInput` button events and pen samples
+/// in the same screen position for apps that read the mouse cursor instead of
+/// the pen pointer coordinates.
+fn send_mouse_move_to(x: i32, y: i32) -> EngineResult<()> {
+    let (vx, vy, vw, vh) = virtual_screen_rect();
+    let input = INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 {
+            mi: MOUSEINPUT {
+                dx: normalize_absolute_mouse_coord(x, vx, vw),
+                dy: normalize_absolute_mouse_coord(y, vy, vh),
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK,
+                time: 0,
+                dwExtraInfo: 0,
+            },
+        },
+    };
+    let inputs = [input];
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+    if sent == 0 {
+        return Err(EngineError::Win32(windows::core::Error::from_thread()));
+    }
+    Ok(())
+}
+
+fn normalize_absolute_mouse_coord(pos: i32, origin: i32, span: i32) -> i32 {
+    if span <= 1 {
+        return 0;
+    }
+
+    let max_index = i64::from(span - 1);
+    let rel = (i64::from(pos) - i64::from(origin)).clamp(0, max_index);
+    ((rel * 65_535 + max_index / 2) / max_index) as i32
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::TouchState;
@@ -745,6 +816,14 @@ mod tests {
                 "missing PRIMARY for (was_range={wr}, was_contact={wc}, range={r}, contact={c})"
             );
         }
+    }
+
+    #[test]
+    fn absolute_mouse_coord_maps_virtual_desktop_edges() {
+        assert_eq!(normalize_absolute_mouse_coord(-100, -100, 200), 0);
+        assert_eq!(normalize_absolute_mouse_coord(99, -100, 200), 65_535);
+        assert_eq!(normalize_absolute_mouse_coord(-101, -100, 200), 0);
+        assert_eq!(normalize_absolute_mouse_coord(100, -100, 200), 65_535);
     }
 
     /// Smoke: build the unified injector. The only failure modes here are
