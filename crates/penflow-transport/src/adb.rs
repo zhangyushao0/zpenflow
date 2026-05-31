@@ -47,6 +47,70 @@ fn silent(cmd: &mut Command) -> &mut Command {
     cmd
 }
 
+/// Ensure any process we spawn dies when we do. Done by putting
+/// ourselves in a Windows job object with `KILL_ON_JOB_CLOSE` —
+/// children inherit job membership, so when our last handle to the
+/// job is released on process exit, the kernel tears them down with
+/// us. Targets the detached `adb fork-server` daemon, which otherwise
+/// outlives Penflow and pins the USB endpoint. A pre-existing daemon
+/// from Android Studio / scrcpy sits in a different job and is
+/// untouched.
+#[cfg(windows)]
+fn mark_kill_children_on_exit() {
+    use std::sync::OnceLock;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+    use windows::Win32::System::Threading::GetCurrentProcess;
+
+    struct JobHandle(#[allow(dead_code)] HANDLE);
+    // HANDLE is an opaque pointer we never dereference or mutate after
+    // init; safe to share across threads.
+    unsafe impl Send for JobHandle {}
+    unsafe impl Sync for JobHandle {}
+
+    static JOB: OnceLock<Option<JobHandle>> = OnceLock::new();
+    JOB.get_or_init(|| unsafe {
+        let job = match CreateJobObjectW(None, None) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[adb] CreateJobObjectW failed: {e} — adb daemon will outlive Penflow");
+                return None;
+            }
+        };
+        let mut info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let size = std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32;
+        if let Err(e) = SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &info as *const _ as *const _,
+            size,
+        ) {
+            eprintln!("[adb] SetInformationJobObject failed: {e}");
+            return None;
+        }
+        if let Err(e) = AssignProcessToJobObject(job, GetCurrentProcess()) {
+            // Most likely cause: parent process is already in a job that
+            // doesn't allow nesting / breakaway. Windows 8+ allows nested
+            // jobs, but a debugger / installer harness can still block
+            // assignment. Non-fatal — we just fall back to the old
+            // behavior (daemon outlives us).
+            eprintln!(
+                "[adb] AssignProcessToJobObject failed: {e} — adb daemon may outlive Penflow"
+            );
+            return None;
+        }
+        Some(JobHandle(job))
+    });
+}
+
+#[cfg(not(windows))]
+fn mark_kill_children_on_exit() {}
+
 use async_trait::async_trait;
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
@@ -94,6 +158,8 @@ impl AdbLocalAbstractTransport {
         // "Could not create process". Going straight to the underlying
         // adb.exe sidesteps the entire shim.
         let adb_path: String = resolve_through_shim(&adb_path.into());
+
+        mark_kill_children_on_exit();
 
         // 1. Start the adb daemon (idempotent — `start-server` is a no-op
         //    if one is already running). On a fresh install the very

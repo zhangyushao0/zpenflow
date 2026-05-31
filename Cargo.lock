@@ -2174,6 +2174,7 @@ dependencies = [
  "async-trait",
  "thiserror 1.0.69",
  "tokio",
+ "windows 0.62.2",
 ]
 
 [[package]]
