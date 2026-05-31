@@ -148,10 +148,41 @@ impl MfSession {
         configure_video_output_type(&out_type, &cfg)?;
         unsafe { transform.SetOutputType(0, &out_type, 0)? };
 
-        // 5. Input type (NV12) — colour-space attrs on this side.
+        // 5. Input type (NV12) — colour-space attrs on this side so the
+        //    encoder writes matching VUI metadata.
+        //
+        //    Intel's Quick Sync MFT rejects `MF_MT_VIDEO_NOMINAL_RANGE` on
+        //    the NV12 *input* type with `MF_E_INVALIDMEDIATYPE` (0xC00D36B4),
+        //    even though our NV12 genuinely is full-range — NVIDIA/AMD accept
+        //    the same attribute fine. That single rejection used to brick the
+        //    whole Intel path: `make_session` failed → engine never produced a
+        //    keyframe → the session errored → the GUI service loop re-enabled
+        //    the VDD in a tight loop (issue #37's "频繁切换显示器状态 / 无法接入").
+        //
+        //    Fix: try the fully-tagged type first (unchanged for the
+        //    daily-driver-tested NVIDIA/AMD path); if a backend refuses it,
+        //    retry without the nominal-range tag. This is colour-safe: the
+        //    nominal-range attribute only controls the VUI `video_full_range_
+        //    flag`, not the sample values — and the Android decoder forces
+        //    `KEY_COLOR_RANGE = COLOR_RANGE_FULL` explicitly (VideoDecoder.kt),
+        //    so it interprets the (still full-range) samples correctly
+        //    regardless of the stream VUI.
         let in_type = unsafe { MFCreateMediaType()? };
-        configure_nv12_input_type(&in_type, &cfg)?;
-        unsafe { transform.SetInputType(0, &in_type, 0)? };
+        configure_nv12_input_type(&in_type, &cfg, true)?;
+        if let Err(e) = unsafe { transform.SetInputType(0, &in_type, 0) } {
+            if e.code() == MF_E_INVALIDMEDIATYPE {
+                eprintln!(
+                    "[mf] SetInputType rejected the full NV12 type ({:?}); retrying without \
+                     MF_MT_VIDEO_NOMINAL_RANGE (Intel Quick Sync quirk — issue #37)",
+                    e.code()
+                );
+                let retry = unsafe { MFCreateMediaType()? };
+                configure_nv12_input_type(&retry, &cfg, false)?;
+                unsafe { transform.SetInputType(0, &retry, 0)? };
+            } else {
+                return Err(e.into());
+            }
+        }
 
         // 6. Codec API: rate control + bitrate + low-latency mode.
         let codec_api: ICodecAPI = transform.cast()?;
@@ -592,7 +623,16 @@ fn configure_video_output_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineR
     Ok(())
 }
 
-fn configure_nv12_input_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineResult<()> {
+/// Build the NV12 input media type. `set_nominal_range` controls whether the
+/// `MF_MT_VIDEO_NOMINAL_RANGE = 0_255` (full-range) tag is included — Intel's
+/// Quick Sync MFT rejects it on the input type (issue #37), so the caller
+/// retries with `false` when `SetInputType` fails. The other colour-space
+/// attributes are accepted by every tested vendor and stay unconditionally.
+fn configure_nv12_input_type(
+    t: &IMFMediaType,
+    cfg: &SessionConfig,
+    set_nominal_range: bool,
+) -> EngineResult<()> {
     unsafe {
         t.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
         t.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
@@ -600,7 +640,9 @@ fn configure_nv12_input_type(t: &IMFMediaType, cfg: &SessionConfig) -> EngineRes
         t.SetUINT64(&MF_MT_FRAME_RATE, pack_2u32(cfg.fps, 1))?;
         t.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, pack_2u32(1, 1))?;
         t.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-        let _ = t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32);
+        if set_nominal_range {
+            let _ = t.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_0_255.0 as u32);
+        }
         let _ = t.SetUINT32(&MF_MT_VIDEO_PRIMARIES, MFVideoPrimaries_BT709.0 as u32);
         let _ = t.SetUINT32(&MF_MT_TRANSFER_FUNCTION, MFVideoTransFunc_709.0 as u32);
         let _ = t.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT709.0 as u32);
