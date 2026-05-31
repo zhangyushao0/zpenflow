@@ -761,6 +761,20 @@ export default function App() {
                                         No video is sent — the encoder and capture pipeline are stopped. Pen and touch still work; the tablet behaves like an input-only Wacom Intuos.
                                     </Caption1>
                                 )}
+                                <div className={styles.row}>
+                                    <span className={styles.rowLabel} title="Drop all hand-gesture / touch contacts server-side so palm-resting on the tablet doesn't trigger taps or scrolls on the PC. Pen input is unaffected. Takes effect after the next reconnect.">
+                                        Disable hand gestures
+                                    </span>
+                                    <Switch
+                                        checked={settings.disable_touch === true}
+                                        onChange={(_, d) => setSettings({ ...settings, disable_touch: d.checked })}
+                                    />
+                                </div>
+                                {settings.disable_touch === true && (
+                                    <Caption1 className={styles.hint}>
+                                        Touch and multi-finger gestures from the tablet are ignored by the PC. Only pen input drives the cursor.
+                                    </Caption1>
+                                )}
                             </>
                         )}
                         <Field label="Codec" orientation="horizontal" className={styles.row}>

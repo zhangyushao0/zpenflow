@@ -153,6 +153,9 @@ pub struct SessionConfig {
     /// Screen-off mode (Duplicate topology only — `service.rs` enforces).
     /// Skips engine + video pumps; only input dispatch runs.
     pub screen_off: bool,
+    /// Drop inbound `MSG_TOUCH_EVENT` frames before they reach the
+    /// injector. Pen samples are unaffected.
+    pub disable_touch: bool,
     /// Pen-button bindings to apply on the per-session injector. Default
     /// is the engine's `PenButtonProfile::default()` (Ctrl/Shift/E). The
     /// GUI converts user-edited `settings::PenBindings` to this struct
@@ -211,6 +214,7 @@ impl Default for SessionConfig {
             vdd_target_resolution: None,
             hud_enabled: true,
             screen_off: false,
+            disable_touch: false,
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
         }
     }
@@ -622,6 +626,7 @@ impl Session {
             android.display_height,
             idr_tx,
             session_start,
+            self.cfg.disable_touch,
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -805,6 +810,7 @@ impl Session {
             android.display_height,
             idr_tx,
             session_start,
+            self.cfg.disable_touch,
         )
         .await;
 
@@ -976,6 +982,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
     android_h: u16,
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
+    disable_touch: bool,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
@@ -1037,6 +1044,16 @@ async fn read_loop<R: AsyncRead + Unpin>(
             }
             MSG_TOUCH_EVENT => {
                 let te = TouchEvent::decode(&payload)?;
+                if disable_touch {
+                    // Release any fingers that were touching the tablet
+                    // when the toggle flipped on; otherwise the OS would
+                    // see them as stuck-pressed until the next session.
+                    let mut inj = injector.lock().await;
+                    if let Err(e) = inj.inject_touch(&[]) {
+                        eprintln!("[read_loop] touch lift (disable_touch) failed: {e:?}");
+                    }
+                    continue;
+                }
                 let snapshot: Vec<TouchPoint> = te
                     .contacts
                     .iter()

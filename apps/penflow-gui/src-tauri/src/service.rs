@@ -435,6 +435,8 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         // Screen-off requires Duplicate — blanking the tablet in Extend
         // mode would leave the user with no view of the VDD desktop.
         screen_off: s.screen_off && matches!(s.topology, settings::TopologyMode::Duplicate),
+        // Disable-touch is exposed only in the Duplicate options card.
+        disable_touch: s.disable_touch && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
     }
 }

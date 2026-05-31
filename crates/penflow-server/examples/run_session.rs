@@ -180,6 +180,7 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         vdd_target_resolution: None,
         hud_enabled: true,
         screen_off: false,
+        disable_touch: false,
         pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
     };
 
