@@ -47,10 +47,10 @@ Penflow 是 **[Wacom Instant Pen Display Mode](https://community.wacom.com/en-sg
 | 厂商 | 编码器 MFT | 状态 |
 |---|---|---|
 | **NVIDIA** | NVENC | ✅ 日用过（RTX 5070） |
-| Intel | Quick Sync (QSV) | 🟡 代码路径已存在；**真机未验证** |
+| Intel | Quick Sync (QSV) | 🟡 H.264 已有用户验证；HEVC 目前会回退到 H.264，以避开 #40 报告的高延迟路径 |
 | AMD | AMF | 🟡 代码路径已存在；**真机未验证** |
 
-如果你在 Intel Arc / 核显或 AMD Radeon 上跑出来了（或者跑不起来），欢迎开 Issue 附 `dxdiag` 输出 — 这是关掉这一格的方式。
+如果你能验证 Intel HEVC 或其他尚未验证的 GPU 路径，欢迎附上 `dxdiag` 适配器信息和延迟 HUD 数据 — 这是关掉这一格的方式。
 
 ## 功能
 

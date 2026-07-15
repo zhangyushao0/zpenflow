@@ -39,13 +39,20 @@ pub enum Binding {
     KeyHold(Vec<VIRTUAL_KEY>),
     /// Send all keys down, then all up, in order. Useful for `Ctrl+Z` style.
     KeyChord(Vec<VIRTUAL_KEY>),
-    /// Hold a synthetic mouse button while the barrel is pressed: down on
-    /// press, up on release. Used by people who like the Wacom convention
-    /// of mapping a barrel button to right-click for the context menu.
+    /// Hold zero or more keyboard keys plus a synthetic mouse button while
+    /// the barrel is pressed. Keys go down first, followed by the mouse
+    /// button; release happens in the opposite order. This supports app
+    /// gestures such as `Space + Left Mouse` for hover-panning.
+    ///
+    /// Used by people who like the Wacom convention of mapping a barrel
+    /// button to right-click for the context menu.
     /// HANDOFF §2.3 #4 cautions that mouse-button presses get filtered by
     /// Windows Ink **during ongoing pen contact** — keep this for off-stroke
     /// hover use; for in-stroke modifiers prefer `KeyHold`.
-    MouseButton(MouseButtonKind),
+    MouseButton {
+        button: MouseButtonKind,
+        keys: Vec<VIRTUAL_KEY>,
+    },
     /// Flip the `PEN_FLAG_INVERTED` bit on subsequent pen samples until
     /// pressed again. Krita Windows Ink mode reads the bit as "this is the
     /// eraser end of the pen".

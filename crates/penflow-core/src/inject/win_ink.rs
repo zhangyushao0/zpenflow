@@ -200,8 +200,11 @@ impl InputInjector {
                         let _ = send_key(*vk, false);
                     }
                 }
-                Binding::MouseButton(kind) => {
-                    let _ = send_mouse_button(*kind, false);
+                Binding::MouseButton { button, keys } => {
+                    let _ = send_mouse_button(*button, false);
+                    for vk in keys.iter().rev() {
+                        let _ = send_key(*vk, false);
+                    }
                 }
                 _ => {}
             }
@@ -306,7 +309,7 @@ impl InputInjector {
                 1 => &self.pen_profile.barrel_2,
                 _ => &self.pen_profile.tertiary,
             };
-            if matches!(binding, Binding::MouseButton(_))
+            if matches!(binding, Binding::MouseButton { .. })
                 && (now_bits & mask != 0 || released_now & mask != 0)
             {
                 sync_mouse_to_pen = true;
@@ -348,7 +351,17 @@ impl InputInjector {
                             send_key(*vk, false)?;
                         }
                     }
-                    Binding::MouseButton(kind) => send_mouse_button(*kind, true)?,
+                    Binding::MouseButton { button, keys } => {
+                        for vk in keys {
+                            send_key(*vk, true)?;
+                        }
+                        if let Err(e) = send_mouse_button(*button, true) {
+                            for vk in keys.iter().rev() {
+                                let _ = send_key(*vk, false);
+                            }
+                            return Err(e);
+                        }
+                    }
                     Binding::EraserToggle => {
                         self.pen_eraser_sticky = !self.pen_eraser_sticky;
                     }
@@ -367,7 +380,13 @@ impl InputInjector {
                             send_key(*vk, false)?;
                         }
                     }
-                    Binding::MouseButton(kind) => send_mouse_button(*kind, false)?,
+                    Binding::MouseButton { button, keys } => {
+                        let mouse_result = send_mouse_button(*button, false);
+                        for vk in keys.iter().rev() {
+                            send_key(*vk, false)?;
+                        }
+                        mouse_result?;
+                    }
                     _ => {}
                 }
             }

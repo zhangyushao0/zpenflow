@@ -37,10 +37,10 @@ use penflow_core::Engine;
 use penflow_protocol::{
     encode_frame, extract_h264_nals, extract_hevc_nals, read_frame, write_frame, ClientConfig,
     HelloAndroid, HelloPc, PenEvent, Telemetry, TimeSyncReq, TimeSyncResp, TouchEvent, VideoFrame,
-    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_H264, CODEC_HEVC, FRAME_FLAG_EXTENDED,
-    FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG, MSG_HELLO_ANDROID, MSG_HELLO_PC,
-    MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY, MSG_TIME_SYNC_REQ,
-    MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
+    CLIENT_CFG_FLAG_HUD, CLIENT_CFG_FLAG_SCREEN_OFF, CODEC_CAPS_H264, CODEC_H264, CODEC_HEVC,
+    FRAME_FLAG_EXTENDED, FRAME_FLAG_KEYFRAME, MSG_ANDROID_GOODBYE, MSG_CLIENT_CONFIG,
+    MSG_HELLO_ANDROID, MSG_HELLO_PC, MSG_PC_GOODBYE, MSG_PEN_EVENT, MSG_REQUEST_IDR, MSG_TELEMETRY,
+    MSG_TIME_SYNC_REQ, MSG_TIME_SYNC_RESP, MSG_TOUCH_EVENT, MSG_VIDEO_CONFIG, MSG_VIDEO_FRAME,
 };
 use penflow_transport::{Transport, TransportStream};
 
@@ -53,6 +53,24 @@ use crate::vdd::{
     force_monitor_mode, snapshot_attached_monitor_keys, wait_for_virtual_monitor, VddController,
     VddError,
 };
+
+const INTEL_VENDOR_ID: u32 = 0x8086;
+
+fn compatible_codec(requested: Codec, adapter_vendor_id: u32, client_codec_caps: u8) -> Codec {
+    // Intel's HEVC Media Foundation path has been observed accepting input
+    // faster than it emits output at the default 2880x1800@120, building up
+    // seconds of queued video. H.264 is confirmed usable on that hardware in
+    // issue #40, so prefer it until the HEVC path can be validated on a real
+    // Intel device. Keep HEVC when the client does not advertise H.264.
+    if requested == Codec::Hevc
+        && adapter_vendor_id == INTEL_VENDOR_ID
+        && client_codec_caps & CODEC_CAPS_H264 != 0
+    {
+        Codec::H264
+    } else {
+        requested
+    }
+}
 
 /// Session-level errors. Most fan-in from the engine, transport, or protocol;
 /// the variants below capture the few cases where the orchestrator wants to
@@ -464,6 +482,18 @@ impl Session {
             self.cfg.monitor.clone()
         };
 
+        let effective_codec = compatible_codec(
+            self.cfg.codec,
+            capture_monitor.adapter_vendor_id,
+            android.codec_caps,
+        );
+        if effective_codec != self.cfg.codec {
+            eprintln!(
+                "[session] Intel adapter device 0x{:04X}: falling back from HEVC to H.264 to avoid the high-latency path reported in issue #40",
+                capture_monitor.adapter_device_id
+            );
+        }
+
         // 4. NOW start the engine. HEVC's first encoded frame is necessarily
         //    an IDR (no reference frames available), so we don't need an
         //    explicit `request_idr()` — just take whatever comes off the
@@ -477,7 +507,7 @@ impl Session {
         //    init is the VDD enable + settle + engine bring-up time, ~2 s
         //    on a cold start).
         let engine = Engine::builder(capture_monitor)
-            .codec(self.cfg.codec)
+            .codec(effective_codec)
             .bitrate_bps(self.cfg.bitrate_bps)
             .fps(self.cfg.fps)
             .pts_epoch(session_start)
@@ -523,7 +553,7 @@ impl Session {
         // Codec-specific parameter-set extraction:
         //   H.264 csd-0 = SPS (NAL 7) + PPS (NAL 8)
         //   HEVC  csd-0 = VPS (NAL 32) + SPS (NAL 33) + PPS (NAL 34)
-        let (csd0, codec_wire_id) = match self.cfg.codec {
+        let (csd0, codec_wire_id) = match effective_codec {
             Codec::H264 => (extract_h264_nals(&first_pkt.bytes, &[7, 8]), CODEC_H264),
             Codec::Hevc => (
                 extract_hevc_nals(&first_pkt.bytes, &[32, 33, 34]),
@@ -1150,5 +1180,38 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn intel_hevc_falls_back_when_h264_is_supported() {
+        assert_eq!(
+            compatible_codec(Codec::Hevc, INTEL_VENDOR_ID, CODEC_CAPS_H264),
+            Codec::H264
+        );
+    }
+
+    #[test]
+    fn intel_hevc_is_kept_without_h264_support() {
+        assert_eq!(
+            compatible_codec(Codec::Hevc, INTEL_VENDOR_ID, 0),
+            Codec::Hevc
+        );
+    }
+
+    #[test]
+    fn non_intel_and_h264_requests_are_unchanged() {
+        assert_eq!(
+            compatible_codec(Codec::Hevc, 0x10DE, CODEC_CAPS_H264),
+            Codec::Hevc
+        );
+        assert_eq!(
+            compatible_codec(Codec::H264, 0x1002, CODEC_CAPS_H264),
+            Codec::H264
+        );
     }
 }

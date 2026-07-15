@@ -47,10 +47,10 @@ The encoder uses Windows Media Foundation's hardware-MFT path and selects the ma
 | Vendor | Encoder MFT | Status |
 |---|---|---|
 | **NVIDIA** | NVENC | ✅ Daily-driver-tested (RTX 5070) |
-| Intel | Quick Sync (QSV) | 🟡 Code path exists; **not yet validated** on real hardware |
+| Intel | Quick Sync (QSV) | 🟡 H.264 user-validated; HEVC currently falls back to H.264 to avoid the high-latency path reported in #40 |
 | AMD | AMF | ✅ Daily-driver-tested (RX 6600) |
 
-If you run Penflow on Intel Arc / iGPU or Radeon and it works (or doesn't), please file an issue with `dxdiag` output — that's how we close out the matrix.
+If you can validate Intel HEVC or another untested GPU path, please report the `dxdiag` adapter details and latency HUD readings — that's how we close out the matrix.
 
 ## Features
 
