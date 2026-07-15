@@ -495,11 +495,27 @@ fn convert_binding(b: &settings::Binding) -> CoreBinding {
     match b {
         settings::Binding::None => CoreBinding::None,
         settings::Binding::EraserToggle => CoreBinding::EraserToggle,
-        settings::Binding::MouseButton { button } => CoreBinding::MouseButton(match button {
-            SettingsMouseButton::Left => MouseButtonKind::Left,
-            SettingsMouseButton::Right => MouseButtonKind::Right,
-            SettingsMouseButton::Middle => MouseButtonKind::Middle,
-        }),
+        settings::Binding::MouseButton { button, key } => {
+            let button = match button {
+                SettingsMouseButton::Left => MouseButtonKind::Left,
+                SettingsMouseButton::Right => MouseButtonKind::Right,
+                SettingsMouseButton::Middle => MouseButtonKind::Middle,
+            };
+            let keys = if key.trim().is_empty() {
+                Vec::new()
+            } else {
+                match parse_key_combo(key) {
+                    Some(keys) => keys,
+                    None => {
+                        eprintln!(
+                            "[bindings] unrecognised MouseButton key spec '{key}'; ignoring keys"
+                        );
+                        Vec::new()
+                    }
+                }
+            };
+            CoreBinding::MouseButton { button, keys }
+        }
         settings::Binding::KeyTap { key } => match parse_key_combo(key) {
             Some(keys) if keys.len() == 1 => CoreBinding::KeyTap(keys[0]),
             Some(keys) if keys.len() > 1 => CoreBinding::KeyChord(keys),
@@ -715,10 +731,29 @@ mod tests {
     fn convert_mouse_button_passes_kind() {
         let b = settings::Binding::MouseButton {
             button: SettingsMouseButton::Right,
+            key: String::new(),
         };
         match convert_binding(&b) {
-            CoreBinding::MouseButton(MouseButtonKind::Right) => {}
+            CoreBinding::MouseButton { button, keys } => {
+                assert_eq!(button, MouseButtonKind::Right);
+                assert!(keys.is_empty());
+            }
             other => panic!("expected MouseButton(Right), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn convert_mouse_button_preserves_key_combo() {
+        let b = settings::Binding::MouseButton {
+            button: SettingsMouseButton::Left,
+            key: "Ctrl+Space".into(),
+        };
+        match convert_binding(&b) {
+            CoreBinding::MouseButton { button, keys } => {
+                assert_eq!(button, MouseButtonKind::Left);
+                assert_eq!(keys.as_slice(), &[VK_CONTROL, VK_SPACE]);
+            }
+            other => panic!("expected MouseButton with key combo, got {other:?}"),
         }
     }
 }

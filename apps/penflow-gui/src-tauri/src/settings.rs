@@ -217,8 +217,12 @@ pub enum Binding {
     KeyHold { key: String },
     /// Send the keys in order with the last held until release.
     KeyChord { keys: Vec<String> },
-    /// Synthesize a mouse button press while pressed.
-    MouseButton { button: MouseButton },
+    /// Hold an optional key chord plus a mouse button while pressed.
+    MouseButton {
+        button: MouseButton,
+        #[serde(default)]
+        key: String,
+    },
     /// Toggle the pen's eraser tool flag for the lifetime of the press.
     EraserToggle,
 }
@@ -400,5 +404,18 @@ mod tests {
         .validate()
         .expect_err("odd width should be rejected");
         assert!(err.contains("even"));
+    }
+
+    #[test]
+    fn legacy_mouse_button_binding_defaults_to_no_key() {
+        let binding: Binding =
+            serde_json::from_str(r#"{"kind":"mouse_button","button":"left"}"#).unwrap();
+        match binding {
+            Binding::MouseButton { button, key } => {
+                assert_eq!(button, MouseButton::Left);
+                assert!(key.is_empty());
+            }
+            other => panic!("expected MouseButton, got {other:?}"),
+        }
     }
 }

@@ -368,6 +368,7 @@ function bindingToState(binding) {
             break;
         case "mouse_button":
             s.mouse = binding.button ?? "left";
+            ({ mods: s.mods, key: s.key } = splitKeySpec(binding.key ?? ""));
             break;
     }
     return s;
@@ -380,7 +381,11 @@ function stateToBinding(s) {
         case "key_tap":      return { kind: "key_tap",  key: joinKeySpec(s.mods, s.key) };
         case "key_hold":     return { kind: "key_hold", key: joinKeySpec(s.mods, s.key) };
         case "key_chord":    return { kind: "key_chord", keys: [...s.mods, s.key].filter(Boolean) };
-        case "mouse_button": return { kind: "mouse_button", button: s.mouse };
+        case "mouse_button": return {
+            kind: "mouse_button",
+            button: s.mouse,
+            key: joinKeySpec(s.mods, s.key),
+        };
     }
 }
 
@@ -431,9 +436,10 @@ function BindingRow({ label, slot, onChange, styles }) {
                 </span>
             );
         }
-        if (slot.kind === "mouse_button") {
-            return (
-                <div className={styles.bindingDetail}>
+        const isMouseButton = slot.kind === "mouse_button";
+        return (
+            <div className={styles.bindingDetail}>
+                {isMouseButton && (
                     <div className={styles.mouseGroup}>
                         {[["left","Left"],["middle","Middle"],["right","Right"]].map(([v, l]) => (
                             <button
@@ -446,12 +452,7 @@ function BindingRow({ label, slot, onChange, styles }) {
                             >{l}</button>
                         ))}
                     </div>
-                </div>
-            );
-        }
-        // key_tap / key_hold / key_chord
-        return (
-            <div className={styles.bindingDetail}>
+                )}
                 {MOD_ORDER.map((m) => (
                     <button
                         key={m}
@@ -477,7 +478,9 @@ function BindingRow({ label, slot, onChange, styles }) {
                     onKeyDown={onKeyDown}
                     onBlur={() => setCapturing(false)}
                 >
-                    {capturing ? "press a key…" : (slot.key || "press a key")}
+                    {capturing
+                        ? "press a key…"
+                        : (slot.key || (isMouseButton ? "optional key" : "press a key"))}
                 </span>
                 <button
                     type="button"
