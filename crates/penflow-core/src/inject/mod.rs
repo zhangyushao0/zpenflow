@@ -25,6 +25,7 @@
 
 pub mod binding;
 pub mod coords;
+pub mod pressure;
 
 #[cfg(windows)]
 pub mod win_ink;

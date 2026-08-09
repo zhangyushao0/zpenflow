@@ -185,17 +185,66 @@ impl MfSession {
         }
 
         // 6. Codec API: rate control + bitrate + low-latency mode.
+        //
+        // Rate control defaults to PEAK-CONSTRAINED VBR rather than CBR.
+        // CBR spends the full budget even on an unchanged desktop, so a
+        // static screen still produces ~bitrate of near-padding traffic
+        // that the USB link must carry and the tablet must decode — pure
+        // heat at both ends. PCVBR with peak == the configured bitrate
+        // keeps the same worst-case bound for motion (latency profile
+        // unchanged) while letting static/low-motion content undershoot
+        // to a trickle. Desktop/drawing content is mostly static, so the
+        // average saving is large.
+        //
+        // PENFLOW_RATE_CONTROL=cbr restores the old behaviour if a
+        // backend's PCVBR implementation misbehaves.
         let codec_api: ICodecAPI = transform.cast()?;
-        set_codec_ui4(
-            &codec_api,
-            &CODECAPI_AVEncCommonRateControlMode,
-            eAVEncCommonRateControlMode_CBR.0 as u32,
-        )?;
-        set_codec_ui4(
-            &codec_api,
-            &CODECAPI_AVEncCommonMeanBitRate,
-            cfg.bitrate_bps,
-        )?;
+        let use_cbr = std::env::var("PENFLOW_RATE_CONTROL")
+            .map(|v| v.eq_ignore_ascii_case("cbr"))
+            .unwrap_or(false);
+        if use_cbr {
+            set_codec_ui4(
+                &codec_api,
+                &CODECAPI_AVEncCommonRateControlMode,
+                eAVEncCommonRateControlMode_CBR.0 as u32,
+            )?;
+            set_codec_ui4(
+                &codec_api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                cfg.bitrate_bps,
+            )?;
+        } else {
+            set_codec_ui4(
+                &codec_api,
+                &CODECAPI_AVEncCommonRateControlMode,
+                eAVEncCommonRateControlMode_PeakConstrainedVBR.0 as u32,
+            )?;
+            set_codec_ui4(
+                &codec_api,
+                &CODECAPI_AVEncCommonMeanBitRate,
+                cfg.bitrate_bps,
+            )?;
+            // Peak == mean: motion may use the full configured budget,
+            // static content undershoots. Best-effort — a backend that
+            // rejects MaxBitRate still runs VBR against the mean.
+            let _ = set_codec_ui4(
+                &codec_api,
+                &CODECAPI_AVEncCommonMaxBitRate,
+                cfg.bitrate_bps,
+            );
+        }
+        // Quality-vs-speed preset (0 = fastest, 100 = best quality).
+        // Default 33 leans toward speed: at desktop-streaming bitrates the
+        // visual difference is small, but the per-frame encode cost — and
+        // with it heat and, on weaker encoders like Intel QSV at high
+        // resolutions, latency headroom — drops measurably. Best-effort;
+        // PENFLOW_QUALITY_VS_SPEED=0..100 to tune.
+        let qvs = std::env::var("PENFLOW_QUALITY_VS_SPEED")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| *v <= 100)
+            .unwrap_or(33);
+        let _ = set_codec_ui4(&codec_api, &CODECAPI_AVEncCommonQualityVsSpeed, qvs);
         let _ = set_codec_bool(&codec_api, &CODECAPI_AVLowLatencyMode, true);
         // `AVEncCommonRealTime` is independent of `AVLowLatencyMode` — it
         // tells the MFT "this is a real-time stream, prefer latency over

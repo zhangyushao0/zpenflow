@@ -71,6 +71,10 @@ pub struct Service {
     /// Broadcasts every state transition. Frontend subscribes; commands
     /// call `current()` for the latest snapshot.
     events: broadcast::Sender<ServiceState>,
+    /// Live pen samples (raw + curved pressure) for the settings page's
+    /// "pen feel" test pad. Broadcast, so it costs one failed send per
+    /// sample when the page isn't open.
+    pen_feed: broadcast::Sender<penflow_server::PenFeel>,
     settings: SharedSettings,
 }
 
@@ -87,6 +91,7 @@ struct Inner {
 impl Service {
     pub fn new(settings: SharedSettings) -> Self {
         let (tx, _) = broadcast::channel(16);
+        let (pen_tx, _) = broadcast::channel(256);
         Self {
             inner: Mutex::new(Inner {
                 task: None,
@@ -94,12 +99,18 @@ impl Service {
                 last_state: ServiceState::Stopped,
             }),
             events: tx,
+            pen_feed: pen_tx,
             settings,
         }
     }
 
     /// Subscribe to state-transition events. Each subscriber gets every
     /// new state; lagging subscribers see the channel reset.
+    /// Subscribe to live pen samples for the "pen feel" test pad.
+    pub fn subscribe_pen(&self) -> broadcast::Receiver<penflow_server::PenFeel> {
+        self.pen_feed.subscribe()
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<ServiceState> {
         self.events.subscribe()
     }
@@ -205,7 +216,8 @@ impl Service {
                 };
 
             eprintln!("[service] building session config (VDD detect…)");
-            let cfg = build_session_config(&self.settings);
+            let mut cfg = build_session_config(&self.settings);
+            cfg.pen_feed = Some(self.pen_feed.clone());
             eprintln!(
                 "[service] session config: fallback={}x{}@{} codec={:?} vdd={}",
                 cfg.monitor.width,
@@ -475,6 +487,13 @@ fn build_session_config(settings: &SharedSettings) -> SessionConfig {
         // Disable-touch is exposed only in the Duplicate options card.
         disable_touch: s.disable_touch && matches!(s.topology, settings::TopologyMode::Duplicate),
         pen_profile: build_pen_profile(&s.bindings),
+        pressure: penflow_core::inject::pressure::PressureCurve::new(
+            s.pressure.threshold,
+            s.pressure.max,
+            s.pressure.gamma,
+        ),
+        // Filled by the run loop, which owns the broadcast sender.
+        pen_feed: None,
     }
 }
 

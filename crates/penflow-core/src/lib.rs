@@ -8,6 +8,7 @@
 //! tokio session loop that wires these together to the transport.
 
 pub mod error;
+pub mod idle;
 
 #[cfg(windows)]
 pub mod capture;
@@ -71,6 +72,7 @@ use crate::pipeline::{Pipeline, PipelineConfig};
 /// [`Engine::list_monitors`] + [`Engine::builder`].
 #[cfg(windows)]
 pub struct Engine {
+    activity: std::sync::Arc<idle::ActivityTracker>,
     monitor: MonitorInfo,
     pipeline: Option<Pipeline>,
 }
@@ -132,6 +134,13 @@ impl Engine {
 
     /// Request an IDR on the next encoded frame. Used on initial connect or
     /// when the Android client signals decoder recovery (`MSG_REQUEST_IDR`).
+    /// Shared pen/touch activity signal for the idle governor. The
+    /// session's input read loop calls `.touch()` on every pen or touch
+    /// event; the pipeline throttles its tick rate when this goes quiet.
+    pub fn activity(&self) -> std::sync::Arc<idle::ActivityTracker> {
+        self.activity.clone()
+    }
+
     pub fn request_idr(&self) {
         if let Some(p) = self.pipeline.as_ref() {
             p.request_idr();
@@ -290,6 +299,16 @@ impl EngineBuilder {
             scrgb_sdr_scale * 80.0,
         );
 
+        let idle_cfg = idle::IdleConfig::from_env();
+        let activity = std::sync::Arc::new(idle::ActivityTracker::new());
+        if idle_cfg.enabled() {
+            eprintln!(
+                "[engine] idle governor: {} fps after {} ms without pen/touch \
+                 (PENFLOW_IDLE_FPS / PENFLOW_IDLE_AFTER_MS to tune, 0 disables)",
+                idle_cfg.idle_fps, idle_cfg.idle_after_ms
+            );
+        }
+
         let pipeline = Pipeline::start(
             ctx,
             capturer,
@@ -303,10 +322,13 @@ impl EngineBuilder {
                 packet_queue_capacity: self.packet_queue_capacity,
                 pts_epoch: self.pts_epoch.unwrap_or_else(Instant::now),
                 scrgb_sdr_scale,
+                idle: idle_cfg,
             },
+            activity.clone(),
         )?;
 
         Ok(Engine {
+            activity,
             monitor,
             pipeline: Some(pipeline),
         })

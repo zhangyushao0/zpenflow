@@ -3,6 +3,7 @@
 // visible while developing.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod gpu;
 mod os;
 mod service;
 mod settings;
@@ -76,7 +77,18 @@ fn save_settings(state: tauri::State<'_, AppState>, new: Settings) -> Result<(),
         settings::write_installed_vdd_settings(&new)
             .map_err(|e| format!("VDD settings write failed: {e}"))?;
     }
+
+    // Per-app GPU preference (Settings → Display → Graphics equivalent).
+    // Kept in lockstep with the vdd_settings.xml <gpu> pin written above;
+    // the engine picks its adapter through this preference at next launch.
+    gpu::apply_process_gpu_preference(&new.preferred_gpu)
+        .map_err(|e| format!("GPU preference write failed: {e}"))?;
     Ok(())
+}
+
+#[tauri::command]
+fn list_gpus() -> Vec<String> {
+    gpu::list_gpus()
 }
 
 #[tauri::command]
@@ -415,12 +427,61 @@ fn main() -> std::process::ExitCode {
                         let _ = app_handle.emit("service-state", state);
                     }
                 });
+
+                // Pen-feel feed: forward live (raw, curved) pen samples to
+                // the settings page's test pad. Throttled to ~125 Hz;
+                // contact edges always pass so stroke ends stay crisp.
+                #[derive(Clone, serde::Serialize)]
+                struct PenFeelUi {
+                    x: f32,
+                    y: f32,
+                    raw: f32,
+                    curved: f32,
+                    contact: bool,
+                    x_px: i32,
+                    y_px: i32,
+                }
+                let pen_service = Arc::clone(&service);
+                let pen_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    let mut rx = pen_service.subscribe_pen();
+                    let mut last = std::time::Instant::now() - std::time::Duration::from_secs(1);
+                    let mut last_contact = false;
+                    loop {
+                        match rx.recv().await {
+                            Ok(s) => {
+                                let edge = s.contact != last_contact;
+                                last_contact = s.contact;
+                                if !edge && last.elapsed() < std::time::Duration::from_millis(8) {
+                                    continue;
+                                }
+                                last = std::time::Instant::now();
+                                let _ = pen_handle.emit(
+                                    "pen-feel",
+                                    PenFeelUi {
+                                        x: s.x,
+                                        y: s.y,
+                                        raw: s.raw,
+                                        curved: s.curved,
+                                        contact: s.contact,
+                                        x_px: s.x_px,
+                                        y_px: s.y_px,
+                                    },
+                                );
+                            }
+                            // Lagged: fine, drop and continue. Closed: exit.
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                });
                 Ok(())
             }
         })
         .invoke_handler(tauri::generate_handler![
             get_settings,
             save_settings,
+            list_gpus,
             get_status,
             start_service,
             stop_service,

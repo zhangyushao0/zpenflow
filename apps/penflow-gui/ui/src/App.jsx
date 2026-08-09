@@ -23,6 +23,196 @@ import {
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+// ---------------------------------------------------------------------------
+// Pen feel: Wacom-style pressure curve editor + live test pad.
+//
+// The curve is out(p) = clamp((p - threshold) / (max - threshold))^gamma.
+// Three handles mirror the classic Wacom dialog: click threshold (bottom
+// axis), max pressure (top axis), sensitivity (mid-curve point, vertical
+// drag). The test pad draws live strokes from the "pen-feel" event the
+// service emits — draw anywhere on the tablet and watch width follow the
+// curved pressure.
+// ---------------------------------------------------------------------------
+
+const CURVE_W = 260;
+const CURVE_H = 180;
+const CURVE_PAD = 14;
+
+function curveApply(p, th, mx, g) {
+    if (p <= th) return 0;
+    const ramp = Math.min(1, (p - th) / (mx - th));
+    return Math.pow(ramp, g);
+}
+
+function PenFeelCard({ styles, pressure, onChange }) {
+    const th = pressure?.threshold ?? 0;
+    const mx = pressure?.max ?? 1;
+    const g = pressure?.gamma ?? 1;
+
+    const svgRef = useRef(null);
+    const dragRef = useRef(null); // "threshold" | "max" | "sense"
+    const canvasRef = useRef(null);
+    const lastPtRef = useRef(null);
+
+    const X = (p) => CURVE_PAD + p * (CURVE_W - 2 * CURVE_PAD);
+    const Y = (o) => CURVE_H - CURVE_PAD - o * (CURVE_H - 2 * CURVE_PAD);
+    const fromX = (px) => Math.min(1, Math.max(0, (px - CURVE_PAD) / (CURVE_W - 2 * CURVE_PAD)));
+    const fromY = (py) => Math.min(1, Math.max(0, (CURVE_H - CURVE_PAD - py) / (CURVE_H - 2 * CURVE_PAD)));
+
+    const path = (() => {
+        const pts = [];
+        for (let i = 0; i <= 60; i++) {
+            const p = i / 60;
+            pts.push(`${i === 0 ? "M" : "L"}${X(p).toFixed(1)},${Y(curveApply(p, th, mx, g)).toFixed(1)}`);
+        }
+        return pts.join(" ");
+    })();
+
+    // Sensitivity handle sits at the curve's midpoint between threshold and max.
+    const senseP = th + 0.5 * (mx - th);
+    const senseOut = curveApply(senseP, th, mx, g);
+
+    const onPointer = (ev, phase) => {
+        const rect = svgRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        const px = ev.clientX - rect.left;
+        const py = ev.clientY - rect.top;
+        if (phase === "down") {
+            const near = (hx, hy) => Math.hypot(px - hx, py - hy) < 14;
+            if (near(X(th), Y(0))) dragRef.current = "threshold";
+            else if (near(X(mx), Y(1))) dragRef.current = "max";
+            else if (near(X(senseP), Y(senseOut))) dragRef.current = "sense";
+            else dragRef.current = null;
+            if (dragRef.current) ev.target.setPointerCapture?.(ev.pointerId);
+            return;
+        }
+        if (phase === "up") { dragRef.current = null; return; }
+        if (!dragRef.current) return;
+        if (dragRef.current === "threshold") {
+            onChange({ ...pressure, threshold: Math.min(0.5, fromX(px)), max: mx, gamma: g });
+        } else if (dragRef.current === "max") {
+            onChange({ ...pressure, threshold: th, max: Math.max(0.5, Math.max(th + 0.05, fromX(px))), gamma: g });
+        } else {
+            // Vertical drag sets gamma: out(mid) = y  =>  gamma = ln(y)/ln(0.5)
+            const y = Math.min(0.95, Math.max(0.05, fromY(py)));
+            const gamma = Math.min(5, Math.max(0.2, Math.log(y) / Math.log(0.5)));
+            onChange({ ...pressure, threshold: th, max: mx, gamma });
+        }
+    };
+
+    useEffect(() => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#2b2b2b";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        const un = listen("pen-feel", (ev) => {
+            const s = ev.payload;
+            if (!s.contact) { lastPtRef.current = null; return; }
+            // Wacom-style "Try Here": only strokes that physically land
+            // inside this canvas's on-screen frame are drawn. The sample
+            // carries its mapped desktop-pixel position; compare it to the
+            // canvas's own desktop rect (window position + element rect,
+            // scaled to physical pixels). Put this settings window on the
+            // tablet's display and draw directly in the box.
+            const dpr = window.devicePixelRatio || 1;
+            const r = canvas.getBoundingClientRect();
+            const left = (window.screenX + r.left) * dpr;
+            const top = (window.screenY + r.top) * dpr;
+            const w = r.width * dpr;
+            const h = r.height * dpr;
+            if (s.x_px < left || s.x_px > left + w || s.y_px < top || s.y_px > top + h) {
+                lastPtRef.current = null; // stroke left the frame
+                return;
+            }
+            const pt = {
+                x: ((s.x_px - left) / w) * canvas.width,
+                y: ((s.y_px - top) / h) * canvas.height,
+                w: 0.5 + s.curved * 12,
+            };
+            const last = lastPtRef.current;
+            if (last) {
+                ctx.strokeStyle = "#3b6df0";
+                ctx.lineCap = "round";
+                ctx.lineWidth = (last.w + pt.w) / 2;
+                ctx.beginPath();
+                ctx.moveTo(last.x, last.y);
+                ctx.lineTo(pt.x, pt.y);
+                ctx.stroke();
+            }
+            lastPtRef.current = pt;
+        });
+        return () => { un.then((fn) => fn()).catch(() => {}); };
+    }, []);
+
+    const clearPad = () => {
+        const canvas = canvasRef.current;
+        if (!canvas) return;
+        const ctx = canvas.getContext("2d");
+        ctx.fillStyle = "#2b2b2b";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        lastPtRef.current = null;
+    };
+
+    return (
+        <section className={styles.card}>
+            <Subtitle2 className={styles.cardTitle}>Pen feel</Subtitle2>
+            <Caption1 className={styles.hint}>
+                Drag the handles: ▲ click threshold, ▼ max pressure, ■ sensitivity.
+                Move this window onto the tablet's display and draw INSIDE the
+                dark box — only strokes inside the frame are tracked, at the
+                curved pressure.
+            </Caption1>
+            <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", alignItems: "flex-start" }}>
+                <svg
+                    ref={svgRef}
+                    width={CURVE_W}
+                    height={CURVE_H}
+                    style={{ background: "#242424", borderRadius: 6, touchAction: "none", cursor: "pointer" }}
+                    onPointerDown={(e) => onPointer(e, "down")}
+                    onPointerMove={(e) => onPointer(e, "move")}
+                    onPointerUp={(e) => onPointer(e, "up")}
+                >
+                    {/* axes */}
+                    <line x1={X(0)} y1={Y(0)} x2={X(1)} y2={Y(0)} stroke="#555" />
+                    <line x1={X(0)} y1={Y(0)} x2={X(0)} y2={Y(1)} stroke="#555" />
+                    {/* curve */}
+                    <path d={path} fill="none" stroke="#4caf50" strokeWidth="2" />
+                    {/* threshold handle (bottom axis, up-triangle) */}
+                    <polygon
+                        points={`${X(th)},${Y(0) - 8} ${X(th) - 6},${Y(0) + 2} ${X(th) + 6},${Y(0) + 2}`}
+                        fill="#29b6f6"
+                    />
+                    {/* max handle (top, down-triangle) */}
+                    <polygon
+                        points={`${X(mx)},${Y(1) + 8} ${X(mx) - 6},${Y(1) - 2} ${X(mx) + 6},${Y(1) - 2}`}
+                        fill="#29b6f6"
+                    />
+                    {/* sensitivity handle */}
+                    <rect x={X(senseP) - 5} y={Y(senseOut) - 5} width="10" height="10" fill="#ff7043" />
+                </svg>
+                <div style={{ display: "flex", flexDirection: "column", gap: "6px" }}>
+                    <canvas
+                        ref={canvasRef}
+                        width={CURVE_W}
+                        height={CURVE_H}
+                        style={{ background: "#2b2b2b", borderRadius: 6 }}
+                    />
+                    <div style={{ display: "flex", gap: "8px" }}>
+                        <Button size="small" onClick={clearPad}>Clear</Button>
+                        <Button
+                            size="small"
+                            onClick={() => onChange({ threshold: 0, max: 1, gamma: 1 })}
+                        >
+                            Default
+                        </Button>
+                    </div>
+                </div>
+            </div>
+        </section>
+    );
+}
+
 const useStyles = makeStyles({
     root: {
         display: "flex",
@@ -526,6 +716,7 @@ export default function App() {
     const styles = useStyles();
     const [status, setStatus] = useState({ state: "stopped" });
     const [settings, setSettings] = useState(null);
+    const [gpus, setGpus] = useState([]);
     const [slots, setSlots] = useState([
         { kind: "key_hold", mods: ["Ctrl"], key: "", mouse: "left" },
         { kind: "key_hold", mods: ["Shift"], key: "", mouse: "left" },
@@ -561,6 +752,7 @@ export default function App() {
             try { setStatus(await invoke("get_status")); } catch {}
             try { setVddInstalled(await invoke("is_vdd_installed")); } catch {}
             try { setVmultiInstalled(await invoke("is_vmulti_installed")); } catch {}
+            try { setGpus(await invoke("list_gpus")); } catch {}
         })();
 
         const unlistenP = listen("service-state", (ev) => setStatus(ev.payload));
@@ -978,6 +1170,25 @@ export default function App() {
                         onChange={(_, d) => setSettings({ ...settings, hud_enabled: d.checked })}
                     />
                 </div>
+                <Field
+                    label="GPU"
+                    orientation="horizontal"
+                    className={styles.row}
+                    hint="Pins the virtual display AND Penflow's renderer to one GPU — they must match on dual-GPU laptops. Applies after restarting Penflow."
+                >
+                    <Dropdown
+                        value={settings.preferred_gpu || "Default (Windows decides)"}
+                        selectedOptions={[settings.preferred_gpu || ""]}
+                        onOptionSelect={(_, d) =>
+                            setSettings({ ...settings, preferred_gpu: d.optionValue })
+                        }
+                    >
+                        <Option value="">Default (Windows decides)</Option>
+                        {gpus.map((g) => (
+                            <Option key={g} value={g}>{g}</Option>
+                        ))}
+                    </Dropdown>
+                </Field>
                 <Caption1 style={{ color: tokens.colorNeutralForeground4 }}>
                     {elevated ? "Currently running as administrator" : "Currently running unelevated"}
                 </Caption1>
@@ -1006,6 +1217,12 @@ export default function App() {
                     />
                 ))}
             </section>
+
+            <PenFeelCard
+                styles={styles}
+                pressure={settings.pressure || { threshold: 0, max: 1, gamma: 1 }}
+                onChange={(p) => setSettings({ ...settings, pressure: p })}
+            />
 
             <footer className={styles.footer}>
                 <span className={styles.saveStatus}>{saveMsg}</span>

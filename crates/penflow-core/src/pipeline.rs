@@ -107,6 +107,9 @@ pub struct PipelineConfig {
     /// `DisplayConfigGetDeviceInfo(GET_SDR_WHITE_LEVEL)` in
     /// `Engine::start`.
     pub scrgb_sdr_scale: f32,
+    /// Idle-governor tunables (see `crate::idle`). `IdleConfig::disabled()`
+    /// preserves the exact pre-governor behaviour.
+    pub idle: crate::idle::IdleConfig,
 }
 
 impl Default for PipelineConfig {
@@ -123,6 +126,7 @@ impl Default for PipelineConfig {
             packet_queue_capacity: 2,
             pts_epoch: Instant::now(),
             scrgb_sdr_scale: 1.0,
+            idle: crate::idle::IdleConfig::disabled(),
         }
     }
 }
@@ -144,6 +148,7 @@ impl Pipeline {
         converter: ColorConverter,
         encoder: Box<dyn EncodeSession>,
         cfg: PipelineConfig,
+        activity: std::sync::Arc<crate::idle::ActivityTracker>,
     ) -> EngineResult<Self> {
         let queue = PacketQueue::new(cfg.packet_queue_capacity);
         let stop = Arc::new(AtomicBool::new(false));
@@ -245,7 +250,9 @@ impl Pipeline {
                     idr_request: idr,
                     keepalive_uses: ka,
                     cfg,
+                    activity,
                     has_real_frame: false,
+                    nv12_valid: false,
                     start_instant: pts_epoch,
                     last_dda_format: None,
                 };
@@ -328,7 +335,13 @@ struct LoopState {
     idr_request: Arc<AtomicBool>,
     keepalive_uses: Arc<AtomicU64>,
     cfg: PipelineConfig,
+    activity: std::sync::Arc<crate::idle::ActivityTracker>,
     has_real_frame: bool,
+    /// True while the converter's NV12 output still matches the keepalive
+    /// texture. A fresh DDA frame or cursor re-composite invalidates it; a
+    /// keepalive re-encode with this set can skip the BGRA→NV12 shader
+    /// pass entirely and feed the encoder the previous conversion.
+    nv12_valid: bool,
     start_instant: Instant,
     /// Last DDA format we logged the routing decision for. Lets us emit
     /// one log line per format transition (HDR toggled, monitor swap)
@@ -339,7 +352,19 @@ struct LoopState {
 impl LoopState {
     fn run(&mut self) -> EngineResult<()> {
         while !self.stop.load(Ordering::Acquire) {
+            let tick_start = Instant::now();
             self.tick()?;
+            // Idle governor: when pen/touch has been quiet for the
+            // configured window, stretch the tick period out to the idle
+            // frame rate. `throttle_sleep_ms` returns `None` while active,
+            // so the hot path is one atomic load + one compare.
+            if let Some(sleep_ms) = crate::idle::throttle_sleep_ms(
+                self.cfg.idle,
+                self.activity.ms_since_activity(),
+                tick_start.elapsed().as_millis() as u64,
+            ) {
+                std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            }
         }
         Ok(())
     }
@@ -436,6 +461,7 @@ impl LoopState {
                     }
                 }
                 self.has_real_frame = true;
+                self.nv12_valid = false; // keepalive repainted below
 
                 // Pull cursor state. Shape only ships when it changed — if
                 // GetFramePointerShape errors we keep the cached one rather
@@ -455,6 +481,19 @@ impl LoopState {
                     }
                 }
                 if let Some(pos) = frame.pointer_position() {
+                    // A cursor that moved means a human is driving this
+                    // display with the MOUSE — the idle governor must not
+                    // throttle under them. Pen/touch already feed the
+                    // tracker from the session's read loop; this covers the
+                    // remaining input device. Video playback doesn't move
+                    // the cursor, so passive watching still idles down.
+                    let moved = match self.last_pointer {
+                        Some(prev) => prev.x != pos.x || prev.y != pos.y,
+                        None => true,
+                    };
+                    if moved {
+                        self.activity.touch();
+                    }
                     self.last_pointer = Some(pos);
                 }
                 drop(frame);
@@ -495,9 +534,17 @@ impl LoopState {
         }
 
         // BGRA → NV12 (writes to the converter's stable output texture).
-        if let Err(e) = self.converter.convert(&self.keepalive) {
-            eprintln!("[pipeline] convert ERR: {e:?}");
-            return Err(e);
+        // Skipped when the keepalive is untouched since the previous
+        // convert — on keepalive re-encode ticks (static desktop, idle
+        // governor) the previous NV12 output is still exact, so the video
+        // processor pass is pure waste. The encoder still gets a frame
+        // either way; only the redundant conversion is elided.
+        if !self.nv12_valid {
+            if let Err(e) = self.converter.convert(&self.keepalive) {
+                eprintln!("[pipeline] convert ERR: {e:?}");
+                return Err(e);
+            }
+            self.nv12_valid = true;
         }
         if trace {
             eprintln!("[pipeline] convert ok, submitting frame to encoder");
@@ -639,6 +686,7 @@ mod tests {
             packet_queue_capacity: 16,
             pts_epoch: Instant::now(),
             scrgb_sdr_scale: 1.0,
+            idle: crate::idle::IdleConfig::disabled(),
         };
         let conv = ColorConverter::new(&ctx, cfg.width, cfg.height, cfg.fps).expect("conv");
         // Build the encoder session BEFORE moving ctx into the capturer
@@ -663,7 +711,15 @@ mod tests {
         )
         .expect("capturer");
 
-        let pipeline = Pipeline::start(ctx, capturer, conv, encoder, cfg).expect("start");
+        let pipeline = Pipeline::start(
+            ctx,
+            capturer,
+            conv,
+            encoder,
+            cfg,
+            std::sync::Arc::new(crate::idle::ActivityTracker::new()),
+        )
+        .expect("start");
         // Force an IDR very early so we don't depend on the encoder's natural
         // GOP cadence.
         pipeline.request_idr();

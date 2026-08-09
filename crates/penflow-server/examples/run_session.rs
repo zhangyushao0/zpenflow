@@ -182,6 +182,8 @@ async fn run_session_main() -> Result<(), Box<dyn std::error::Error>> {
         screen_off: false,
         disable_touch: false,
         pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
+        pressure: penflow_core::inject::pressure::PressureCurve::default(),
+        pen_feed: None,
     };
 
     // Subscribe to lifecycle events so the operator sees them.

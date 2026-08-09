@@ -40,6 +40,19 @@ class PenInputCapture(
 
     private var lastButtonsRaw = 0  // bitmask straight from MotionEvent
 
+    /** Extra button bits sourced OUTSIDE MotionEvent — stylus KeyEvents.
+     *
+     *  Wacom EMR pens report barrel buttons in [MotionEvent.buttonState],
+     *  but capacitive BLE pencils (HONOR Magic-Pencil, Huawei M-Pencil)
+     *  deliver their tap/press gestures as KeyEvents instead — Android 14's
+     *  official KEYCODE_STYLUS_BUTTON_* range, or OEM extension keycodes
+     *  (the M-Pencil 3 double-tap arrives as keycode 718). MainActivity
+     *  translates those to bits (bit0=btn1, bit1=btn2, bit2=btn3) and sets
+     *  them here; they are OR-ed into every outgoing sample so the rest of
+     *  the pipeline (protocol, PC bindings, injection) is unchanged and
+     *  pen-agnostic. */
+    @Volatile var externalButtonBits: Int = 0
+
     // Spatial dead zone after stylus lift (HANDOFF §1.3, design §10.7).
     // Without this, fast tap-and-go strokes can register a phantom second
     // contact within ~5px of the lift coordinates as a double-click.
@@ -139,7 +152,7 @@ class PenInputCapture(
 
         val decodedButtons = decodeButtons(
             newPrimary, newSecondary, newTertiary, chordTransition
-        )
+        ) or externalButtonBits
         lastButtonsRaw = rawButtons
 
         // Emit historical samples first (Android batches at high rates),

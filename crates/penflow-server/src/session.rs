@@ -46,7 +46,8 @@ use penflow_transport::{Transport, TransportStream};
 
 #[cfg(windows)]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN,
+    GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN,
+    SM_YVIRTUALSCREEN,
 };
 
 use crate::vdd::{
@@ -164,6 +165,35 @@ pub struct SessionConfig {
     /// in `service.rs::build_session_config` so the saved bindings
     /// actually reach the synthetic-pointer layer (issue #6).
     pub pen_profile: penflow_core::inject::binding::PenButtonProfile,
+    /// Pen pressure response curve, applied where `PenSample` is built so
+    /// both injection backends see the identical reshaped pressure.
+    pub pressure: penflow_core::inject::pressure::PressureCurve,
+    /// Optional live feed of (raw, curved) pen samples for the GUI's
+    /// "pen feel" test pad. `send` on a receiver-less channel is a cheap
+    /// no-op, so this costs nothing when the settings page is closed.
+    pub pen_feed: Option<tokio::sync::broadcast::Sender<PenFeel>>,
+}
+
+/// One pen sample as exposed to the GUI test pad: normalized tablet
+/// coordinates plus raw and curve-shaped pressure.
+#[derive(Clone, Copy, Debug)]
+pub struct PenFeel {
+    /// Normalized `[0, 1]` X on the tablet panel.
+    pub x: f32,
+    /// Normalized `[0, 1]` Y on the tablet panel.
+    pub y: f32,
+    /// Raw pressure as reported by the pen, `[0, 1]`.
+    pub raw: f32,
+    /// Pressure after the response curve, `[0, 1]` — what gets injected.
+    pub curved: f32,
+    /// True while the (curved) sample counts as tip contact.
+    pub contact: bool,
+    /// Mapped desktop-space X in physical pixels — where this sample lands
+    /// on the PC desktop. Lets the GUI's test pad accept only strokes that
+    /// physically fall inside its own on-screen frame.
+    pub x_px: i32,
+    /// Mapped desktop-space Y in physical pixels.
+    pub y_px: i32,
 }
 
 impl Default for SessionConfig {
@@ -218,6 +248,8 @@ impl Default for SessionConfig {
             screen_off: false,
             disable_touch: false,
             pen_profile: penflow_core::inject::binding::PenButtonProfile::default(),
+            pressure: penflow_core::inject::pressure::PressureCurve::default(),
+            pen_feed: None,
         }
     }
 }
@@ -635,6 +667,9 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            engine.activity(),
+            self.cfg.pressure,
+            self.cfg.pen_feed.clone(),
         ));
 
         // 8. Wait for the read loop to finish, while servicing IDR requests.
@@ -840,6 +875,11 @@ impl Session {
             idr_tx,
             session_start,
             self.cfg.disable_touch,
+            // No engine on this path, so nothing consumes the signal; a
+            // fresh tracker keeps the read_loop signature uniform.
+            Arc::new(penflow_core::idle::ActivityTracker::new()),
+            self.cfg.pressure,
+            self.cfg.pen_feed.clone(),
         );
         let finish_fut: Pin<Box<dyn Future<Output = ()> + Send>> = match finish {
             Some(rx) => Box::pin(async move {
@@ -1024,23 +1064,35 @@ async fn read_loop<R: AsyncRead + Unpin>(
     idr_tx: tokio::sync::mpsc::UnboundedSender<()>,
     session_start: Instant,
     disable_touch: bool,
+    activity: Arc<penflow_core::idle::ActivityTracker>,
+    pressure: penflow_core::inject::pressure::PressureCurve,
+    pen_feed: Option<tokio::sync::broadcast::Sender<PenFeel>>,
 ) -> Result<(), SessionError> {
     let _ = (android_w, android_h); // captured for future use
 
-    // Virtual-screen dimensions. Used to convert VMulti's normalized
-    // [0,1] tablet coords onto its logical-axis [0, 32767] range scaled
-    // across the full desktop. Captured once per session — monitor
-    // topology changes are rare and would require a session restart for
-    // the rest of the engine anyway.
+    // Virtual-screen origin and dimensions. Used to convert VMulti's
+    // normalized [0,1] tablet coords onto its logical-axis [0, 32767]
+    // range scaled across the full desktop. Captured once per session —
+    // monitor topology changes are rare and would require a session
+    // restart for the rest of the engine anyway.
+    //
+    // The origin is not always (0, 0): `SM_X/YVIRTUALSCREEN` go negative
+    // whenever a monitor sits left of or above the primary. `coords` emits
+    // desktop-space pixels (origin = primary top-left), so they must be
+    // rebased onto the virtual-screen origin before scaling, exactly as
+    // the win_ink path does via `virtual_screen_origin()`. Without this the
+    // pen maps across the whole desktop instead of onto its own monitor.
     #[cfg(windows)]
-    let (vscreen_w, vscreen_h) = unsafe {
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = unsafe {
         (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
             GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as u32,
             GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as u32,
         )
     };
     #[cfg(not(windows))]
-    let (vscreen_w, vscreen_h) = (1u32, 1u32);
+    let (vscreen_x, vscreen_y, vscreen_w, vscreen_h) = (0i32, 0i32, 1u32, 1u32);
     loop {
         let (msg_id, payload) = match read_frame(&mut reader).await {
             Ok(v) => v,
@@ -1057,23 +1109,43 @@ async fn read_loop<R: AsyncRead + Unpin>(
 
         match msg_id {
             MSG_PEN_EVENT => {
+                // Feed the idle governor: any pen traffic (hover included)
+                // keeps or restores the full frame rate.
+                activity.touch();
                 let pe = PenEvent::decode(&payload)?;
                 let (x, y) = coords.map_to_pixel(pe.x_norm, pe.y_norm);
                 // VMulti logical coords, scaled across the virtual screen.
                 // The Win32 / WinRT fallback path ignores these; the
                 // VMulti path uses them and ignores the i32 pixels above.
-                let (vx_log, vy_log) =
-                    coords.map_to_vmulti(pe.x_norm, pe.y_norm, vscreen_w, vscreen_h);
+                let (vx_log, vy_log) = coords.map_to_vmulti(
+                    pe.x_norm, pe.y_norm, vscreen_x, vscreen_y, vscreen_w, vscreen_h,
+                );
+                // Pressure curve. When it outputs 0 on a physical contact
+                // (below the click threshold) the sample is demoted to
+                // hover — that is the Wacom click-threshold contract.
+                let curved = pressure.apply(pe.pressure);
+                let in_contact = matches!(pe.phase, 1 | 2) && curved > 0.0;
+                if let Some(feed) = &pen_feed {
+                    let _ = feed.send(PenFeel {
+                        x: pe.x_norm,
+                        y: pe.y_norm,
+                        raw: pe.pressure,
+                        curved,
+                        contact: in_contact,
+                        x_px: x,
+                        y_px: y,
+                    });
+                }
                 let sample = PenSample {
                     x,
                     y,
                     x_logical: vx_log,
                     y_logical: vy_log,
-                    pressure: pe.pressure,
+                    pressure: curved,
                     tilt_x_deg: pe.tilt_x as i32,
                     tilt_y_deg: pe.tilt_y as i32,
-                    in_range: pe.phase != 4,               // 4 = leave
-                    in_contact: matches!(pe.phase, 1 | 2), // down or move
+                    in_range: pe.phase != 4, // 4 = leave
+                    in_contact,
                     eraser: pe.tool == 1,
                     buttons: pe.buttons,
                     captured_at: None,
@@ -1084,6 +1156,7 @@ async fn read_loop<R: AsyncRead + Unpin>(
                 }
             }
             MSG_TOUCH_EVENT => {
+                activity.touch();
                 let te = TouchEvent::decode(&payload)?;
                 if disable_touch {
                     // Release any fingers that were touching the tablet

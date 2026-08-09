@@ -13,7 +13,7 @@ pub mod session;
 pub mod vdd;
 
 #[cfg(windows)]
-pub use session::{Session, SessionConfig, SessionError, SessionEvent};
+pub use session::{PenFeel, Session, SessionConfig, SessionError, SessionEvent};
 #[cfg(windows)]
 pub use vdd::{install_driver, uninstall_driver, VddController, VddError};
 

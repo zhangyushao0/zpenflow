@@ -61,6 +61,52 @@ pub struct Settings {
     /// interpreting fingers as taps. Pen samples are unaffected.
     #[serde(default)]
     pub disable_touch: bool,
+    /// Adapter friendly name both halves of the GPU story are pinned to:
+    /// written into `vdd_settings.xml` as `<gpu><friendlyname>` AND used
+    /// to set this process's `UserGpuPreferences` registry entry (the
+    /// Settings → Display → Graphics per-app preference). Keeping the two
+    /// in lockstep is what prevents the cross-adapter capture failure on
+    /// hybrid-GPU laptops. Empty = "default": driver picks, no per-app
+    /// preference. Takes effect on app restart + next VDD enable.
+    #[serde(default)]
+    pub preferred_gpu: String,
+    /// Pen pressure response curve (Wacom "Pen Feel" equivalent).
+    #[serde(default)]
+    pub pressure: PressureSettings,
+}
+
+/// Serializable shadow of `penflow_core::inject::pressure::PressureCurve`
+/// parameters. Same clamping happens core-side on construction, so stale
+/// or hand-edited JSON can never produce a dead pen.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub struct PressureSettings {
+    /// Click threshold: raw pressure below this is hover. [0, 0.5]
+    #[serde(default)]
+    pub threshold: f32,
+    /// Input level where output saturates at 1. [0.5, 1]
+    #[serde(default = "default_pressure_max")]
+    pub max: f32,
+    /// Curve exponent; <1 soft, >1 firm, 1 linear. [0.2, 5]
+    #[serde(default = "default_pressure_gamma")]
+    pub gamma: f32,
+}
+
+fn default_pressure_max() -> f32 {
+    1.0
+}
+
+fn default_pressure_gamma() -> f32 {
+    1.0
+}
+
+impl Default for PressureSettings {
+    fn default() -> Self {
+        Self {
+            threshold: 0.0,
+            max: default_pressure_max(),
+            gamma: default_pressure_gamma(),
+        }
+    }
 }
 
 fn default_hud_enabled() -> bool {
@@ -81,6 +127,8 @@ impl Default for Settings {
             topology: TopologyMode::default(),
             screen_off: false,
             disable_touch: false,
+            preferred_gpu: String::new(),
+            pressure: PressureSettings::default(),
         }
     }
 }
@@ -310,11 +358,30 @@ pub fn write_vdd_settings_file(
             std::fs::create_dir_all(parent)?;
         }
     }
-    let xml = render_vdd_settings_xml(s.vdd_resolution);
+    let xml = render_vdd_settings_xml(s.vdd_resolution, &s.preferred_gpu);
     std::fs::write(path, xml)
 }
 
-fn render_vdd_settings_xml(resolution: DisplayResolution) -> String {
+/// Minimal XML text escaping for the GPU friendly name. Adapter names are
+/// plain ASCII in practice, but a name is user-influenced input and the
+/// driver's parser failing on `&` would silently produce a 0-monitor
+/// config (the exact failure mode vdd.rs's code-31 recovery text warns
+/// about).
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn render_vdd_settings_xml(resolution: DisplayResolution, preferred_gpu: &str) -> String {
+    let gpu = {
+        let g = preferred_gpu.trim();
+        if g.is_empty() {
+            "default".to_string()
+        } else {
+            xml_escape(g)
+        }
+    };
     format!(
         r#"<?xml version='1.0' encoding='utf-8'?>
 <!--
@@ -330,7 +397,7 @@ fn render_vdd_settings_xml(resolution: DisplayResolution) -> String {
         <count>1</count>
     </monitors>
     <gpu>
-        <friendlyname>default</friendlyname>
+        <friendlyname>{gpu}</friendlyname>
     </gpu>
     <global>
         <g_refresh_rate>60</g_refresh_rate>
@@ -383,12 +450,39 @@ mod tests {
 
     #[test]
     fn vdd_xml_uses_selected_resolution() {
-        let xml = render_vdd_settings_xml(DisplayResolution {
-            width: 1920,
-            height: 1200,
-        });
+        let xml = render_vdd_settings_xml(
+            DisplayResolution {
+                width: 1920,
+                height: 1200,
+            },
+            "",
+        );
         assert!(xml.contains("<width>1920</width>"));
         assert!(xml.contains("<height>1200</height>"));
+        assert!(xml.contains("<friendlyname>default</friendlyname>"));
+    }
+
+    #[test]
+    fn vdd_xml_pins_selected_gpu() {
+        let xml = render_vdd_settings_xml(
+            DisplayResolution::default(),
+            "NVIDIA GeForce RTX 5080 Laptop GPU",
+        );
+        assert!(xml.contains(
+            "<friendlyname>NVIDIA GeForce RTX 5080 Laptop GPU</friendlyname>"
+        ));
+    }
+
+    #[test]
+    fn vdd_xml_escapes_gpu_name() {
+        let xml = render_vdd_settings_xml(DisplayResolution::default(), "A & B <GPU>");
+        assert!(xml.contains("<friendlyname>A &amp; B &lt;GPU&gt;</friendlyname>"));
+    }
+
+    #[test]
+    fn vdd_xml_whitespace_gpu_is_default() {
+        let xml = render_vdd_settings_xml(DisplayResolution::default(), "   ");
+        assert!(xml.contains("<friendlyname>default</friendlyname>"));
     }
 
     #[test]

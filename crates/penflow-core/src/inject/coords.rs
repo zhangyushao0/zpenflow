@@ -113,23 +113,44 @@ impl AffineTransform {
     }
 
     /// Map normalized pen coords `[0,1]²` to VMulti's logical units
-    /// `[0, 32767]²`, scaled across `(target_w_px, target_h_px)`.
+    /// `[0, 32767]²`, scaled across the target area whose top-left is
+    /// `(origin_x_px, origin_y_px)` and whose size is
+    /// `(target_w_px, target_h_px)`.
     ///
     /// VMulti's HID descriptor declares `logical_min/max = 0..32767` per
     /// axis. The receiver-side mapping from those logical units onto
     /// screen pixels happens inside the Windows kernel, using the
     /// digitizer's physical-axis declaration plus the monitor it's
     /// associated with. For a digitizer that spans the full virtual
-    /// screen, callers pass `vscreen_w / vscreen_h` here. For a
-    /// digitizer that should land only on a specific monitor (e.g. the
-    /// VDD), callers can pass that monitor's pixel size and additionally
-    /// shift the output via the affine's translation.
-    pub fn map_to_vmulti(&self, x: f32, y: f32, target_w_px: u32, target_h_px: u32) -> (u16, u16) {
+    /// screen, callers pass the virtual-screen origin and size here.
+    ///
+    /// The origin matters: `self.map()` returns coordinates in Windows'
+    /// desktop space, whose zero point is the PRIMARY monitor's top-left,
+    /// while VMulti's logical range is measured from the VIRTUAL SCREEN's
+    /// top-left. Those differ whenever a monitor sits left of or above the
+    /// primary, in which case `SM_X/YVIRTUALSCREEN` are negative. Dividing
+    /// raw desktop pixels by the virtual-screen size without first
+    /// rebasing onto that origin scales every sample by the wrong factor,
+    /// so the pen smears across the whole desktop instead of landing on
+    /// its own monitor. This is the same coordinate contract `win_ink`
+    /// already handles via `virtual_screen_origin()` (issue #16); the
+    /// VMulti path needs it too.
+    pub fn map_to_vmulti(
+        &self,
+        x: f32,
+        y: f32,
+        origin_x_px: i32,
+        origin_y_px: i32,
+        target_w_px: u32,
+        target_h_px: u32,
+    ) -> (u16, u16) {
         let (fx, fy) = self.map(x, y);
         let tw = target_w_px.max(1) as f32;
         let th = target_h_px.max(1) as f32;
-        let ux = ((fx / tw) * 32767.0).clamp(0.0, 32767.0).round() as u16;
-        let uy = ((fy / th) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        let rx = fx - origin_x_px as f32;
+        let ry = fy - origin_y_px as f32;
+        let ux = ((rx / tw) * 32767.0).clamp(0.0, 32767.0).round() as u16;
+        let uy = ((ry / th) * 32767.0).clamp(0.0, 32767.0).round() as u16;
         (ux, uy)
     }
 }
@@ -163,9 +184,9 @@ mod tests {
         // VDD at origin, 3840x2160; tablet norm [0,1] → VDD pixel [0..3840, 0..2160]
         // → VMulti logical [0..32767].
         let t = AffineTransform::from_normalized_to_rect(0, 0, 3840, 2160, 0);
-        assert_eq!(t.map_to_vmulti(0.0, 0.0, 3840, 2160), (0, 0));
-        assert_eq!(t.map_to_vmulti(1.0, 1.0, 3840, 2160), (32767, 32767));
-        let (mx, my) = t.map_to_vmulti(0.5, 0.5, 3840, 2160);
+        assert_eq!(t.map_to_vmulti(0.0, 0.0, 0, 0, 3840, 2160), (0, 0));
+        assert_eq!(t.map_to_vmulti(1.0, 1.0, 0, 0, 3840, 2160), (32767, 32767));
+        let (mx, my) = t.map_to_vmulti(0.5, 0.5, 0, 0, 3840, 2160);
         assert!(mx.abs_diff(16383) <= 1 && my.abs_diff(16383) <= 1);
     }
 
@@ -175,14 +196,80 @@ mod tests {
         // covers the right half. Tablet (0,0) → VDD top-left → virtual
         // pixel (1920, 0) → VMulti logical (16383, 0).
         let t = AffineTransform::from_normalized_to_rect(1920, 0, 1920, 1080, 0);
-        let (mx, my) = t.map_to_vmulti(0.0, 0.0, 3840, 1080);
+        let (mx, my) = t.map_to_vmulti(0.0, 0.0, 0, 0, 3840, 1080);
         assert!(mx.abs_diff(16383) <= 1, "got {mx}");
         assert_eq!(my, 0);
         // Tablet (1,1) → VDD bottom-right pixel (3840, 1080) → VMulti
         // logical (32767, 32767).
-        let (mx, my) = t.map_to_vmulti(1.0, 1.0, 3840, 1080);
+        let (mx, my) = t.map_to_vmulti(1.0, 1.0, 0, 0, 3840, 1080);
         assert_eq!(mx, 32767);
         assert_eq!(my, 32767);
+    }
+
+    #[test]
+    fn map_to_vmulti_rebases_onto_negative_virtual_screen_origin() {
+        // Regression: a monitor left of primary puts SM_XVIRTUALSCREEN at
+        // -3840, so desktop-space pixels and virtual-screen-space pixels
+        // disagree by that much. Layout: 3840-wide display at x=-3840,
+        // primary 2560 at x=0, VDD 2880 at x=2560. Virtual screen is
+        // therefore origin (-3840, 0), size 9280x2160.
+        let t = AffineTransform::from_normalized_to_rect(2560, 0, 2880, 1800, 0);
+        let (vx, vy) = (-3840, 0);
+        let (vw, vh) = (9280u32, 2160u32);
+
+        // Tablet top-left → desktop (2560,0) → virtual-screen-relative
+        // (6400, 0) → 6400/9280 * 32767 ≈ 22598.
+        let (mx, _my) = t.map_to_vmulti(0.0, 0.0, vx, vy, vw, vh);
+        assert!(mx.abs_diff(22598) <= 2, "left edge got {mx}");
+
+        // Tablet right edge → desktop 5440 → relative 9280 → full scale.
+        let (mx, _my) = t.map_to_vmulti(1.0, 0.0, vx, vy, vw, vh);
+        assert_eq!(mx, 32767, "right edge should reach logical max");
+
+        // The whole tablet must occupy only its own slice of the range,
+        // not smear across the desktop: width is 2880/9280 of the span.
+        let (x0, _) = t.map_to_vmulti(0.0, 0.0, vx, vy, vw, vh);
+        let (x1, _) = t.map_to_vmulti(1.0, 0.0, vx, vy, vw, vh);
+        let span = (x1 - x0) as f32 / 32767.0;
+        let expected = 2880.0 / 9280.0;
+        assert!(
+            (span - expected).abs() < 0.01,
+            "tablet should span {expected:.3} of the logical range, got {span:.3}"
+        );
+    }
+
+    #[test]
+    fn map_to_vmulti_negative_origin_without_rebase_would_be_wrong() {
+        // Guards the fix itself: with the old (origin-less) math the same
+        // layout produced a visibly different value, which is what made the
+        // pen wander onto the wrong monitor. Passing origin 0 reproduces
+        // the old behaviour and must NOT agree with the corrected one.
+        let t = AffineTransform::from_normalized_to_rect(2560, 0, 2880, 1800, 0);
+        let corrected = t.map_to_vmulti(0.0, 0.0, -3840, 0, 9280, 2160);
+        let legacy = t.map_to_vmulti(0.0, 0.0, 0, 0, 9280, 2160);
+        assert_ne!(corrected, legacy);
+        assert!(corrected.0 > legacy.0);
+    }
+
+    #[test]
+    fn map_to_vmulti_origin_zero_is_unchanged() {
+        // Single-monitor and right-of-primary layouts have origin (0,0);
+        // behaviour there must be identical to before the fix.
+        let t = AffineTransform::from_normalized_to_rect(2560, 0, 2880, 1800, 0);
+        assert_eq!(
+            t.map_to_vmulti(0.37, 0.62, 0, 0, 5440, 1800),
+            t.map_to_vmulti(0.37, 0.62, 0, 0, 5440, 1800)
+        );
+        let (mx, _) = t.map_to_vmulti(0.0, 0.0, 0, 0, 5440, 1800);
+        assert!(mx.abs_diff(15420) <= 2, "got {mx}");
+    }
+
+    #[test]
+    fn map_to_vmulti_clamps_outside_target() {
+        // A sample that maps left of the virtual screen must clamp to 0
+        // rather than wrap through the u16 cast.
+        let t = AffineTransform::from_normalized_to_rect(-1000, 0, 500, 500, 0);
+        assert_eq!(t.map_to_vmulti(0.0, 0.0, 0, 0, 1920, 1080), (0, 0));
     }
 
     #[test]

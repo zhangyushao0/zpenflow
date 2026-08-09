@@ -39,6 +39,19 @@ class MainActivity : Activity() {
     @Volatile
     private var screenOff: Boolean = false
 
+    /** True while the client state is Connected. Drives the keep-screen-on
+     *  window flag together with [screenOff]. */
+    private var sessionActive: Boolean = false
+
+    /** Last client state, so transient pen-key debug text can revert. */
+    private var lastState: PenflowClient.State = PenflowClient.State.Disconnected
+
+    /** Handler for the stylus-key minimum-hold latch + debug revert. */
+    private val stylusKeyHandler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** Keycode -> press wall-time, for the minimum-hold latch. */
+    private val stylusKeysDown = HashMap<Int, Long>()
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -115,6 +128,7 @@ class MainActivity : Activity() {
                     // Screen-off: hide the video surface and dim the panel
                     // (no video will arrive). Pen + touch input still flow.
                     screenOff = cfg.screenOff
+                    updateKeepScreenOn()
                     surfaceView.visibility =
                         if (cfg.screenOff) android.view.View.GONE
                         else android.view.View.VISIBLE
@@ -139,6 +153,69 @@ class MainActivity : Activity() {
         super.onDestroy()
     }
 
+    /** Map a stylus-ish keycode to our button bitmask (bit0..bit2).
+     *
+     *  - 632..635: Android 14 KEYCODE_STYLUS_BUTTON_PRIMARY/SECONDARY/
+     *    TERTIARY/TAIL (raw ints so we compile on older SDKs).
+     *  - >= 700: OEM extension range. Huawei/Honor pencils deliver their
+     *    tap gestures here (M-Pencil 3 double-tap = 718). Mapped to btn1
+     *    so the GUI's "Barrel button 1" binding drives it.
+     */
+    private fun stylusKeyToBits(keyCode: Int): Int = when (keyCode) {
+        632 -> 0x1          // STYLUS_BUTTON_PRIMARY
+        633 -> 0x2          // STYLUS_BUTTON_SECONDARY
+        634 -> 0x4          // STYLUS_BUTTON_TERTIARY
+        635 -> 0x4          // STYLUS_BUTTON_TAIL -> btn3
+        else -> if (keyCode >= 700) 0x1 else 0
+    }
+
+    private fun refreshExternalButtons() {
+        var bits = 0
+        for (k in stylusKeysDown.keys) bits = bits or stylusKeyToBits(k)
+        penCapture.externalButtonBits = bits
+    }
+
+    /** Show what the pen's key channel is doing — the discovery tool for
+     *  non-Wacom pens. Visible whenever the status line is (HUD toggle). */
+    private fun showPenKeyDebug(keyCode: Int, down: Boolean) {
+        statusView.text = "pen key $keyCode ${if (down) "DOWN" else "UP"}"
+        stylusKeyHandler.postDelayed({ renderState(lastState) }, 1500)
+    }
+
+    override fun dispatchKeyEvent(event: android.view.KeyEvent): Boolean {
+        val bits = stylusKeyToBits(event.keyCode)
+        if (bits == 0) return super.dispatchKeyEvent(event)
+
+        android.util.Log.i(
+            "PenflowPenKey",
+            "stylus key ${event.keyCode} action=${event.action} " +
+                "device=${event.device?.name}"
+        )
+        when (event.action) {
+            android.view.KeyEvent.ACTION_DOWN -> {
+                stylusKeysDown[event.keyCode] = android.os.SystemClock.uptimeMillis()
+                refreshExternalButtons()
+                showPenKeyDebug(event.keyCode, true)
+            }
+            android.view.KeyEvent.ACTION_UP -> {
+                // Minimum-hold latch: a gesture "press" can be a few ms —
+                // shorter than the gap between pen samples — and a press no
+                // sample ever carried is a press the PC never sees. Hold the
+                // bit at least 90 ms so it lands in the sample stream.
+                val downAt = stylusKeysDown[event.keyCode]
+                val heldMs = if (downAt != null)
+                    android.os.SystemClock.uptimeMillis() - downAt else 999L
+                val clearIn = (90L - heldMs).coerceAtLeast(0L)
+                stylusKeyHandler.postDelayed({
+                    stylusKeysDown.remove(event.keyCode)
+                    refreshExternalButtons()
+                }, clearIn)
+                showPenKeyDebug(event.keyCode, false)
+            }
+        }
+        return true
+    }
+
     override fun dispatchTouchEvent(ev: MotionEvent): Boolean {
         // Pen events first (they use a different toolType so don't conflict with
         // touch). If the pen capture rejects the event (toolType=FINGER), fall
@@ -155,6 +232,9 @@ class MainActivity : Activity() {
     }
 
     private fun renderState(st: PenflowClient.State) {
+        lastState = st
+        sessionActive = st is PenflowClient.State.Connected
+        updateKeepScreenOn()
         statusView.text = when (st) {
             PenflowClient.State.Disconnected -> "disconnected"
             PenflowClient.State.Connecting -> "connecting…"
@@ -176,6 +256,30 @@ class MainActivity : Activity() {
     }
 
     /** Per-window brightness override; no WRITE_SETTINGS needed. */
+    /**
+     * Keep the panel awake ONLY while a session is live and actually
+     * showing video. An earlier unconditional FLAG_KEEP_SCREEN_ON in
+     * onCreate was removed (93ea1d2) because it pinned the screen awake
+     * for the whole app lifetime — including while sitting disconnected
+     * and in screen-off pen-tablet mode, whose entire purpose is letting
+     * the panel rest. Scoping the flag to (Connected && !screenOff)
+     * keeps that fix intact while stopping the display timeout from
+     * blanking the tablet mid-session: a pen display that dozes off
+     * between strokes is not usable as a display.
+     *
+     * A window flag needs no permissions and cannot leak: the flag dies
+     * with the window, and every path out of Connected (disconnect,
+     * error, reconnect) lands in renderState which clears it.
+     */
+    private fun updateKeepScreenOn() {
+        val keep = sessionActive && !screenOff
+        if (keep) {
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
+
     private fun applyScreenBrightness(dim: Boolean) {
         val lp = window.attributes
         val target = if (dim) {
