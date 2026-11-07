@@ -36,6 +36,10 @@ pub struct TransportStream {
 }
 
 /// Listener for one Android client at a time.
+// Clippy 1.99's `double_must_use` fires on the `#[must_use]` that
+// `async_trait` attaches to its generated boxed futures; the future is
+// already `#[must_use]`, so the macro's duplicate attribute is harmless.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait Transport: Send + Sync {
     /// Block until exactly one Android client connects and any

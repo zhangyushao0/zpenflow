@@ -24,7 +24,7 @@ use windows::core::{Interface, GUID, PWSTR};
 use windows::Win32::Foundation::VARIANT_TRUE;
 use windows::Win32::Graphics::Direct3D11::ID3D11Texture2D;
 use windows::Win32::Media::MediaFoundation::*;
-use windows::Win32::System::Com::CoTaskMemFree;
+use windows::Win32::System::Com::{CoCreateInstance, CoTaskMemFree, CLSCTX_ALL};
 use windows::Win32::System::Variant::{VARIANT, VT_BOOL, VT_UI4};
 
 use crate::d3d11::D3d11Context;
@@ -129,8 +129,7 @@ impl MfSession {
         // 1. Pick the right MFT for our adapter + codec (gate-1 vendor-ID
         //    match plus subtype filter so we get NVIDIA's H.264 MFT vs the
         //    HEVC one based on `cfg.codec`).
-        let activate = pick_mft_for_adapter(ctx.adapter_vendor_id, cfg.codec)?;
-        let transform: IMFTransform = unsafe { activate.ActivateObject()? };
+        let transform = pick_mft_for_adapter(ctx.adapter_vendor_id, cfg.codec)?;
 
         // 2. Async-unlock BEFORE anything else (gate-1 finding).
         let attrs = unsafe { transform.GetAttributes()? };
@@ -511,7 +510,51 @@ impl Drop for MfSession {
 
 // ----------------- helpers (mirror the gate-1 probe) -----------------
 
-fn pick_mft_for_adapter(adapter_vendor_id: u32, codec: Codec) -> EngineResult<IMFActivate> {
+/// Some graphics drivers register their Media Foundation encoder CLSIDs in
+/// `HKLM\SOFTWARE\Classes\MediaFoundation\Transforms`, but `MFTEnumEx` fails
+/// to return them on some Windows builds (observed with NVIDIA 610.88 on
+/// Windows 11 26200: only Microsoft's AVC DX12 encoder was enumerated while
+/// both NVIDIA H.264/HEVC CLSIDs instantiated and encoded correctly).
+///
+/// Try the known vendor CLSIDs directly first. The activation is cheap and
+/// immediately fails with a meaningful HRESULT on systems where that vendor's
+/// MFT is not installed, after which we fall back to MFTEnumEx.
+fn vendor_encoder_clsid(adapter_vendor_id: u32, codec: Codec) -> Option<GUID> {
+    match (adapter_vendor_id, codec) {
+        // NVIDIA H.264 Encoder MFT (nvEncMFTH264x.dll).
+        (0x10DE, Codec::H264) => Some(GUID::from_u128(0x60F44560_5A20_4857_BFEF_D29773CB8040)),
+        // NVIDIA HEVC Encoder MFT (nvEncMFThevcx.dll).
+        (0x10DE, Codec::Hevc) => Some(GUID::from_u128(0x966F107C_8EA2_425D_B822_E4A71BEF01D7)),
+        // AMD AMF H.264 encoder MFT.
+        (0x1002, Codec::H264) => Some(GUID::from_u128(0xADC9BC80_0F41_46C6_AB75_D693D793597D)),
+        // AMD AMF HEVC encoder MFT.
+        (0x1002, Codec::Hevc) => Some(GUID::from_u128(0x5FD65104_A924_4835_AB71_09A223E3E37B)),
+        _ => None,
+    }
+}
+
+fn pick_mft_for_adapter(adapter_vendor_id: u32, codec: Codec) -> EngineResult<IMFTransform> {
+    // 1. Direct vendor CLSID. This is the path that works around MFTEnumEx
+    //    omitting installed NVIDIA/AMD encoders on affected systems.
+    if let Some(clsid) = vendor_encoder_clsid(adapter_vendor_id, codec) {
+        match unsafe { CoCreateInstance::<_, IMFTransform>(&clsid, None, CLSCTX_ALL) } {
+            Ok(transform) => {
+                eprintln!(
+                    "[mf] using direct vendor encoder CLSID for {:?} (vendor 0x{:04X})",
+                    codec, adapter_vendor_id
+                );
+                return Ok(transform);
+            }
+            Err(e) => eprintln!(
+                "[mf] direct vendor encoder CLSID unavailable for {:?} (vendor 0x{:04X}): {e:?}; \
+                 falling back to MFTEnumEx",
+                codec, adapter_vendor_id
+            ),
+        }
+    }
+
+    // 2. Enumerate MFTs and prefer the one whose hardware vendor ID matches
+    //    the active D3D11 adapter.
     let output_info = MFT_REGISTER_TYPE_INFO {
         guidMajorType: MFMediaType_Video,
         guidSubtype: match codec {
@@ -547,16 +590,19 @@ fn pick_mft_for_adapter(adapter_vendor_id: u32, codec: Codec) -> EngineResult<IM
     for a in &activates {
         if let Some(v) = read_mft_vendor_id(a) {
             if v.eq_ignore_ascii_case(&target_tag) {
-                return Ok(a.clone());
+                if let Ok(t) = unsafe { a.ActivateObject::<IMFTransform>() } {
+                    return Ok(t);
+                }
             }
         }
     }
-    // Fallback: take the first MFT and let the live-probe at SetOutputType
-    // surface the failure if it's wrong-vendor.
-    activates
+    // Fallback: take the first MFT; SetOutputType/SetInputType will surface
+    // an incompatibility if it is the wrong vendor.
+    let activate = activates
         .into_iter()
         .next()
-        .ok_or(EngineError::NoCompatibleEncoder)
+        .ok_or(EngineError::NoCompatibleEncoder)?;
+    unsafe { activate.ActivateObject::<IMFTransform>() }.map_err(Into::into)
 }
 
 fn read_mft_vendor_id(activate: &IMFActivate) -> Option<String> {
